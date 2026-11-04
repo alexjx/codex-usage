@@ -1,0 +1,1696 @@
+//! Read-only rollout discovery, incremental parsing, and usage reconciliation.
+use crate::model::{Coverage, Scan, Source, SourceStatus, Usage, UsageEvent};
+use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
+use serde_json::Value;
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
+    fs::{self, File, Metadata},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom},
+    path::{Path, PathBuf},
+    time::{Duration, Instant, SystemTime},
+};
+use walkdir::WalkDir;
+
+#[derive(Clone, Default)]
+struct Turn {
+    model: String,
+    project: Option<String>,
+    provider: String,
+    tier: Option<String>,
+}
+#[derive(Clone)]
+struct Candidate {
+    event: UsageEvent,
+    turn: Option<String>,
+    snapshot: Option<String>,
+    direct: bool,
+}
+#[derive(Clone, Default)]
+struct Parser {
+    owner: String,
+    active_session: String,
+    owner_created: Option<DateTime<Utc>>,
+    parent: Option<String>,
+    current: Turn,
+    current_turn: Option<String>,
+    turns: HashMap<String, Turn>,
+    baselines: HashMap<String, Usage>,
+    baseline_models: HashMap<String, String>,
+    events: Vec<Candidate>,
+    coverage: Coverage,
+    offset: u64,
+    pending: Vec<u8>,
+    line: u64,
+    direct_responses: BTreeSet<String>,
+    compactions: BTreeSet<String>,
+    fallback_counts: HashMap<String, u64>,
+    recent_direct: HashMap<String, (Usage, DateTime<Utc>, bool)>,
+    thread_tiers: HashMap<String, Option<String>>,
+}
+#[derive(Clone)]
+struct CachedFile {
+    len: u64,
+    modified: Option<SystemTime>,
+    identity: String,
+    prefix: Vec<u8>,
+    parser: Parser,
+}
+#[derive(Clone, Default)]
+struct SourceSnapshot {
+    candidates: Vec<Candidate>,
+    coverage: Coverage,
+}
+type ReconcileJob = (
+    (String, PathBuf),
+    std::thread::JoinHandle<Result<CachedFile>>,
+);
+#[derive(Default)]
+pub struct Reader {
+    files: HashMap<(String, PathBuf), CachedFile>,
+    sources: HashMap<String, (SourceSnapshot, DateTime<Utc>)>,
+    reconcile_at: Option<Instant>,
+    sweep: VecDeque<(String, PathBuf)>,
+    reconcile_job: Option<ReconcileJob>,
+    background_errors: BTreeMap<(String, PathBuf), String>,
+}
+impl Reader {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn scan(&mut self, sources: &[Source]) -> Result<Scan> {
+        self.service_reconciliation(sources);
+        let mut scan = Scan::default();
+        let mut candidates = Vec::new();
+        for source in sources {
+            match self.read_source(source) {
+                Ok(snapshot) => {
+                    let now = Utc::now();
+                    candidates.extend(snapshot.candidates.iter().cloned());
+                    add_coverage(&mut scan.coverage, &snapshot.coverage);
+                    self.sources.insert(source.name.clone(), (snapshot, now));
+                    scan.sources.push(SourceStatus {
+                        name: source.name.clone(),
+                        root: source.root.clone(),
+                        readable: true,
+                        last_success: Some(now),
+                        error: None,
+                    });
+                }
+                Err(error) => {
+                    let previous = self.sources.get(&source.name);
+                    if let Some((snapshot, _)) = previous {
+                        candidates.extend(snapshot.candidates.iter().cloned());
+                        add_coverage(&mut scan.coverage, &snapshot.coverage);
+                    }
+                    scan.sources.push(SourceStatus {
+                        name: source.name.clone(),
+                        root: source.root.clone(),
+                        readable: false,
+                        last_success: previous.map(|(_, time)| *time),
+                        error: Some(error.to_string()),
+                    });
+                }
+            }
+        }
+        for ((name, _), message) in &self.background_errors {
+            if sources.iter().any(|source| source.name == *name) {
+                scan.coverage.uncertain += 1;
+                note(&mut scan.coverage, message.clone());
+            }
+        }
+        if self.reconcile_at.is_none() && self.sweep.is_empty() && self.reconcile_job.is_none() {
+            self.reconcile_at = Some(Instant::now() + Duration::from_secs(60));
+        }
+        scan.events = reconcile(candidates, &mut scan.coverage);
+        scan.sources.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(scan)
+    }
+
+    fn service_reconciliation(&mut self, selected: &[Source]) {
+        if self
+            .reconcile_job
+            .as_ref()
+            .is_some_and(|(_, job)| job.is_finished())
+        {
+            let (key, job) = self.reconcile_job.take().unwrap();
+            match job.join() {
+                Ok(Ok(parsed)) => {
+                    let unchanged = fs::metadata(&key.1).ok().is_some_and(|metadata| {
+                        metadata.len() == parsed.len
+                            && metadata.modified().ok() == parsed.modified
+                            && identity(&metadata) == parsed.identity
+                    });
+                    if unchanged && self.files.contains_key(&key) {
+                        self.files.insert(key.clone(), parsed);
+                        self.background_errors.remove(&key);
+                    }
+                }
+                Ok(Err(error)) => {
+                    self.background_errors.insert(key, error.to_string());
+                }
+                Err(_) => {
+                    self.background_errors
+                        .insert(key, "Background content reconciliation failed".into());
+                }
+            }
+        }
+        if self
+            .reconcile_at
+            .is_some_and(|deadline| Instant::now() >= deadline)
+            && self.reconcile_job.is_none()
+            && self.sweep.is_empty()
+        {
+            let mut keys: Vec<_> = self
+                .files
+                .keys()
+                .filter(|(name, _)| selected.iter().any(|source| source.name == *name))
+                .cloned()
+                .collect();
+            keys.sort();
+            self.sweep.extend(keys);
+            self.reconcile_at = None;
+        }
+        // One background file at a time. Large archives never block the terminal event loop.
+        if self.reconcile_job.is_none() {
+            if let Some(key) = self.sweep.pop_front() {
+                let path = key.1.clone();
+                let job = std::thread::spawn(move || {
+                    let metadata = fs::metadata(&path)?;
+                    parse_cached(&path, &metadata, None)
+                });
+                self.reconcile_job = Some((key, job));
+            }
+        }
+    }
+
+    fn read_source(&mut self, source: &Source) -> Result<SourceSnapshot> {
+        let paths = discover(&source.root)?;
+        let mut snapshot = SourceSnapshot::default();
+        let mut present = BTreeSet::new();
+        for path in paths {
+            let key = (source.name.clone(), path.clone());
+            present.insert(key.clone());
+            let loaded = (|| -> Result<()> {
+                let metadata = fs::metadata(&path)
+                    .with_context(|| format!("Cannot inspect {}", path.display()))?;
+                let old = self.files.get(&key);
+                let changed = old.is_none_or(|cached| {
+                    cached.len != metadata.len()
+                        || cached.modified != metadata.modified().ok()
+                        || cached.identity != identity(&metadata)
+                });
+                if changed {
+                    let parsed = parse_cached(&path, &metadata, old)?;
+                    self.files.insert(key.clone(), parsed);
+                    self.background_errors.remove(&key);
+                }
+                Ok(())
+            })();
+            if let Err(error) = loaded {
+                snapshot.coverage.uncertain += 1;
+                note(&mut snapshot.coverage, error.to_string());
+                if !self.files.contains_key(&key) {
+                    continue;
+                }
+            }
+            let cached = self.files.get(&key).expect("file was parsed");
+            snapshot.coverage.files += 1;
+            add_coverage(&mut snapshot.coverage, &cached.parser.coverage);
+            if !cached.parser.pending.is_empty() {
+                snapshot.coverage.pending += 1;
+            }
+            let missing_compactions = cached
+                .parser
+                .compactions
+                .difference(&cached.parser.direct_responses)
+                .count();
+            if missing_compactions > 0 {
+                snapshot.coverage.uncertain += missing_compactions;
+                note(
+                    &mut snapshot.coverage,
+                    "Compaction markers without recorded token usage",
+                );
+            }
+            for candidate in &cached.parser.events {
+                let mut candidate = candidate.clone();
+                if let Some(turn) = candidate
+                    .turn
+                    .as_ref()
+                    .and_then(|id| cached.parser.turns.get(id))
+                {
+                    if candidate.event.model == "unknown" && !turn.model.is_empty() {
+                        candidate.event.model = turn.model.clone();
+                    }
+                    if candidate.event.provider == "unknown" && !turn.provider.is_empty() {
+                        candidate.event.provider = turn.provider.clone();
+                    }
+                    if candidate.event.project.is_none() && turn.project.is_some() {
+                        candidate.event.project.clone_from(&turn.project);
+                    }
+                }
+                candidate.event.source = source.name.clone();
+                candidate.event.origins.insert(source.name.clone());
+                snapshot.candidates.push(candidate);
+            }
+        }
+        // A successful discovery removes contributions from deleted/moved/replaced files.
+        self.files.retain(|(name, path), _| {
+            name != &source.name || present.contains(&(name.clone(), path.clone()))
+        });
+        Ok(snapshot)
+    }
+}
+
+fn parse_cached(path: &Path, metadata: &Metadata, old: Option<&CachedFile>) -> Result<CachedFile> {
+    let identity = identity(metadata);
+    let prefix = read_prefix(path, metadata.len().min(4096) as usize)?;
+    let compressed = path.extension().is_some_and(|v| v == "zst");
+    let append = !compressed
+        && old.is_some_and(|cached| {
+            metadata.len() > cached.len
+                && cached.identity == identity
+                && prefix.starts_with(&cached.prefix)
+        });
+    let mut parser = if append {
+        old.unwrap().parser.clone()
+    } else {
+        Parser::default()
+    };
+    let file = File::open(path).with_context(|| format!("Cannot read {}", path.display()))?;
+    if compressed {
+        let decoder = zstd::stream::read::Decoder::new(file)
+            .with_context(|| format!("Cannot decompress {}", path.display()))?;
+        if let Err(error) = parser.consume(BufReader::new(decoder), path) {
+            if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                parser.coverage.pending += 1;
+            } else {
+                return Err(error).with_context(|| format!("Cannot decompress {}", path.display()));
+            }
+        }
+    } else {
+        let mut file = file;
+        if append {
+            file.seek(SeekFrom::Start(parser.offset))?;
+        }
+        parser
+            .consume(BufReader::new(file), path)
+            .with_context(|| format!("Cannot read {}", path.display()))?;
+    }
+    Ok(CachedFile {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+        identity,
+        prefix,
+        parser,
+    })
+}
+
+fn discover(root: &Path) -> Result<Vec<PathBuf>> {
+    fs::read_dir(root).with_context(|| format!("Cannot read source {}", root.display()))?;
+    let directories: Vec<_> = [root.join("sessions"), root.join("archived_sessions")]
+        .into_iter()
+        .filter(|path| path.is_dir())
+        .collect();
+    let directories = if directories.is_empty() {
+        vec![root.to_path_buf()]
+    } else {
+        directories
+    };
+    let mut selected: BTreeMap<PathBuf, (usize, PathBuf)> = BTreeMap::new();
+    for (directory_index, directory) in directories.iter().enumerate() {
+        for entry in WalkDir::new(directory).follow_links(false) {
+            let entry =
+                entry.with_context(|| format!("Cannot enumerate {}", directory.display()))?;
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let path = entry.path();
+            if path.file_name().is_some_and(|name| name == "history.jsonl") {
+                continue;
+            }
+            let name = path.to_string_lossy();
+            let compressed = name.ends_with(".jsonl.zst");
+            if !compressed && !name.ends_with(".jsonl") {
+                continue;
+            }
+            let mut relative = path.strip_prefix(directory).unwrap_or(path).to_path_buf();
+            if compressed {
+                relative.set_extension("");
+            }
+            let priority = directory_index * 2 + usize::from(compressed);
+            let choice = selected
+                .entry(relative)
+                .or_insert((priority, path.to_path_buf()));
+            if priority < choice.0 {
+                *choice = (priority, path.to_path_buf());
+            }
+        }
+    }
+    Ok(selected.into_values().map(|(_, path)| path).collect())
+}
+#[cfg(unix)]
+fn identity(metadata: &Metadata) -> String {
+    use std::os::unix::fs::MetadataExt;
+    format!("{}:{}", metadata.dev(), metadata.ino())
+}
+#[cfg(not(unix))]
+fn identity(metadata: &Metadata) -> String {
+    format!("{:?}", metadata.created().ok())
+}
+fn read_prefix(path: &Path, length: usize) -> Result<Vec<u8>> {
+    let mut buffer = vec![0; length];
+    File::open(path)?.read_exact(&mut buffer)?;
+    Ok(buffer)
+}
+fn add_coverage(to: &mut Coverage, from: &Coverage) {
+    to.files += from.files;
+    to.malformed += from.malformed;
+    to.pending += from.pending;
+    to.duplicates += from.duplicates;
+    to.conflicts += from.conflicts;
+    to.uncertain += from.uncertain;
+    for message in &from.messages {
+        note(to, message);
+    }
+}
+fn note(coverage: &mut Coverage, message: impl Into<String>) {
+    if coverage.messages.len() < 32 {
+        coverage.messages.insert(message.into());
+    }
+}
+fn string(value: &Value, field: &str) -> Option<String> {
+    value.get(field)?.as_str().map(str::to_owned)
+}
+fn timestamp(value: &Value) -> Option<DateTime<Utc>> {
+    value
+        .get("timestamp")?
+        .as_str()?
+        .parse::<DateTime<Utc>>()
+        .ok()
+}
+
+impl Parser {
+    fn consume(&mut self, mut reader: impl BufRead, path: &Path) -> std::io::Result<()> {
+        loop {
+            let mut line = std::mem::take(&mut self.pending);
+            let read = reader.read_until(b'\n', &mut line)?;
+            self.offset += read as u64;
+            if read == 0 {
+                self.pending = line;
+                break;
+            }
+            if line.last() != Some(&b'\n') {
+                if !line.iter().all(u8::is_ascii_whitespace) {
+                    match serde_json::from_slice::<Value>(&line) {
+                        Ok(_) => {
+                            self.line += 1;
+                            self.parse_line(&line, path);
+                        }
+                        Err(error) if error.is_eof() => self.pending = line,
+                        Err(_) => {
+                            self.line += 1;
+                            self.problem(path, "Malformed final JSON record", true);
+                        }
+                    }
+                }
+                break;
+            }
+            self.line += 1;
+            self.parse_line(&line, path);
+        }
+        Ok(())
+    }
+    fn problem(&mut self, path: &Path, message: &str, malformed: bool) {
+        if malformed {
+            self.coverage.malformed += 1;
+        } else {
+            self.coverage.uncertain += 1;
+        }
+        note(
+            &mut self.coverage,
+            format!("{}:{}: {message}", path.display(), self.line),
+        );
+    }
+    fn parse_line(&mut self, bytes: &[u8], path: &Path) {
+        if bytes.iter().all(u8::is_ascii_whitespace) {
+            return;
+        }
+        // Rollout bodies can contain megabytes of private text. Only deserialize usage/metadata.
+        if let Some(kind) = head_kind(bytes) {
+            if !matches!(
+                kind.as_str(),
+                "session_meta"
+                    | "turn_context"
+                    | "token_usage_record"
+                    | "event_msg"
+                    | "thread_settings_applied"
+                    | "compacted"
+            ) {
+                if kind.contains("usage") || kind.contains("token") {
+                    self.problem(path, "Unrecognized usage record type", false);
+                }
+                return;
+            }
+            if kind == "event_msg"
+                && !bytes.windows(13).any(|part| part == b"\"token_count\"")
+                && !bytes
+                    .windows(25)
+                    .any(|part| part == b"\"thread_settings_applied\"")
+            {
+                return;
+            }
+        }
+        let value: Value = match serde_json::from_slice(bytes) {
+            Ok(value) => value,
+            Err(_) => {
+                self.problem(path, "Malformed JSON record", true);
+                return;
+            }
+        };
+        let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
+        let payload = &value["payload"];
+        match kind {
+            "session_meta" => {
+                let session = string(payload, "id")
+                    .or_else(|| string(payload, "thread_id"))
+                    .or_else(|| string(payload, "session_id"))
+                    .unwrap_or_default();
+                if self.owner.is_empty() {
+                    self.owner = session.clone();
+                    self.owner_created = timestamp(payload).or_else(|| timestamp(&value));
+                    self.parent = string(payload, "forked_from_id")
+                        .or_else(|| string(payload, "parent_thread_id"));
+                }
+                if !session.is_empty() {
+                    self.active_session = session;
+                    self.current.tier = self
+                        .thread_tiers
+                        .get(&self.active_session)
+                        .cloned()
+                        .flatten();
+                }
+                self.current.provider =
+                    string(payload, "model_provider").unwrap_or_else(|| "unknown".into());
+                self.current.project = string(payload, "cwd");
+            }
+            "turn_context" => {
+                self.current_turn = string(payload, "turn_id");
+                if let (Some(parent), Some(created), Some(turn)) = (
+                    self.parent.as_ref(),
+                    self.owner_created,
+                    self.current_turn.as_deref().and_then(uuid_v7_millis),
+                ) {
+                    let session = if turn < created.timestamp_millis() {
+                        parent
+                    } else {
+                        &self.owner
+                    };
+                    if self.active_session != *session {
+                        self.active_session.clone_from(session);
+                        self.current.tier = self.thread_tiers.get(session).cloned().flatten();
+                    }
+                }
+                if let Some(model) = string(payload, "model") {
+                    self.current.model = model;
+                }
+                if let Some(provider) = string(payload, "model_provider") {
+                    self.current.provider = provider;
+                }
+                if let Some(project) = string(payload, "cwd") {
+                    self.current.project = Some(project);
+                }
+                if let Some(tier) = recorded_tier(payload) {
+                    self.current.tier = tier.clone();
+                    self.thread_tiers.insert(self.active_session.clone(), tier);
+                }
+                if let Some(id) = &self.current_turn {
+                    self.turns.insert(id.clone(), self.current.clone());
+                }
+            }
+            "thread_settings_applied" => self.settings(payload),
+            "compacted" => {
+                if let Some(response) = string(payload, "response_id") {
+                    self.compactions.insert(response);
+                }
+            }
+            "token_usage_record" => self.direct(&value, path),
+            "event_msg" if payload["type"] == "thread_settings_applied" => self.settings(payload),
+            "event_msg" if payload["type"] == "token_count" => self.legacy(&value, path),
+            _ => {}
+        }
+    }
+    fn settings(&mut self, payload: &Value) {
+        let tier = recorded_tier(payload).unwrap_or(None);
+        let session = string(payload, "thread_id").unwrap_or_else(|| self.active_session.clone());
+        self.thread_tiers.insert(session.clone(), tier.clone());
+        if session == self.active_session {
+            self.current.tier = tier;
+            if let Some(id) = &self.current_turn {
+                if let Some(turn) = self.turns.get_mut(id) {
+                    turn.tier.clone_from(&self.current.tier);
+                }
+            }
+        }
+    }
+    fn event(
+        &self,
+        id: String,
+        time: DateTime<Utc>,
+        session: String,
+        usage: Usage,
+        payload: &Value,
+    ) -> UsageEvent {
+        UsageEvent {
+            id,
+            timestamp: time,
+            session,
+            model: if self.current.model.is_empty() {
+                "unknown".into()
+            } else {
+                self.current.model.clone()
+            },
+            provider: if self.current.provider.is_empty() {
+                "unknown".into()
+            } else {
+                self.current.provider.clone()
+            },
+            tier: recorded_tier(payload).unwrap_or_else(|| self.current.tier.clone()),
+            project: self.current.project.clone(),
+            usage,
+            source: String::new(),
+            origins: BTreeSet::new(),
+            context_tokens: payload.get("context_tokens").and_then(Value::as_u64),
+            cache_retention: string(payload, "cache_retention")
+                .or_else(|| string(payload, "prompt_cache_retention")),
+        }
+    }
+    fn direct(&mut self, value: &Value, path: &Path) {
+        let payload = &value["payload"];
+        let Some(time) = timestamp(value) else {
+            self.problem(path, "Usage record has no valid timestamp", true);
+            return;
+        };
+        let usage = match parse_usage(&payload["usage"]) {
+            Ok(usage) => usage,
+            Err(error) => {
+                self.problem(path, &error, true);
+                return;
+            }
+        };
+        let session = string(payload, "thread_id")
+            .or_else(|| string(payload, "session_id"))
+            .unwrap_or_else(|| self.active_session.clone());
+        if session.is_empty() {
+            self.problem(path, "Usage record has no session identity", false);
+            return;
+        }
+        if self.active_session != session {
+            self.current.tier = self.thread_tiers.get(&session).cloned().flatten();
+            self.active_session.clone_from(&session);
+        }
+        let response = string(payload, "response_id");
+        let id = if let Some(response) = &response {
+            self.direct_responses.insert(response.clone());
+            format!("response:{response}")
+        } else {
+            self.problem(
+                path,
+                "Per-response usage lacks stable response identity",
+                false,
+            );
+            let hash = blake3::hash(value.to_string().as_bytes())
+                .to_hex()
+                .to_string();
+            let occurrence = self.fallback_counts.entry(hash.clone()).or_default();
+            *occurrence += 1;
+            format!("record:{hash}:{occurrence}")
+        };
+        if payload.get("thread_id").is_none()
+            && payload.get("turn_id").is_none()
+            && payload.get("thread_token_usage").is_none()
+        {
+            self.problem(path, "Standalone usage lacks turn/counter evidence for compaction reconciliation; excluded", false);
+            return;
+        }
+        let cumulative = parse_usage(&payload["thread_token_usage"]).ok();
+        let snapshot = cumulative
+            .as_ref()
+            .map(|total| snapshot_key(&session, total));
+        if self.parent.is_some() && session != self.owner {
+            // The source explicitly records another thread: this is replayed parent history.
+            if let Some(total) = cumulative {
+                self.baselines.insert(session, total);
+            }
+            self.coverage.duplicates += 1;
+            return;
+        }
+        let turn = string(payload, "turn_id").or_else(|| self.current_turn.clone());
+        let mut event = self.event(id, time, session.clone(), usage, payload);
+        if turn != self.current_turn {
+            if let Some(context) = turn.as_ref().and_then(|id| self.turns.get(id)) {
+                event.model = if context.model.is_empty() {
+                    "unknown".into()
+                } else {
+                    context.model.clone()
+                };
+                event.project.clone_from(&context.project);
+                event.provider = if context.provider.is_empty() {
+                    "unknown".into()
+                } else {
+                    context.provider.clone()
+                };
+                event.tier.clone_from(&context.tier);
+            } else {
+                event.model = "unknown".into();
+            }
+        }
+        if let Some(tier) = recorded_tier(payload) {
+            // Per-response evidence wins over thread defaults or inferred active context.
+            event.tier = tier;
+        }
+        self.recent_direct
+            .insert(session, (event.usage.clone(), time, false));
+        self.events.push(Candidate {
+            event,
+            turn,
+            snapshot,
+            direct: true,
+        });
+    }
+    fn legacy(&mut self, value: &Value, path: &Path) {
+        let payload = &value["payload"];
+        let info = &payload["info"];
+        if info.is_null() {
+            return;
+        }
+        let Some(time) = timestamp(value) else {
+            self.problem(path, "Token snapshot has no valid timestamp", true);
+            return;
+        };
+        let total = match parse_usage(&info["total_token_usage"]) {
+            Ok(total) => total,
+            Err(error) => {
+                self.problem(path, &error, true);
+                return;
+            }
+        };
+        if self.parent.is_some() && self.inherited_turn(time) {
+            // Replayed historical records may be re-timestamped during child creation.
+            // The stable UUIDv7 turn identity, not the copied record timestamp, locates them.
+            let parent = self.parent.clone().unwrap();
+            self.baselines.insert(parent.clone(), total);
+            self.baseline_models
+                .insert(parent, self.current.model.clone());
+            self.coverage.duplicates += 1;
+            return;
+        }
+        let session =
+            if self.parent.is_some() && self.owner_created.is_some_and(|created| time >= created) {
+                self.owner.clone()
+            } else if self.parent.is_some() && self.active_session == self.owner {
+                self.parent.clone().unwrap()
+            } else {
+                self.active_session.clone()
+            };
+        if session.is_empty() {
+            self.problem(path, "Token snapshot has no session identity", false);
+            return;
+        }
+        let latest = parse_usage(&info["last_token_usage"]).ok();
+        let legacy_delta = self
+            .baselines
+            .get(&session)
+            .and_then(|previous| subtract_usage(&total, previous));
+        if let Some((usage, observed, consumed)) = self.recent_direct.get_mut(&session) {
+            if !*consumed
+                && (latest.as_ref() == Some(usage) || legacy_delta.as_ref() == Some(usage))
+                && (time - *observed).num_milliseconds().unsigned_abs() <= 2000
+            {
+                *consumed = true;
+                // Compatibility counters can exclude compaction that the new counters include.
+                // Keep the two counter series separate; this request was already counted directly.
+                self.baselines.insert(session.clone(), total);
+                self.baseline_models
+                    .insert(session, self.current.model.clone());
+                self.coverage.duplicates += 1;
+                return;
+            }
+        }
+        let previous = self.baselines.get(&session).cloned().or_else(|| {
+            if session == self.owner {
+                self.parent
+                    .as_ref()
+                    .and_then(|parent| self.baselines.get(parent))
+                    .cloned()
+            } else {
+                None
+            }
+        });
+        let usage = if let Some(previous) = &previous {
+            match subtract_usage(&total, previous) {
+                Some(delta) => delta,
+                None => {
+                    self.baselines.insert(session, total);
+                    self.problem(path, "Cumulative counter decreased; baseline reset, ambiguous increment excluded", false);
+                    return;
+                }
+            }
+        } else {
+            total.clone()
+        };
+        self.baselines.insert(session.clone(), total.clone());
+        let previous_model = self
+            .baseline_models
+            .insert(session.clone(), self.current.model.clone());
+        if usage.total() == 0 {
+            return;
+        }
+        if let Err(error) = usage.validate() {
+            self.problem(path, &error.to_string(), true);
+            return;
+        }
+        let snapshot = snapshot_key(&session, &total);
+        let id = format!("legacy:{}:{}", time.timestamp_millis(), snapshot);
+        let mut event = self.event(id, time, session, usage, info);
+        let mixed_model = previous_model.is_some_and(|model| model != self.current.model)
+            && !parse_usage(&info["last_token_usage"]).is_ok_and(|last| last == event.usage);
+        if mixed_model {
+            event.model = "unknown".into();
+            self.problem(
+                path,
+                "Cumulative delta spans a model change; model attribution is unknown",
+                false,
+            );
+        }
+        self.events.push(Candidate {
+            event,
+            turn: if mixed_model {
+                None
+            } else {
+                self.current_turn.clone()
+            },
+            snapshot: Some(snapshot),
+            direct: false,
+        });
+    }
+
+    fn inherited_turn(&self, record_time: DateTime<Utc>) -> bool {
+        let Some(created) = self.owner_created else {
+            return false;
+        };
+        if let Some(turn_time) = self.current_turn.as_deref().and_then(uuid_v7_millis) {
+            return turn_time < created.timestamp_millis();
+        }
+        record_time < created
+    }
+}
+
+fn uuid_v7_millis(id: &str) -> Option<i64> {
+    let bytes = id.as_bytes();
+    if bytes.len() != 36
+        || bytes[8] != b'-'
+        || bytes[13] != b'-'
+        || bytes[14] != b'7'
+        || bytes[18] != b'-'
+        || bytes[23] != b'-'
+    {
+        return None;
+    }
+    if bytes
+        .iter()
+        .enumerate()
+        .any(|(i, b)| ![8, 13, 18, 23].contains(&i) && !b.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    i64::from_str_radix(&format!("{}{}", &id[..8], &id[9..13]), 16).ok()
+}
+
+fn recorded_tier(payload: &Value) -> Option<Option<String>> {
+    for record in [payload, &payload["settings"], &payload["thread_settings"]] {
+        if let Some(value) = record.get("service_tier") {
+            return Some(value.as_str().map(str::to_owned));
+        }
+    }
+    None
+}
+
+fn head_kind(bytes: &[u8]) -> Option<String> {
+    let prefix = bytes.get(..bytes.len().min(256))?;
+    let mut position = 0;
+    let mut depth = 0usize;
+    while position < prefix.len() {
+        match prefix[position] {
+            b'{' | b'[' => depth += 1,
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            b'"' => {
+                let start = position;
+                position += 1;
+                while position < prefix.len() {
+                    if prefix[position] == b'\\' {
+                        position += 2;
+                        continue;
+                    }
+                    if prefix[position] == b'"' {
+                        break;
+                    }
+                    position += 1;
+                }
+                if depth == 1 && prefix.get(start..=position) == Some(b"\"type\"") {
+                    let mut rest = prefix.get(position + 1..)?;
+                    while rest.first().is_some_and(u8::is_ascii_whitespace) {
+                        rest = &rest[1..];
+                    }
+                    if rest.first() != Some(&b':') {
+                        return None;
+                    }
+                    rest = &rest[1..];
+                    while rest.first().is_some_and(u8::is_ascii_whitespace) {
+                        rest = &rest[1..];
+                    }
+                    if rest.first() != Some(&b'"') {
+                        return None;
+                    }
+                    let end = rest[1..].iter().position(|byte| *byte == b'"')?;
+                    return std::str::from_utf8(&rest[1..end + 1])
+                        .ok()
+                        .map(str::to_owned);
+                }
+            }
+            _ => {}
+        }
+        position += 1;
+    }
+    None
+}
+fn parse_usage(value: &Value) -> std::result::Result<Usage, String> {
+    let required = |key| {
+        value
+            .get(key)
+            .and_then(Value::as_u64)
+            .ok_or_else(|| format!("Missing or invalid {key}"))
+    };
+    let optional = |key| match value.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| format!("Invalid {key}")),
+    };
+    let usage = Usage {
+        input: required("input_tokens")?,
+        output: required("output_tokens")?,
+        cached: optional("cached_input_tokens")?,
+        cache_write: optional("cache_write_input_tokens")?,
+        reasoning: optional("reasoning_output_tokens")?,
+    };
+    usage.validate().map_err(|error| error.to_string())?;
+    if let Some(reported) = value.get("total_tokens") {
+        if reported.as_u64() != Some(usage.total()) {
+            return Err("Reported total differs from input plus output".into());
+        }
+    }
+    Ok(usage)
+}
+fn subtract_usage(total: &Usage, previous: &Usage) -> Option<Usage> {
+    let subset = |a: Option<u64>, b: Option<u64>| match (a, b) {
+        (Some(a), Some(b)) => a.checked_sub(b).map(Some),
+        _ => Some(None),
+    };
+    Some(Usage {
+        input: total.input.checked_sub(previous.input)?,
+        output: total.output.checked_sub(previous.output)?,
+        cached: subset(total.cached, previous.cached)?,
+        cache_write: subset(total.cache_write, previous.cache_write)?,
+        reasoning: subset(total.reasoning, previous.reasoning)?,
+    })
+}
+fn snapshot_key(session: &str, usage: &Usage) -> String {
+    // Core counters identify mirrored snapshots even if an older format omitted subsets.
+    format!("{session}:{}:{}", usage.input, usage.output)
+}
+fn same_usage(a: &UsageEvent, b: &UsageEvent) -> bool {
+    a.usage.input == b.usage.input
+        && a.usage.output == b.usage.output
+        && compatible(a.usage.cached, b.usage.cached)
+        && compatible(a.usage.cache_write, b.usage.cache_write)
+        && compatible(a.usage.reasoning, b.usage.reasoning)
+}
+fn same_event(a: &UsageEvent, b: &UsageEvent) -> bool {
+    same_usage(a, b)
+        && a.session == b.session
+        && (a.model == "unknown" || b.model == "unknown" || a.model == b.model)
+        && (a.provider == "unknown" || b.provider == "unknown" || a.provider == b.provider)
+        && (a.tier.is_none() || b.tier.is_none() || a.tier == b.tier)
+}
+fn compatible(a: Option<u64>, b: Option<u64>) -> bool {
+    a.is_none() || b.is_none() || a == b
+}
+fn merge_event(existing: &mut UsageEvent, other: &UsageEvent) {
+    existing.origins.extend(other.origins.iter().cloned());
+    if existing.model == "unknown" && other.model != "unknown" {
+        existing.model.clone_from(&other.model);
+    }
+    if existing.provider == "unknown" && other.provider != "unknown" {
+        existing.provider.clone_from(&other.provider);
+    }
+    if existing.tier.is_none() {
+        existing.tier.clone_from(&other.tier);
+    }
+    if existing.usage.cached.is_none() {
+        existing.usage.cached = other.usage.cached;
+    }
+    if existing.usage.cache_write.is_none() {
+        existing.usage.cache_write = other.usage.cache_write;
+    }
+    if existing.usage.reasoning.is_none() {
+        existing.usage.reasoning = other.usage.reasoning;
+    }
+}
+fn reconcile(mut candidates: Vec<Candidate>, coverage: &mut Coverage) -> Vec<UsageEvent> {
+    // Prefer an identified response over its equivalent legacy snapshot from another copy.
+    candidates.sort_by(|a, b| {
+        b.direct
+            .cmp(&a.direct)
+            .then_with(|| a.event.source.cmp(&b.event.source))
+            .then_with(|| a.event.id.cmp(&b.event.id))
+    });
+    let mut events: BTreeMap<String, UsageEvent> = BTreeMap::new();
+    let mut direct_snapshots: HashMap<String, Vec<String>> = HashMap::new();
+    let mut conflicts = BTreeSet::new();
+    for candidate in candidates {
+        let mut event = candidate.event;
+        if !candidate.direct {
+            if let Some(ids) = candidate
+                .snapshot
+                .as_ref()
+                .and_then(|key| direct_snapshots.get(key))
+            {
+                let matching: Vec<_> = ids
+                    .iter()
+                    .filter(|id| {
+                        events.get(*id).is_some_and(|other| {
+                            same_usage(other, &event)
+                                && (other.timestamp - event.timestamp)
+                                    .num_milliseconds()
+                                    .unsigned_abs()
+                                    <= 2000
+                        })
+                    })
+                    .cloned()
+                    .collect();
+                if matching.len() == 1 {
+                    if let Some(other) = events.get_mut(&matching[0]) {
+                        merge_event(other, &event);
+                    }
+                    coverage.duplicates += 1;
+                    continue;
+                }
+            }
+        }
+        if conflicts.contains(&event.id) {
+            continue;
+        }
+        if let Some(existing) = events.get_mut(&event.id) {
+            if same_event(existing, &event) {
+                merge_event(existing, &event);
+                coverage.duplicates += 1;
+            } else {
+                coverage.conflicts += 1;
+                note(
+                    coverage,
+                    "Conflicting copies of an identified request were excluded",
+                );
+                conflicts.insert(event.id.clone());
+                events.remove(&event.id);
+            }
+        } else {
+            if candidate.direct {
+                if let Some(snapshot) = candidate.snapshot {
+                    direct_snapshots
+                        .entry(snapshot)
+                        .or_default()
+                        .push(event.id.clone());
+                }
+            }
+            if event.origins.is_empty() {
+                event.origins.insert(event.source.clone());
+            }
+            events.insert(event.id.clone(), event);
+        }
+    }
+    let mut events: Vec<_> = events.into_values().collect();
+    events.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then_with(|| a.id.cmp(&b.id)));
+    events
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::io::Write;
+    use tempfile::TempDir;
+
+    fn source(root: &Path, name: &str) -> Source {
+        Source {
+            name: name.into(),
+            kind: "linux".into(),
+            root: root.into(),
+            enabled: true,
+        }
+    }
+    fn usage(input: u64, output: u64) -> Value {
+        json!({"input_tokens":input,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":output,
+            "reasoning_output_tokens":0,"total_tokens":input+output})
+    }
+    fn metadata(session: &str) -> Value {
+        json!({"timestamp":"2026-11-01T10:00:00Z","type":"session_meta",
+            "payload":{"id":session,"timestamp":"2026-11-01T10:00:00Z","cwd":"/project","model_provider":"openai"}})
+    }
+    fn turn(id: &str, model: &str) -> Value {
+        json!({"timestamp":"2026-11-01T10:00:01Z","type":"turn_context","payload":{"turn_id":id,"model":model}})
+    }
+    fn direct(
+        response: &str,
+        session: &str,
+        turn_id: &str,
+        input: u64,
+        output: u64,
+        total_input: u64,
+        total_output: u64,
+    ) -> Value {
+        json!({"timestamp":"2026-11-01T10:00:02Z","type":"token_usage_record", "payload":{
+            "thread_id":session,"turn_id":turn_id,"response_id":response,"usage":usage(input,output),
+            "thread_token_usage":usage(total_input,total_output)}})
+    }
+    fn legacy(input: u64, output: u64, seconds: u8) -> Value {
+        json!({"timestamp":format!("2026-11-01T10:00:{seconds:02}Z"),"type":"event_msg", "payload":{
+            "type":"token_count","info":{"total_token_usage":usage(input,output),"last_token_usage":usage(input,output)}}})
+    }
+    fn write(path: &Path, values: &[Value]) {
+        let mut file = File::create(path).unwrap();
+        for value in values {
+            writeln!(file, "{value}").unwrap();
+        }
+    }
+    #[test]
+    fn current_model_changes_and_legacy_mirrors_count_once() {
+        let dir = TempDir::new().unwrap();
+        write(
+            &dir.path().join("rollout.jsonl"),
+            &[
+                metadata("s"),
+                turn("t1", "alpha"),
+                direct("r1", "s", "t1", 100, 20, 100, 20),
+                legacy(100, 20, 2),
+                turn("t2", "beta"),
+                direct("r2", "s", "t2", 50, 5, 150, 25),
+                legacy(150, 25, 3),
+            ],
+        );
+        let scan = Reader::new().scan(&[source(dir.path(), "linux")]).unwrap();
+        assert_eq!(scan.events.len(), 2);
+        assert_eq!(
+            scan.events.iter().map(|e| e.usage.total()).sum::<u64>(),
+            175
+        );
+        assert_eq!(
+            scan.events
+                .iter()
+                .find(|e| e.id == "response:r2")
+                .unwrap()
+                .model,
+            "beta"
+        );
+        assert!(!scan.coverage.incomplete(), "{:?}", scan.coverage);
+    }
+    #[test]
+    fn legacy_counters_reset_without_charging_full_snapshot() {
+        let dir = TempDir::new().unwrap();
+        write(
+            &dir.path().join("rollout.jsonl"),
+            &[
+                metadata("s"),
+                turn("t", "alpha"),
+                legacy(100, 10, 2),
+                legacy(100, 10, 3),
+                legacy(200, 20, 4),
+                legacy(20, 2, 5),
+                legacy(30, 3, 6),
+            ],
+        );
+        let scan = Reader::new().scan(&[source(dir.path(), "linux")]).unwrap();
+        assert_eq!(
+            scan.events.iter().map(|e| e.usage.total()).sum::<u64>(),
+            231
+        );
+        assert_eq!(scan.coverage.uncertain, 1);
+    }
+    #[test]
+    fn copies_and_forked_history_preserve_original_thread_identity() {
+        let left = TempDir::new().unwrap();
+        let right = TempDir::new().unwrap();
+        let values = [
+            metadata("parent"),
+            turn("p", "alpha"),
+            direct("rp", "parent", "p", 100, 10, 100, 10),
+        ];
+        write(&left.path().join("parent.jsonl"), &values);
+        let mut child_meta = metadata("child");
+        child_meta["payload"]["parent_thread_id"] = json!("parent");
+        child_meta["payload"]["forked_from_id"] = json!("parent");
+        let mut child = vec![child_meta];
+        child.extend(values.clone());
+        child.extend([
+            turn("c", "beta"),
+            direct("rc", "child", "c", 50, 5, 50, 5),
+            legacy(50, 5, 3),
+        ]);
+        write(&right.path().join("child.jsonl"), &child);
+        write(&right.path().join("copy.jsonl"), &values);
+        let scan = Reader::new()
+            .scan(&[source(left.path(), "windows"), source(right.path(), "wsl")])
+            .unwrap();
+        assert_eq!(scan.events.len(), 2);
+        assert_eq!(
+            scan.events.iter().map(|e| e.usage.total()).sum::<u64>(),
+            165
+        );
+        let parent = scan.events.iter().find(|e| e.session == "parent").unwrap();
+        assert_eq!(parent.origins.len(), 2);
+        assert_eq!(scan.coverage.duplicates, 3);
+    }
+    #[test]
+    fn append_partial_rewrite_move_and_source_recovery_reconcile() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        write(
+            &path,
+            &[
+                metadata("s"),
+                turn("t", "alpha"),
+                direct("r1", "s", "t", 100, 10, 100, 10),
+            ],
+        );
+        let sources = [source(dir.path(), "linux")];
+        let mut reader = Reader::new();
+        assert_eq!(reader.scan(&sources).unwrap().events.len(), 1);
+        let record = direct("r2", "s", "t", 50, 5, 150, 15).to_string();
+        let half = record.len() / 2;
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(&record.as_bytes()[..half]).unwrap();
+        file.flush().unwrap();
+        let pending = reader.scan(&sources).unwrap();
+        assert_eq!(pending.events.len(), 1);
+        assert_eq!(pending.coverage.pending, 1);
+        file.write_all(&record.as_bytes()[half..]).unwrap();
+        writeln!(file).unwrap();
+        file.flush().unwrap();
+        assert_eq!(reader.scan(&sources).unwrap().events.len(), 2);
+        drop(file);
+        write(
+            &path,
+            &[
+                metadata("s"),
+                turn("t", "beta"),
+                direct("r3", "s", "t", 20, 2, 20, 2),
+            ],
+        );
+        assert_eq!(reader.scan(&sources).unwrap().events[0].usage.total(), 22);
+        let hidden = dir.path().with_extension("temporarily-offline");
+        fs::rename(dir.path(), &hidden).unwrap();
+        let stale = reader.scan(&sources).unwrap();
+        assert_eq!(stale.events.len(), 1);
+        assert!(!stale.sources[0].readable);
+        fs::rename(&hidden, dir.path()).unwrap();
+        fs::rename(&path, dir.path().join("moved.jsonl")).unwrap();
+        let live = reader.scan(&sources).unwrap();
+        assert_eq!(live.events.len(), 1);
+        assert!(live.sources[0].readable);
+    }
+
+    #[test]
+    fn complete_final_json_without_newline_counts_once() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("a.jsonl");
+        write(&path, &[metadata("s"), turn("t", "alpha")]);
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        write!(file, "{}", direct("r1", "s", "t", 10, 1, 10, 1)).unwrap();
+        file.flush().unwrap();
+        let mut reader = Reader::new();
+        let sources = [source(dir.path(), "linux")];
+        let first = reader.scan(&sources).unwrap();
+        assert_eq!(first.events.len(), 1);
+        assert_eq!(first.coverage.pending, 0);
+        writeln!(file).unwrap();
+        writeln!(file, "{}", direct("r2", "s", "t", 20, 2, 30, 3)).unwrap();
+        file.flush().unwrap();
+        let second = reader.scan(&sources).unwrap();
+        assert_eq!(second.events.len(), 2);
+        assert_eq!(second.coverage.pending, 0);
+    }
+    #[test]
+    fn compressed_copy_plain_preference_and_unknown_model() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("sessions");
+        fs::create_dir(&active).unwrap();
+        let archive = dir.path().join("archived_sessions");
+        fs::create_dir(&archive).unwrap();
+        let data = format!(
+            "{}\n{}\n",
+            metadata("s"),
+            direct("r", "s", "t", 10, 1, 10, 1)
+        );
+        let compressed = zstd::encode_all(data.as_bytes(), 1).unwrap();
+        fs::write(active.join("rollout.jsonl.zst"), compressed).unwrap();
+        fs::write(
+            archive.join("rollout.jsonl"),
+            format!("{}\n", metadata("empty")),
+        )
+        .unwrap();
+        let scan = Reader::new().scan(&[source(dir.path(), "linux")]).unwrap();
+        assert_eq!(scan.events.len(), 1);
+        assert_eq!(scan.coverage.files, 1);
+        assert_eq!(scan.events[0].model, "unknown");
+    }
+    #[test]
+    fn malformed_counts_unknown_usage_and_missing_subsets_are_visible() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        let mut record = direct("r", "s", "t", 10, 1, 10, 1);
+        record["payload"]["usage"]
+            .as_object_mut()
+            .unwrap()
+            .remove("cache_write_input_tokens");
+        write(
+            &path,
+            &[
+                metadata("s"),
+                record,
+                json!({"type":"new_token_usage","payload":{}}),
+            ],
+        );
+        writeln!(
+            fs::OpenOptions::new().append(true).open(&path).unwrap(),
+            "not json"
+        )
+        .unwrap();
+        let scan = Reader::new().scan(&[source(dir.path(), "linux")]).unwrap();
+        assert_eq!(scan.events[0].usage.cache_write, None);
+        assert_eq!(scan.coverage.uncertain, 1);
+        assert_eq!(scan.coverage.malformed, 1);
+    }
+    #[test]
+    fn conflicting_response_is_excluded_instead_of_guessed() {
+        let dir = TempDir::new().unwrap();
+        write(
+            &dir.path().join("a.jsonl"),
+            &[metadata("s"), direct("r", "s", "t", 10, 1, 10, 1)],
+        );
+        write(
+            &dir.path().join("b.jsonl"),
+            &[metadata("s"), direct("r", "s", "t", 20, 2, 20, 2)],
+        );
+        let scan = Reader::new().scan(&[source(dir.path(), "linux")]).unwrap();
+        assert!(scan.events.is_empty());
+        assert_eq!(scan.coverage.conflicts, 1);
+    }
+
+    #[test]
+    fn equal_independent_requests_without_response_ids_are_not_collapsed() {
+        let dir = TempDir::new().unwrap();
+        let mut record = direct("unused", "s", "t", 10, 1, 10, 1);
+        record["payload"]
+            .as_object_mut()
+            .unwrap()
+            .remove("response_id");
+        record["payload"]
+            .as_object_mut()
+            .unwrap()
+            .remove("thread_token_usage");
+        write(
+            &dir.path().join("a.jsonl"),
+            &[metadata("s"), record.clone(), record],
+        );
+        let scan = Reader::new().scan(&[source(dir.path(), "linux")]).unwrap();
+        assert_eq!(scan.events.len(), 2);
+        assert_eq!(
+            scan.events
+                .iter()
+                .map(|event| event.usage.total())
+                .sum::<u64>(),
+            22
+        );
+        assert_eq!(scan.coverage.uncertain, 2);
+    }
+
+    #[test]
+    fn settings_and_reused_turn_contexts_do_not_reprice_earlier_responses() {
+        let dir = TempDir::new().unwrap();
+        let setting =
+            json!({"type":"thread_settings_applied","payload":{"service_tier":"priority"}});
+        write(
+            &dir.path().join("a.jsonl"),
+            &[
+                metadata("s"),
+                turn("t", "alpha"),
+                direct("r1", "s", "t", 10, 1, 10, 1),
+                setting,
+                turn("t", "beta"),
+                direct("r2", "s", "t", 20, 2, 30, 3),
+            ],
+        );
+        let scan = Reader::new().scan(&[source(dir.path(), "linux")]).unwrap();
+        let first = scan
+            .events
+            .iter()
+            .find(|event| event.id == "response:r1")
+            .unwrap();
+        let second = scan
+            .events
+            .iter()
+            .find(|event| event.id == "response:r2")
+            .unwrap();
+        assert_eq!(first.model, "alpha");
+        assert_eq!(first.tier, None);
+        assert_eq!(second.model, "beta");
+        assert_eq!(second.tier.as_deref(), Some("priority"));
+    }
+
+    #[test]
+    fn recorded_thread_settings_and_request_tiers_keep_switch_chronology() {
+        let dir = TempDir::new().unwrap();
+        let setting = |tier| {
+            json!({"type":"event_msg","payload":{
+            "type":"thread_settings_applied","thread_id":"s","thread_settings":{"service_tier":tier}}})
+        };
+        let mut regular = turn("t", "alpha");
+        regular["payload"]["service_tier"] = json!("standard");
+        let mut request_override = direct("r4", "s", "t", 10, 1, 40, 4);
+        request_override["payload"]["service_tier"] = json!("priority");
+        write(
+            &dir.path().join("a.jsonl"),
+            &[
+                metadata("s"),
+                turn("t", "alpha"),
+                setting(json!("priority")),
+                direct("r1", "s", "t", 10, 1, 10, 1),
+                regular,
+                direct("r2", "s", "t", 10, 1, 20, 2),
+                setting(Value::Null),
+                direct("r3", "s", "t", 10, 1, 30, 3),
+                request_override,
+            ],
+        );
+        let scan = Reader::new().scan(&[source(dir.path(), "linux")]).unwrap();
+        let tiers: Vec<_> = ["r1", "r2", "r3", "r4"]
+            .iter()
+            .map(|id| {
+                scan.events
+                    .iter()
+                    .find(|event| event.id == format!("response:{id}"))
+                    .unwrap()
+                    .tier
+                    .as_deref()
+            })
+            .collect();
+        assert_eq!(
+            tiers,
+            vec![Some("priority"), Some("standard"), None, Some("priority")]
+        );
+    }
+
+    #[test]
+    fn inherited_parent_settings_do_not_classify_unrecorded_child_mode() {
+        let dir = TempDir::new().unwrap();
+        let mut child = metadata("child");
+        child["payload"]["parent_thread_id"] = json!("parent");
+        let setting = json!({"type":"event_msg","payload":{"type":"thread_settings_applied",
+            "thread_id":"parent","thread_settings":{"service_tier":"priority"}}});
+        write(
+            &dir.path().join("a.jsonl"),
+            &[
+                child,
+                metadata("parent"),
+                turn("parent-turn", "alpha"),
+                setting,
+                direct("inherited", "parent", "parent-turn", 10, 1, 10, 1),
+                turn("child-turn", "alpha"),
+                direct("own", "child", "child-turn", 20, 2, 20, 2),
+            ],
+        );
+        let scan = Reader::new().scan(&[source(dir.path(), "linux")]).unwrap();
+        assert_eq!(scan.events.len(), 1);
+        assert_eq!(scan.events[0].tier, None);
+    }
+
+    #[test]
+    fn inherited_turn_tier_is_scoped_to_parent_thread() {
+        let dir = TempDir::new().unwrap();
+        let created: DateTime<Utc> = "2026-11-01T10:00:00Z".parse().unwrap();
+        let mut child = metadata("child");
+        child["payload"]["parent_thread_id"] = json!("parent");
+        let old_turn = uuid_at(created.timestamp_millis() - 500, 1);
+        let own_turn = uuid_at(created.timestamp_millis() + 500, 2);
+        let mut parent_context = turn(&old_turn, "alpha");
+        parent_context["payload"]["service_tier"] = json!("priority");
+        write(
+            &dir.path().join("a.jsonl"),
+            &[
+                child,
+                parent_context,
+                direct("inherited", "parent", &old_turn, 10, 1, 10, 1),
+                turn(&own_turn, "alpha"),
+                direct("own", "child", &own_turn, 20, 2, 20, 2),
+            ],
+        );
+        let scan = Reader::new().scan(&[source(dir.path(), "linux")]).unwrap();
+        assert_eq!(scan.events.len(), 1);
+        assert_eq!(scan.events[0].tier, None);
+    }
+
+    #[test]
+    fn duplicate_copy_can_supply_recorded_mode_missing_in_other_copy() {
+        let left = TempDir::new().unwrap();
+        let right = TempDir::new().unwrap();
+        let original = direct("r", "s", "t", 10, 1, 10, 1);
+        let mut enriched = original.clone();
+        enriched["payload"]["service_tier"] = json!("priority");
+        write(&left.path().join("a.jsonl"), &[metadata("s"), original]);
+        write(&right.path().join("b.jsonl"), &[metadata("s"), enriched]);
+        let scan = Reader::new()
+            .scan(&[source(left.path(), "a"), source(right.path(), "b")])
+            .unwrap();
+        assert_eq!(scan.events.len(), 1);
+        assert_eq!(scan.events[0].tier.as_deref(), Some("priority"));
+        assert_eq!(scan.events[0].origins.len(), 2);
+    }
+
+    #[test]
+    fn ambiguous_model_boundary_and_standalone_compaction_are_disclosed() {
+        let dir = TempDir::new().unwrap();
+        let mut later = legacy(200, 20, 3);
+        later["payload"]["info"]["last_token_usage"] = usage(50, 5);
+        let standalone = json!({"timestamp":"2026-11-01T10:00:04Z","type":"token_usage_record",
+            "payload":{"response_id":"compaction","usage":usage(10,1)}});
+        write(
+            &dir.path().join("a.jsonl"),
+            &[
+                metadata("s"),
+                turn("a", "alpha"),
+                legacy(100, 10, 2),
+                turn("b", "beta"),
+                later,
+                standalone,
+            ],
+        );
+        let scan = Reader::new().scan(&[source(dir.path(), "linux")]).unwrap();
+        assert_eq!(scan.events.len(), 2);
+        assert_eq!(
+            scan.events
+                .iter()
+                .filter(|event| event.model == "unknown")
+                .count(),
+            1
+        );
+        assert_eq!(scan.coverage.uncertain, 2);
+        assert_eq!(
+            scan.events
+                .iter()
+                .map(|event| event.usage.total())
+                .sum::<u64>(),
+            220
+        );
+    }
+
+    #[test]
+    fn current_and_compatibility_counters_may_have_different_bases() {
+        let dir = TempDir::new().unwrap();
+        let mut first = legacy(10_000, 1_000, 2);
+        first["payload"]["info"]["last_token_usage"] = usage(10, 1);
+        let mut second = legacy(10_020, 1_002, 3);
+        second["payload"]["info"]["last_token_usage"] = usage(20, 2);
+        write(
+            &dir.path().join("a.jsonl"),
+            &[
+                metadata("s"),
+                turn("t", "alpha"),
+                direct("r1", "s", "t", 10, 1, 10, 1),
+                first,
+                direct("r2", "s", "t", 20, 2, 30, 3),
+                second,
+            ],
+        );
+        let scan = Reader::new().scan(&[source(dir.path(), "linux")]).unwrap();
+        assert_eq!(scan.events.len(), 2);
+        assert_eq!(
+            scan.events
+                .iter()
+                .map(|event| event.usage.total())
+                .sum::<u64>(),
+            33
+        );
+        assert_eq!(scan.coverage.uncertain, 0);
+    }
+
+    #[test]
+    fn bad_leaf_does_not_discard_readable_source_files() {
+        let dir = TempDir::new().unwrap();
+        write(
+            &dir.path().join("good.jsonl"),
+            &[metadata("s"), direct("r", "s", "t", 10, 1, 10, 1)],
+        );
+        fs::write(dir.path().join("bad.jsonl.zst"), b"not zstandard data").unwrap();
+        let scan = Reader::new().scan(&[source(dir.path(), "linux")]).unwrap();
+        assert_eq!(scan.events.len(), 1);
+        assert!(scan.sources[0].readable);
+        assert_eq!(scan.coverage.uncertain, 1);
+    }
+
+    #[test]
+    fn periodic_reconciliation_starts_after_initial_scan_and_runs_in_background() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("a.jsonl");
+        let values = [metadata("s"), direct("r", "s", "t", 10, 1, 10, 1)];
+        write(&path, &values);
+        let sources = [source(dir.path(), "linux")];
+        let mut reader = Reader::new();
+        reader.scan(&sources).unwrap();
+        assert!(reader.reconcile_at.unwrap() > Instant::now());
+        assert!(reader.reconcile_job.is_none());
+        let original_time = fs::metadata(&path).unwrap().modified().unwrap();
+        let original_size = fs::metadata(&path).unwrap().len();
+        write(&path, &[metadata("s"), direct("r", "s", "t", 20, 2, 20, 2)]);
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(original_time))
+            .unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().len(), original_size);
+        // Force unchanged fingerprints independently of filesystem timestamp precision
+        // or Windows creation-time identity changes across a UNC-backed rewrite.
+        let rewritten = fs::metadata(&path).unwrap();
+        let cached = reader
+            .files
+            .get_mut(&("linux".into(), path.clone()))
+            .unwrap();
+        cached.modified = rewritten.modified().ok();
+        cached.identity = identity(&rewritten);
+        assert_eq!(reader.scan(&sources).unwrap().events[0].usage.total(), 11);
+        reader.reconcile_at = Some(Instant::now() - Duration::from_secs(1));
+        reader.scan(&sources).unwrap();
+        assert!(reader.reconcile_job.is_some());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while reader.reconcile_job.is_some() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+            reader.scan(&sources).unwrap();
+        }
+        assert_eq!(reader.scan(&sources).unwrap().events[0].usage.total(), 22);
+        assert!(reader.reconcile_at.unwrap() > Instant::now());
+        assert!(reader.reconcile_job.is_none());
+    }
+
+    fn uuid_at(millis: i64, suffix: u64) -> String {
+        format!(
+            "{:08x}-{:04x}-7000-8000-{suffix:012x}",
+            millis >> 16,
+            millis & 0xffff
+        )
+    }
+
+    #[test]
+    fn retimestamped_fork_prefix_is_a_baseline_not_child_usage() {
+        let dir = TempDir::new().unwrap();
+        let created: DateTime<Utc> = "2026-11-01T10:00:00Z".parse().unwrap();
+        let parent = uuid_at(created.timestamp_millis() - 1000, 1);
+        let inherited_turn = uuid_at(created.timestamp_millis() - 500, 2);
+        write(
+            &dir.path().join("parent.jsonl"),
+            &[
+                metadata(&parent),
+                turn(&inherited_turn, "alpha"),
+                legacy(100, 10, 2),
+                legacy(200, 20, 3),
+            ],
+        );
+        for (index, input, output) in [(1, 250, 25), (2, 270, 27)] {
+            let child = uuid_at(created.timestamp_millis(), 10 + index);
+            let mut meta = metadata(&child);
+            meta["payload"]["parent_thread_id"] = json!(parent);
+            meta["payload"]["forked_from_id"] = json!(parent);
+            write(
+                &dir.path().join(format!("child-{index}.jsonl")),
+                &[
+                    meta,
+                    turn(&inherited_turn, "alpha"),
+                    legacy(100, 10, 2),
+                    legacy(200, 20, 3),
+                    turn(
+                        &uuid_at(created.timestamp_millis() + 500, 100 + index),
+                        "beta",
+                    ),
+                    legacy(input, output, 4),
+                ],
+            );
+        }
+        let scan = Reader::new().scan(&[source(dir.path(), "linux")]).unwrap();
+        assert_eq!(scan.events.len(), 4);
+        assert_eq!(
+            scan.events
+                .iter()
+                .map(|event| event.usage.total())
+                .sum::<u64>(),
+            352
+        );
+    }
+
+    #[test]
+    #[ignore = "read-only local schema smoke: set CODEX_USAGE_TEST_ROLLOUT"]
+    fn local_rollout_read_only_smoke() {
+        let path =
+            PathBuf::from(std::env::var_os("CODEX_USAGE_TEST_ROLLOUT").expect("set rollout path"));
+        let mut parser = Parser::default();
+        parser
+            .consume(BufReader::new(File::open(&path).unwrap()), &path)
+            .unwrap();
+        assert_eq!(
+            parser.coverage.malformed, 0,
+            "{:?}",
+            parser.coverage.messages
+        );
+        let mut coverage = Coverage::default();
+        let events = reconcile(parser.events, &mut coverage);
+        assert!(!events.is_empty());
+        assert_eq!(coverage.conflicts, 0);
+        eprintln!(
+            "Read-only local smoke: {} usage increments, {} total tokens; {} uncertain",
+            events.len(),
+            events.iter().map(|event| event.usage.total()).sum::<u64>(),
+            parser.coverage.uncertain
+        );
+    }
+}
