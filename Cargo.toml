@@ -5,7 +5,6 @@ edition = "2021"
 description = "Local Codex usage reports and live monitoring across Windows and WSL"
 license = "MIT"
 default-run = "codex-usage"
-autoexamples = false
 
 [dependencies]
 anyhow = "1"
