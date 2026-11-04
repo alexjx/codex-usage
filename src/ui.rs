@@ -7,6 +7,7 @@ use crate::{
     report::Report,
 };
 use anyhow::Result;
+use clap::ValueEnum;
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
@@ -359,11 +360,20 @@ where
                         }
                         KeyCode::Enter if selecting => {
                             notice = None;
-                            let id = &v.session_rows[selected_session].session;
+                            let selected = &v.session_rows[selected_session];
+                            let id = &selected.session;
+                            // Reader context is transient: the saved report remains untouched.
+                            let mut reader_cli = cli.clone();
+                            if let Some(model) = &selected.model {
+                                reader_cli.models = vec![model.clone()];
+                            }
+                            if let Some(mode) = &selected.mode {
+                                reader_cli.mode = crate::cli::Mode::from_str(mode, false).ok();
+                            }
                             match load_conversation(cli, sources, id, &stopped, true) {
                                 Ok(conversation) => {
                                     if conversation_ui::run(
-                                        cli,
+                                        &reader_cli,
                                         conversation,
                                         &report,
                                         sources,

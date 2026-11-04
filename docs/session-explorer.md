@@ -68,7 +68,7 @@ Turn 2/3   [ ] Turn   t Tools   / Search   Esc Back   ? Help
 ```
 
 - The turn list takes 24–32 columns; the conversation uses the remaining space. Turn labels come from the first nonempty line of the user message, never generated summaries or network calls.
-- The selected turn stays highlighted in the outline as the reader scrolls. `[` and `]` jump to previous/next turns; the outline itself scrolls to keep the selected turn visible.
+- The selected turn stays highlighted in the outline as the reader scrolls; the outline scrolls only when the selection leaves its visible rows. Selecting a model/mode row opens a matching invocation, with nearby prompt context. `m`/`M` navigate matching turns while retaining the full transcript. `[` and `]` jump to previous/next turns; the outline itself scrolls to keep the selected turn visible.
 - Below 120 columns, hide the outline and use the full width for conversation. Retain the turn-position indicator and jump keys.
 - Below 60 columns, put role/time/model labels on separate wrapped lines and shorten controls. Very short terminals show a resize hint while preserving the return/quit actions.
 - Wrap prose to the available pane width, capped at a readable 110 columns. Code blocks preserve indentation; long code lines wrap with a continuation marker rather than disappearing offscreen.
@@ -77,7 +77,7 @@ Turn 2/3   [ ] Turn   t Tools   / Search   Esc Back   ? Help
 ## Messages and tools
 
 - Show user messages, assistant progress messages, and final assistant replies in their original order, grouped into turns where recorded IDs establish that relationship.
-- Default to the latest retained user turn. Opening from a date-filtered report instead anchors to the first matching turn; older retained context remains available by scrolling upward.
+- A selected model/mode row opens a matching invocation in the report period; long prompts cannot hide the target below the viewport, and a matching tool call is revealed when needed. Without model focus, default to the latest retained user turn; date-filtered entry anchors to the first matching turn. Older retained context remains available by scrolling upward.
 - Tool activity is a compact collapsed group between messages. Its summary shows call count and duration only when actually recorded. Expanded activity includes tool names, status, arguments, and results; code/output is visually distinct from chat text.
 - `Tab`/`Shift+Tab` move focus between message/tool blocks. Enter expands the focused tool group or long message. `t` toggles tool-group visibility. Arrow keys and `j`/`k` scroll; Page Up/Down and Home/End retain existing meanings.
 - Long messages/tool results start with a bounded preview and a visible expansion affordance. Expansion is cancellable and rendering stays limited to the viewport. Do not silently discard retained content.

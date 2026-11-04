@@ -60,6 +60,7 @@ struct Line {
     role: &'static str,
     turn: usize,
     block: Option<String>,
+    source: Option<(Part, usize)>,
 }
 #[derive(Default)]
 struct Document {
@@ -76,6 +77,7 @@ struct State {
     limits: BTreeMap<String, usize>,
     windows: BTreeMap<String, (Part, usize)>,
     saved_offset: usize,
+    saved_anchor: Option<ReadingAnchor>,
     tools: bool,
     inherited: bool,
     details: bool,
@@ -88,6 +90,9 @@ struct State {
     hit: usize,
     selected_turn: usize,
     notice: Option<String>,
+    outline_offset: usize,
+    model_hits: Vec<ModelHit>,
+    model_focus: String,
 }
 
 fn timezone(report: &Report) -> Tz {
@@ -129,11 +134,17 @@ fn heading(block: &Block, tz: Tz, ascii: bool) -> String {
     if let Some(name) = &block.tool_name {
         bits.push(conversation::sanitize(name));
     }
-    if let Some(model) = &block.model {
-        bits.push(conversation::sanitize(model));
-    }
-    if let Some(mode) = &block.mode {
-        bits.push(conversation::sanitize(mode));
+    if matches!(block.kind, BlockKind::Assistant | BlockKind::Tool) {
+        if let Some(model) = &block.model {
+            bits.push(conversation::sanitize(model));
+        }
+        if let Some(mode) = &block.mode {
+            let mut label = mode.clone();
+            if let Some(first) = label.get_mut(..1) {
+                first.make_ascii_uppercase();
+            }
+            bits.push(conversation::sanitize(&label));
+        }
     }
     if let Some(status) = &block.status {
         bits.push(conversation::sanitize(status));
@@ -176,6 +187,7 @@ fn append(
             role: style,
             turn,
             block: id.map(str::to_owned),
+            source: None,
         });
     }
 }
@@ -196,13 +208,17 @@ fn body(
         20
     };
     let window = state.windows.get(&id).copied();
-    let mut pieces: Vec<(&str, &str)> = Vec::new();
+    let mut pieces: Vec<(Part, &str, &str)> = Vec::new();
     if window.is_some_and(|(part, _)| part == Part::Output) {
-        pieces.push(("Result:", block.output.as_deref().unwrap_or("")));
+        pieces.push((
+            Part::Output,
+            "Result:",
+            block.output.as_deref().unwrap_or(""),
+        ));
     } else {
-        pieces.push(("", &block.text));
+        pieces.push((Part::Text, "", &block.text));
         if let Some(output) = &block.output {
-            pieces.push(("Result:", output));
+            pieces.push((Part::Output, "Result:", output));
         }
     }
     if window.is_some_and(|(_, start)| start > 0)
@@ -220,7 +236,7 @@ fn body(
     let mut shown = 0;
     let mut folded = false;
     let mut any = false;
-    for (piece_index, (label, text)) in pieces.iter().enumerate() {
+    for (piece_index, (part, label, text)) in pieces.iter().enumerate() {
         if !label.is_empty() {
             append(doc, label, "meta", width, turn, Some(&id));
         }
@@ -230,7 +246,8 @@ fn body(
             0
         };
         let start = start.min(text.len());
-        let mut chars = text[start..].chars().peekable();
+        let mut chars = text[start..].char_indices().peekable();
+        let mut line_start = start;
         let mut line = String::new();
         let mut cells = 0usize;
         let mut visited = 0usize;
@@ -238,7 +255,9 @@ fn body(
             .saturating_mul(width.max(1))
             .saturating_mul(8)
             .saturating_add(4096);
-        while let Some(c) = chars.next() {
+        while let Some((byte, c)) = chars.next() {
+            let source_byte = start + byte;
+            let source_end = source_byte + c.len_utf8();
             visited += 1;
             if visited.is_multiple_of(1024) {
                 crate::cancel::check(stopped)?;
@@ -268,7 +287,9 @@ fn body(
                         },
                         turn,
                         block: Some(id.clone()),
+                        source: Some((*part, line_start)),
                     });
+                    line_start = if c == '\n' { source_end } else { source_byte };
                     shown += 1;
                     any = true;
                     cells = 0;
@@ -297,6 +318,7 @@ fn body(
                 },
                 turn,
                 block: Some(id.clone()),
+                source: Some((*part, line_start)),
             });
             shown += 1;
             any = true;
@@ -370,6 +392,7 @@ fn document(
                     role: "body",
                     turn: turn_index,
                     block: None,
+                    source: None,
                 });
                 earlier = true;
             }
@@ -411,6 +434,7 @@ fn document(
                     role: "body",
                     turn: turn_index,
                     block: None,
+                    source: None,
                 });
                 i = end;
                 continue;
@@ -460,6 +484,7 @@ fn document(
                 role: "body",
                 turn: turn_index,
                 block: None,
+                source: None,
             });
             i += 1;
         }
@@ -521,6 +546,67 @@ fn top_block(doc: &Document, offset: usize) -> Option<String> {
                 .find_map(|line| line.block.clone())
         })
 }
+#[derive(Debug, Clone)]
+struct ReadingAnchor {
+    block: Option<String>,
+    source: Option<(Part, usize)>,
+    block_row: usize,
+    turn: usize,
+    turn_row: usize,
+}
+fn reading_anchor(doc: &Document, offset: usize) -> Option<ReadingAnchor> {
+    let line = doc.lines.get(offset)?;
+    let start = line
+        .block
+        .as_deref()
+        .and_then(|id| locate_block(doc, id))
+        .unwrap_or(offset);
+    Some(ReadingAnchor {
+        block: line.block.clone(),
+        source: line.source,
+        block_row: offset.saturating_sub(start),
+        turn: line.turn,
+        turn_row: offset.saturating_sub(locate_turn(doc, line.turn)),
+    })
+}
+fn restore_anchor(doc: &Document, anchor: &ReadingAnchor) -> usize {
+    if let Some(id) = &anchor.block {
+        if let Some((part, byte)) = anchor.source {
+            if let Some(index) = doc.lines.iter().rposition(|line| {
+                line.block.as_ref() == Some(id)
+                    && line
+                        .source
+                        .is_some_and(|(p, start)| p == part && start <= byte)
+            }) {
+                return index;
+            }
+        }
+        if let Some(start) = locate_block(doc, id) {
+            let length = doc
+                .lines
+                .iter()
+                .skip(start)
+                .take_while(|line| line.block.as_ref() == Some(id))
+                .count();
+            return start + anchor.block_row.min(length.saturating_sub(1));
+        }
+    }
+    let start = locate_turn(doc, anchor.turn);
+    let length = doc
+        .lines
+        .iter()
+        .skip(start)
+        .take_while(|line| line.turn == anchor.turn)
+        .count();
+    start + anchor.turn_row.min(length.saturating_sub(1))
+}
+fn block_visible(doc: &Document, id: &str, offset: usize, page: usize) -> bool {
+    doc.lines
+        .iter()
+        .skip(offset)
+        .take(page)
+        .any(|line| line.block.as_deref() == Some(id))
+}
 fn focus_next(state: &mut State, doc: &Document, reverse: bool, page: usize) {
     if doc.focus.is_empty() {
         return;
@@ -528,21 +614,143 @@ fn focus_next(state: &mut State, doc: &Document, reverse: bool, page: usize) {
     let current = state
         .focused
         .as_ref()
-        .and_then(|key| doc.focus.iter().position(|(id, _)| id == key));
+        .filter(|id| block_visible(doc, id, state.offset, page))
+        .and_then(|id| doc.focus.iter().position(|(key, _)| key == id));
     let index = match current {
-        Some(i) if reverse => (i + doc.focus.len() - 1) % doc.focus.len(),
-        Some(i) => (i + 1) % doc.focus.len(),
-        None if reverse => doc.focus.len() - 1,
-        None => 0,
+        Some(i) if reverse => i.saturating_sub(1),
+        Some(i) => (i + 1).min(doc.focus.len() - 1),
+        None if reverse => doc
+            .focus
+            .iter()
+            .rposition(|(_, line)| *line < state.offset + page)
+            .unwrap_or(0),
+        None => top_block(doc, state.offset)
+            .and_then(|id| doc.focus.iter().position(|(key, _)| key == &id))
+            .or_else(|| doc.focus.iter().position(|(_, line)| *line >= state.offset))
+            .unwrap_or(doc.focus.len() - 1),
     };
     let (id, line) = &doc.focus[index];
     state.focused = Some(id.clone());
-    if *line < state.offset || *line >= state.offset.saturating_add(page) {
-        state.offset = *line;
+    if !block_visible(doc, id, state.offset, page) {
+        state.offset = if *line < state.offset {
+            *line
+        } else {
+            (line + 1).saturating_sub(page)
+        };
+    }
+}
+#[derive(Clone, Copy)]
+enum Scroll {
+    Up,
+    Down,
+    PageUp,
+    PageDown,
+    Home,
+    End,
+}
+fn scroll(state: &mut State, content_len: usize, page: usize, action: Scroll) {
+    let end = content_len.saturating_sub(page);
+    state.offset = match action {
+        Scroll::Up => state.offset.saturating_sub(1),
+        Scroll::Down => state.offset.saturating_add(1),
+        Scroll::PageUp => state.offset.saturating_sub(page),
+        Scroll::PageDown => state.offset.saturating_add(page),
+        Scroll::Home => 0,
+        Scroll::End => end,
+    }
+    .min(end);
+    state.focused = None;
+}
+#[derive(Clone)]
+struct ModelHit {
+    turn: usize,
+    block: String,
+}
+fn model_hits(data: &Conversation, cli: &Cli, report: &Report) -> Vec<ModelHit> {
+    if cli.models.is_empty() && cli.mode.is_none() {
+        return Vec::new();
+    }
+    data.turns
+        .iter()
+        .enumerate()
+        .filter(|(_, turn)| !turn.inherited)
+        .filter_map(|(turn, value)| {
+            value
+                .blocks
+                .iter()
+                .filter(|block| matches!(block.kind, BlockKind::Assistant | BlockKind::Tool))
+                .find(|block| {
+                    (cli.models.is_empty()
+                        || block
+                            .model
+                            .as_ref()
+                            .is_some_and(|model| cli.models.contains(model)))
+                        && cli.mode.is_none_or(|mode| {
+                            block.mode.as_deref().unwrap_or("unknown") == mode.as_str()
+                        })
+                        && block
+                            .timestamp
+                            .or(value.timestamp)
+                            .is_none_or(|time| report.period.includes(time))
+                })
+                .map(|block| ModelHit {
+                    turn,
+                    block: key(block),
+                })
+        })
+        .collect()
+}
+fn jump_model(state: &mut State, reverse: bool) -> Option<usize> {
+    let hit = if reverse {
+        state
+            .model_hits
+            .iter()
+            .rfind(|hit| hit.turn < state.selected_turn)
+            .or_else(|| state.model_hits.last())
+    } else {
+        state
+            .model_hits
+            .iter()
+            .find(|hit| hit.turn > state.selected_turn)
+            .or_else(|| state.model_hits.first())
+    }?
+    .clone();
+    state.focused = Some(hit.block);
+    state.selected_turn = hit.turn;
+    Some(hit.turn)
+}
+fn reveal_model(data: &Conversation, state: &mut State, hit: &ModelHit) {
+    state.focused = Some(hit.block.clone());
+    state.selected_turn = hit.turn;
+    if data.turns.get(hit.turn).is_some_and(|turn| {
+        turn.blocks
+            .iter()
+            .any(|block| key(block) == hit.block && block.kind == BlockKind::Tool)
+    }) {
+        state.tools = true;
+    }
+}
+fn model_offset(doc: &Document, hit: &ModelHit, page: usize) -> usize {
+    let turn = locate_turn(doc, hit.turn);
+    let block = locate_block(doc, &hit.block).unwrap_or(turn);
+    // Keep the prompt when it fits, otherwise show the invocation with nearby context.
+    if block.saturating_sub(turn) < page.saturating_sub(3) {
+        turn
+    } else {
+        block.saturating_sub(page / 3).max(turn)
+    }
+}
+fn keep_turn_visible(state: &mut State, page: usize) {
+    let rows = page.saturating_sub(1).max(1);
+    if state.selected_turn < state.outline_offset {
+        state.outline_offset = state.selected_turn;
+    } else if state.selected_turn >= state.outline_offset + rows {
+        state.outline_offset = state.selected_turn + 1 - rows;
     }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Part {
+    Heading,
     Text,
     Output,
 }
@@ -596,7 +804,13 @@ fn search(
     let mut hits = Vec::new();
     for (turn, value) in data.turns.iter().enumerate() {
         for (block, item) in value.blocks.iter().enumerate() {
+            let heading = heading(item, chrono_tz::UTC, true);
+            let metadata = heading
+                .split_once("  ")
+                .map(|(_, text)| text)
+                .unwrap_or(&heading);
             for (part, text) in [
+                (Part::Heading, metadata),
                 (Part::Text, item.text.as_str()),
                 (Part::Output, item.output.as_deref().unwrap_or("")),
             ] {
@@ -644,18 +858,23 @@ fn reveal_hit(conversation: &Conversation, state: &mut State) -> Option<String> 
     let id = key(block);
     state.expanded.insert(id.clone());
     state.limits.insert(id.clone(), 2000);
-    let text = match hit.part {
-        Part::Text => block.text.as_str(),
-        Part::Output => block.output.as_deref().unwrap_or(""),
-    };
-    let mut start = hit.byte.saturating_sub(120);
-    while !text.is_char_boundary(start) {
-        start += 1;
+    if hit.part == Part::Heading {
+        state.windows.remove(&id);
+    } else {
+        let text = match hit.part {
+            Part::Text => block.text.as_str(),
+            Part::Output => block.output.as_deref().unwrap_or(""),
+            Part::Heading => unreachable!(),
+        };
+        let mut start = hit.byte.saturating_sub(120);
+        while !text.is_char_boundary(start) {
+            start += 1;
+        }
+        if let Some(newline) = text[start..hit.byte].rfind('\n') {
+            start += newline + 1;
+        }
+        state.windows.insert(id.clone(), (hit.part, start));
     }
-    if let Some(newline) = text[start..hit.byte].rfind('\n') {
-        start += newline + 1;
-    }
-    state.windows.insert(id.clone(), (hit.part, start));
     if turn.inherited {
         state.inherited = true;
     }
@@ -787,15 +1006,21 @@ fn footer(state: &State, turns: usize, width: usize, updated: bool, loading: boo
             if state.hits_limited { "+" } else { "" }
         )
     };
+    let digits = turns.max(1).to_string().len();
+    let model_navigation = if state.model_hits.is_empty() {
+        ""
+    } else {
+        "  m/M Model"
+    };
     let line = if width < 60 {
         format!(
-            "{}/{}  t Tools  / Find  Esc Back{status}{query}",
+            "{:>digits$}/{}  t Tools  / Find  Esc Back{model_navigation}{status}{query}",
             state.selected_turn + 1,
             turns.max(1)
         )
     } else {
         format!(
-            "Turn {}/{}  [ ] Turn  t Tools  / Search  Esc Back  ? Help{status}{query}",
+            "Turn {:>digits$}/{}  [ ] Turn  t Tools  / Search  Esc Back  ? Help{model_navigation}{status}{query}",
             state.selected_turn + 1,
             turns.max(1)
         )
@@ -812,30 +1037,20 @@ struct Paint<'a> {
     loading: bool,
 }
 fn help(width: usize) -> Vec<String> {
-    ["Conversation help", "j/k or arrows scroll; Page Up/Down and Home/End move through the conversation.","[ and ] jump turns. Tab/Shift+Tab focus message or tool blocks; Enter expands/collapses.","Long blocks load in 2,000-line pages with Enter. Backspace collapses the focused block.","t shows/hides tool calls. / searches retained message and tool text; n/N find next/previous matches.","i shows session/source/report details. r reloads changed logs without altering usage accounting.","Esc clears search or closes details/help before returning. q quits; Ctrl+C also cancels loading.","Earlier context is collapsed by default. Plain exports retain full text."].into_iter().flat_map(|line|render::wrap(line,width)).collect()
+    ["Conversation help", "j/k or arrows scroll; Page Up/Down and Home/End move through the conversation.","[ and ] jump turns. m/M jump to next/previous selected-model turn. Tab/Shift+Tab focus visible blocks; Enter expands/collapses.","Long blocks load in 2,000-line pages with Enter. Backspace collapses the focused block.","t shows/hides tool calls. / searches message/tool text and model/mode labels; n/N find next/previous matches.","i shows session/source/report details. r reloads changed logs without altering usage accounting.","Esc clears search or closes details/help before returning. q quits; Ctrl+C also cancels loading.","Earlier context is collapsed by default. Plain exports retain full text."].into_iter().flat_map(|line|render::wrap(line,width)).collect()
 }
-fn frame(
-    conversation: &Conversation,
-    state: &State,
-    doc: &Document,
-    paint: &Paint<'_>,
-) -> Vec<String> {
-    let Paint {
-        cli,
-        report,
-        style,
-        width,
-        height,
-        updated,
-        loading,
-    } = *paint;
-    if width < 24 || height < 7 {
-        return render::wrap("Resize terminal / Esc Back / q Quit", width)
-            .into_iter()
-            .take(height)
-            .map(|s| style.paint("meta", s))
-            .collect();
-    }
+struct Chrome {
+    header: Vec<String>,
+    footer: Vec<String>,
+    page: usize,
+}
+fn chrome(conversation: &Conversation, state: &State, paint: &Paint<'_>) -> Chrome {
+    let cli = paint.cli;
+    let report = paint.report;
+    let width = paint.width;
+    let height = paint.height;
+    let updated = paint.updated;
+    let loading = paint.loading;
     let sep = if cli.ascii { " / " } else { " · " };
     let mut header = vec![short(
         &format!(
@@ -865,17 +1080,55 @@ fn frame(
             conversation.sources.join(" + ")
         )
     };
+    if !state.model_focus.is_empty() {
+        context = format!(
+            "{date}{sep}{}{sep}All retained conversation{sep}Focus {} ({} turns)",
+            report.period.timezone,
+            state.model_focus,
+            state.model_hits.len()
+        );
+    }
     if !conversation.warnings.is_empty() || conversation.pending > 0 {
-        context.push_str(" / partial data");
+        context = format!("partial data{sep}{context}");
     }
-    if width < 60 {
-        header.extend(render::wrap(&conversation::sanitize(&context), width));
-    } else {
-        header.push(short(&context, width));
-    }
+    header.push(short(&context, width));
     header.push(String::new());
-    let footer = footer(state, conversation.turns.len(), width, updated, loading);
+    let mut footer = footer(state, conversation.turns.len(), width, updated, loading);
+    if header.len() + footer.len() >= height {
+        footer = render::wrap("Esc Back / q Quit", width);
+    }
     let page = height.saturating_sub(header.len() + footer.len()).max(1);
+    Chrome {
+        header,
+        footer,
+        page,
+    }
+}
+fn frame(
+    conversation: &Conversation,
+    state: &State,
+    doc: &Document,
+    paint: &Paint<'_>,
+) -> Vec<String> {
+    let Paint {
+        report,
+        style,
+        width,
+        height,
+        ..
+    } = *paint;
+    if width < 24 || height < 7 {
+        return render::wrap("Resize terminal / Esc Back / q Quit", width)
+            .into_iter()
+            .take(height)
+            .map(|s| style.paint("meta", s))
+            .collect();
+    }
+    let Chrome {
+        header,
+        footer,
+        page,
+    } = chrome(conversation, state, paint);
     let mut out: Vec<String> = header
         .into_iter()
         .map(|s| style.paint("meta", conversation::sanitize(&s)))
@@ -894,12 +1147,16 @@ fn frame(
                 .map(|s| style.paint("meta", s)),
         );
     } else {
-        let current_line = doc
-            .focus
-            .iter()
-            .find(|(id, _)| Some(id) == state.focused.as_ref())
-            .map(|(_, line)| *line);
-        let outline_start = state.selected_turn.saturating_sub(page / 2);
+        let current_line = state.focused.as_deref().and_then(|id| {
+            doc.lines
+                .iter()
+                .enumerate()
+                .skip(state.offset)
+                .take(page)
+                .find(|(_, line)| line.block.as_deref() == Some(id))
+                .map(|(index, _)| index)
+        });
+        let outline_start = state.outline_offset;
         for index in 0..page {
             let row = doc.lines.get(state.offset + index);
             if width >= 120 {
@@ -1015,8 +1272,9 @@ pub fn run(
     let mut conversation = Arc::new(conversation);
     let style = Style::new(cli, true);
     let tz = timezone(report);
-    let mut state = State {
-        selected_turn: initial_turn(
+    let matching = model_hits(&conversation, cli, report);
+    let selected_turn = matching.first().map(|hit| hit.turn).unwrap_or_else(|| {
+        initial_turn(
             &conversation,
             report,
             !manage_screen
@@ -1024,9 +1282,23 @@ pub fn run(
                 || cli.last.is_some()
                 || cli.since.is_some()
                 || cli.until.is_some(),
-        ),
+        )
+    });
+    let mut target = cli.models.clone();
+    if let Some(mode) = cli.mode {
+        target.push(format!("{mode:?}"));
+    }
+    let mut state = State {
+        selected_turn,
+        focused: matching.first().map(|hit| hit.block.clone()),
+        model_hits: matching,
+        model_focus: target.join(" / "),
         ..Default::default()
     };
+    let initial_model = state.model_hits.first().cloned();
+    if let Some(hit) = &initial_model {
+        reveal_model(&conversation, &mut state, hit);
+    }
     std::thread::scope(|scope| -> Result<ReaderExit> {
         let (requests_tx, requests_rx) = std::sync::mpsc::channel::<()>();
         let (results_tx, results_rx) = std::sync::mpsc::channel();
@@ -1069,8 +1341,14 @@ pub fn run(
         let mut old_height = 0;
         let mut document_width = 0;
         let mut doc = Document::default();
-        let mut jump_turn = Some(state.selected_turn);
+        let mut jump_turn = if initial_model.is_none() {
+            Some(state.selected_turn)
+        } else {
+            None
+        };
+        let mut model_jump = initial_model;
         let mut jump_block: Option<String> = None;
+        let mut anchor: Option<ReadingAnchor> = None;
         let mut previous = Vec::<String>::new();
         let mut updated = false;
         let mut check_disk = Instant::now();
@@ -1082,8 +1360,9 @@ pub fn run(
                 loading = false;
                 match result {
                     Ok(next) => {
-                        jump_block = top_block(&doc, state.offset);
+                        anchor = reading_anchor(&doc, state.offset);
                         conversation = Arc::new(next);
+                        state.model_hits = model_hits(&conversation, cli, report);
                         state.selected_turn = state
                             .selected_turn
                             .min(conversation.turns.len().saturating_sub(1));
@@ -1136,13 +1415,16 @@ pub fn run(
                 width.min(110)
             };
             if old_width != width || old_height != height {
-                if jump_turn.is_none() {
-                    jump_block = top_block(&doc, state.offset);
+                if old_width != width {
+                    if jump_turn.is_none() && jump_block.is_none() && !state.details && !state.help
+                    {
+                        anchor = reading_anchor(&doc, state.offset);
+                    }
+                    rebuild = true;
                 }
                 old_width = width;
                 old_height = height;
                 dirty = true;
-                rebuild = true;
                 previous.clear();
                 execute!(io::stdout(), Clear(ClearType::All))?;
             }
@@ -1164,22 +1446,55 @@ pub fn run(
                     &stopped,
                 )?;
                 document_width = content_width;
-                if let Some(turn) = jump_turn.take() {
-                    state.offset = locate_turn(&doc, turn);
-                }
-                if let Some(id) = jump_block.take() {
-                    if let Some(line) = locate_block(&doc, &id) {
-                        state.offset = if !state.query.is_empty() {
-                            hit_line(&doc, &state, &id).unwrap_or(line)
-                        } else {
-                            line
-                        };
-                    }
+                if let Some(saved) = anchor.take() {
+                    state.offset = restore_anchor(&doc, &saved);
                 }
                 rebuild = false;
                 dirty = true;
             }
-            let estimated_page = height.saturating_sub(6).max(1);
+            if let Some(turn) = jump_turn.take() {
+                state.offset = locate_turn(&doc, turn);
+            }
+            if let Some(hit) = model_jump.take() {
+                let page = chrome(
+                    &conversation,
+                    &state,
+                    &Paint {
+                        cli,
+                        report,
+                        style: &style,
+                        width,
+                        height,
+                        updated,
+                        loading,
+                    },
+                )
+                .page;
+                state.offset = model_offset(&doc, &hit, page);
+            }
+            if let Some(id) = jump_block.take() {
+                if let Some(line) = locate_block(&doc, &id) {
+                    state.offset = if !state.query.is_empty() {
+                        hit_line(&doc, &state, &id).unwrap_or(line)
+                    } else {
+                        line
+                    };
+                }
+            }
+            let page = chrome(
+                &conversation,
+                &state,
+                &Paint {
+                    cli,
+                    report,
+                    style: &style,
+                    width,
+                    height,
+                    updated,
+                    loading,
+                },
+            )
+            .page;
             let content_len = if state.details {
                 details(&conversation, report, width).len()
             } else if state.help {
@@ -1187,13 +1502,20 @@ pub fn run(
             } else {
                 doc.lines.len()
             };
-            state.offset = state.offset.min(content_len.saturating_sub(1));
+            state.offset = state.offset.min(content_len.saturating_sub(page));
             if !state.details && !state.help {
-                state.selected_turn = doc
-                    .lines
-                    .get(state.offset)
-                    .map(|line| line.turn)
+                let focused_turn = state.focused.as_ref().and_then(|id| {
+                    doc.lines
+                        .iter()
+                        .skip(state.offset)
+                        .take(page)
+                        .find(|line| line.block.as_ref() == Some(id))
+                        .map(|line| line.turn)
+                });
+                state.selected_turn = focused_turn
+                    .or_else(|| doc.lines.get(state.offset).map(|line| line.turn))
                     .unwrap_or(state.selected_turn);
+                keep_turn_visible(&mut state, page);
             }
             if dirty {
                 let mut lines = frame(
@@ -1238,7 +1560,6 @@ pub fn run(
             }
             match event::read()? {
                 Event::Resize(_, _) => {
-                    rebuild = true;
                     dirty = true;
                 }
                 Event::Key(key_event) if key_event.kind != KeyEventKind::Release => {
@@ -1297,7 +1618,11 @@ pub fn run(
                             if state.details || state.help {
                                 state.details = false;
                                 state.help = false;
-                                state.offset = state.saved_offset;
+                                state.offset = state
+                                    .saved_anchor
+                                    .take()
+                                    .map(|anchor| restore_anchor(&doc, &anchor))
+                                    .unwrap_or(state.saved_offset);
                             } else if !state.query.is_empty() {
                                 state.query.clear();
                                 state.hits.clear();
@@ -1314,23 +1639,52 @@ pub fn run(
                         KeyCode::Char('?') => {
                             if !state.help && !state.details {
                                 state.saved_offset = state.offset;
+                                state.saved_anchor = reading_anchor(&doc, state.offset);
                             }
                             state.help = !state.help;
                             state.details = false;
-                            state.offset = if state.help { 0 } else { state.saved_offset };
+                            state.offset = if state.help {
+                                0
+                            } else {
+                                state
+                                    .saved_anchor
+                                    .take()
+                                    .map(|anchor| restore_anchor(&doc, &anchor))
+                                    .unwrap_or(state.saved_offset)
+                            };
                         }
                         KeyCode::Char('i') => {
                             if !state.help && !state.details {
                                 state.saved_offset = state.offset;
+                                state.saved_anchor = reading_anchor(&doc, state.offset);
                             }
                             state.details = !state.details;
                             state.help = false;
-                            state.offset = if state.details { 0 } else { state.saved_offset };
+                            state.offset = if state.details {
+                                0
+                            } else {
+                                state
+                                    .saved_anchor
+                                    .take()
+                                    .map(|anchor| restore_anchor(&doc, &anchor))
+                                    .unwrap_or(state.saved_offset)
+                            };
                         }
                         KeyCode::Char('/') => {
+                            if state.help || state.details {
+                                state.help = false;
+                                state.details = false;
+                                state.offset = state
+                                    .saved_anchor
+                                    .take()
+                                    .map(|anchor| restore_anchor(&doc, &anchor))
+                                    .unwrap_or(state.saved_offset);
+                            }
                             state.search_input = Some(state.query.clone());
                         }
-                        KeyCode::Char('n') | KeyCode::Char('N') => {
+                        KeyCode::Char('n') | KeyCode::Char('N')
+                            if !state.help && !state.details =>
+                        {
                             if !state.hits.is_empty() {
                                 state.hit = if key_event.code == KeyCode::Char('N') {
                                     (state.hit + state.hits.len() - 1) % state.hits.len()
@@ -1341,23 +1695,19 @@ pub fn run(
                                 rebuild = true;
                             }
                         }
-                        KeyCode::Char('t') => {
-                            jump_block = top_block(&doc, state.offset);
+                        KeyCode::Char('t') if !state.help && !state.details => {
+                            anchor = reading_anchor(&doc, state.offset);
                             state.tools = !state.tools;
                             rebuild = true;
                         }
-                        KeyCode::Tab | KeyCode::BackTab => {
-                            focus_next(
-                                &mut state,
-                                &doc,
-                                key_event.code == KeyCode::BackTab,
-                                estimated_page,
-                            );
+                        KeyCode::Tab | KeyCode::BackTab if !state.help && !state.details => {
+                            focus_next(&mut state, &doc, key_event.code == KeyCode::BackTab, page);
                         }
-                        KeyCode::Enter => {
+                        KeyCode::Enter if !state.help && !state.details => {
                             if let Some(id) = state
                                 .focused
                                 .clone()
+                                .filter(|id| block_visible(&doc, id, state.offset, page))
                                 .or_else(|| top_block(&doc, state.offset))
                             {
                                 if id == "__earlier_context" {
@@ -1375,25 +1725,28 @@ pub fn run(
                                     state.windows.remove(&id);
                                 }
                                 if jump_block.is_none() {
-                                    jump_block = Some(id);
+                                    anchor = reading_anchor(&doc, state.offset);
                                 }
                                 rebuild = true;
                             }
                         }
-                        KeyCode::Backspace => {
+                        KeyCode::Backspace if !state.help && !state.details => {
                             if let Some(id) = state
                                 .focused
                                 .clone()
+                                .filter(|id| block_visible(&doc, id, state.offset, page))
                                 .or_else(|| top_block(&doc, state.offset))
                             {
                                 state.expanded.remove(&id);
                                 state.limits.remove(&id);
                                 state.windows.remove(&id);
-                                jump_block = Some(id);
+                                anchor = reading_anchor(&doc, state.offset);
                                 rebuild = true;
                             }
                         }
-                        KeyCode::Char('[') | KeyCode::Char(']') => {
+                        KeyCode::Char('[') | KeyCode::Char(']')
+                            if !state.help && !state.details =>
+                        {
                             if !conversation.turns.is_empty() {
                                 let current = state.selected_turn;
                                 let next = if key_event.code == KeyCode::Char('[') {
@@ -1401,31 +1754,50 @@ pub fn run(
                                 } else {
                                     (current + 1).min(conversation.turns.len() - 1)
                                 };
-                                if conversation.turns[next].inherited {
+                                if conversation.turns[next].inherited && !state.inherited {
                                     state.inherited = true;
+                                    rebuild = true;
                                 }
                                 state.selected_turn = next;
+                                state.focused = conversation.turns[next].blocks.first().map(key);
                                 jump_turn = Some(next);
-                                rebuild = true;
+                            }
+                        }
+                        KeyCode::Char('m') | KeyCode::Char('M')
+                            if !state.help && !state.details =>
+                        {
+                            if let Some(turn) =
+                                jump_model(&mut state, key_event.code == KeyCode::Char('M'))
+                            {
+                                model_jump = state
+                                    .model_hits
+                                    .iter()
+                                    .find(|hit| hit.turn == turn)
+                                    .cloned();
+                                if let Some(hit) = &model_jump {
+                                    let tools = state.tools;
+                                    reveal_model(&conversation, &mut state, hit);
+                                    rebuild |= tools != state.tools;
+                                }
                             }
                         }
                         KeyCode::Down | KeyCode::Char('j') => {
-                            state.offset = state.offset.saturating_add(1)
+                            scroll(&mut state, content_len, page, Scroll::Down)
                         }
                         KeyCode::Up | KeyCode::Char('k') => {
-                            state.offset = state.offset.saturating_sub(1)
+                            scroll(&mut state, content_len, page, Scroll::Up)
                         }
                         KeyCode::PageDown | KeyCode::Char(' ') => {
-                            state.offset = state.offset.saturating_add(estimated_page)
+                            scroll(&mut state, content_len, page, Scroll::PageDown)
                         }
-                        KeyCode::PageUp => {
-                            state.offset = state.offset.saturating_sub(estimated_page)
+                        KeyCode::PageUp => scroll(&mut state, content_len, page, Scroll::PageUp),
+                        KeyCode::Home | KeyCode::Char('g') => {
+                            scroll(&mut state, content_len, page, Scroll::Home)
                         }
-                        KeyCode::Home | KeyCode::Char('g') => state.offset = 0,
                         KeyCode::End | KeyCode::Char('G') => {
-                            state.offset = content_len.saturating_sub(estimated_page)
+                            scroll(&mut state, content_len, page, Scroll::End)
                         }
-                        KeyCode::Char('r') if !loading => {
+                        KeyCode::Char('r') if !loading && !state.help && !state.details => {
                             reload_stop.store(false, Ordering::Relaxed);
                             if requests_tx.send(()).is_ok() {
                                 loading = true;
@@ -1720,5 +2092,269 @@ mod tests {
         assert_eq!(initial_turn(&conversation, &report, true), 1);
         report.period.start = Some("2026-11-04T13:00:00Z".parse().unwrap());
         assert_eq!(initial_turn(&conversation, &report, true), 0);
+    }
+    #[test]
+    fn paging_uses_rendered_page_and_stops_at_the_last_full_viewport() {
+        let (cli, conversation, report) = fixture();
+        let style = Style::new(&cli, false);
+        for width in [40, 59, 60, 80, 120] {
+            for height in [12, 25, 45] {
+                for updated in [false, true] {
+                    let mut state = State {
+                        offset: 2,
+                        focused: Some("stale".into()),
+                        ..Default::default()
+                    };
+                    let chrome = chrome(
+                        &conversation,
+                        &state,
+                        &Paint {
+                            cli: &cli,
+                            report: &report,
+                            style: &style,
+                            width,
+                            height,
+                            updated,
+                            loading: false,
+                        },
+                    );
+                    assert_eq!(
+                        chrome.header.len() + chrome.page + chrome.footer.len(),
+                        height
+                    );
+                    let page = chrome.page;
+                    scroll(&mut state, 500, page, Scroll::PageDown);
+                    assert_eq!(state.offset, 2 + page);
+                    assert!(state.focused.is_none());
+                    scroll(&mut state, 500, page, Scroll::PageUp);
+                    assert_eq!(state.offset, 2);
+                    scroll(&mut state, 500, page, Scroll::End);
+                    let end = state.offset;
+                    assert_eq!(end, 500 - page);
+                    for _ in 0..600 {
+                        scroll(&mut state, 500, page, Scroll::Down);
+                    }
+                    assert_eq!(state.offset, end);
+                    scroll(&mut state, 500, page, Scroll::PageUp);
+                    scroll(&mut state, 500, page, Scroll::PageDown);
+                    assert_eq!(state.offset, end);
+                }
+            }
+        }
+    }
+    #[test]
+    fn tab_from_a_scrolled_block_ignores_stale_offscreen_focus() {
+        let (_, mut conversation, _) = fixture();
+        conversation.turns[0].blocks[0].text =
+            (0..250).map(|i| format!("retained line {i}\n")).collect();
+        let mut state = State {
+            expanded: BTreeSet::from(["user-1".into()]),
+            offset: 100,
+            focused: Some("assistant-2".into()),
+            ..Default::default()
+        };
+        let doc = document(
+            &conversation,
+            &state,
+            70,
+            chrono_tz::UTC,
+            true,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        focus_next(&mut state, &doc, false, 20);
+        assert_eq!(state.focused.as_deref(), Some("user-1"));
+        assert_eq!(state.offset, 100);
+        scroll(&mut state, doc.lines.len(), 20, Scroll::PageDown);
+        assert_eq!(state.offset, 120);
+        assert!(state.focused.is_none());
+        focus_next(&mut state, &doc, true, 20);
+        assert_eq!(state.focused.as_deref(), Some("user-1"));
+        assert_eq!(state.offset, 120);
+    }
+    #[test]
+    fn source_anchor_preserves_reading_position_through_reflow_and_reload() {
+        let (_, mut conversation, _) = fixture();
+        conversation.turns[0].blocks[0].text = (0..150)
+            .map(|i| {
+                format!("line{i:03} 模型 and preserved content that can wrap on narrower screens\n")
+            })
+            .collect();
+        let state = State {
+            expanded: BTreeSet::from(["user-1".into()]),
+            ..Default::default()
+        };
+        let stop = AtomicBool::new(false);
+        let old = document(&conversation, &state, 78, chrono_tz::UTC, false, &stop).unwrap();
+        let offset = old
+            .lines
+            .iter()
+            .position(|line| line.text.starts_with("line077"))
+            .unwrap();
+        let anchor = reading_anchor(&old, offset).unwrap();
+        assert_eq!(
+            restore_anchor(&old, &anchor),
+            offset,
+            "height-only redraw keeps exact offset"
+        );
+        for width in [38, 88, 108] {
+            let next =
+                document(&conversation, &state, width, chrono_tz::UTC, false, &stop).unwrap();
+            let index = restore_anchor(&next, &anchor);
+            assert!(
+                next.lines[index].text.starts_with("line077"),
+                "{}",
+                next.lines[index].text
+            );
+            assert_eq!(next.lines[index].source, anchor.source);
+        }
+        conversation.turns[0].blocks[0]
+            .text
+            .push_str("new trailing text\n");
+        let next = document(&conversation, &state, 78, chrono_tz::UTC, false, &stop).unwrap();
+        assert_eq!(restore_anchor(&next, &anchor), offset);
+    }
+    #[test]
+    fn selected_model_anchors_real_assistant_or_tool_context_not_user_metadata() {
+        let (mut cli, mut conversation, mut report) = fixture();
+        cli.models = vec!["gpt-5.6-sol".into()];
+        cli.mode = Some(crate::cli::Mode::Fast);
+        conversation.turns[0].blocks[0].model = Some("gpt-5.6-sol".into());
+        conversation.turns[0].blocks[0].mode = Some("fast".into());
+        let assistant = conversation.turns[1]
+            .blocks
+            .iter_mut()
+            .find(|b| b.kind == BlockKind::Assistant)
+            .unwrap();
+        assistant.model = Some("gpt-5.6-sol".into());
+        assistant.mode = Some("fast".into());
+        assistant.timestamp = Some("2026-11-04T14:05:00Z".parse().unwrap());
+        let hits = model_hits(&conversation, &cli, &report);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].turn, 1);
+        let mut state = State {
+            model_hits: hits,
+            ..Default::default()
+        };
+        assert_eq!(jump_model(&mut state, false), Some(1));
+        assert_eq!(state.focused.as_deref(), Some("assistant-2"));
+        let (hits, _) = search(&conversation, "gpt-5.6-sol", &AtomicBool::new(false)).unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "user labels must not invent model invocations"
+        );
+        assert_eq!(hits[0].part, Part::Heading);
+        state.query = "gpt-5.6-sol".into();
+        state.hits = hits;
+        let id = reveal_hit(&conversation, &mut state).unwrap();
+        let doc = document(
+            &conversation,
+            &state,
+            78,
+            chrono_tz::UTC,
+            false,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(doc.lines[hit_line(&doc, &state, &id).unwrap()]
+            .text
+            .contains("gpt-5.6-sol"));
+        report.period.end = Some("2026-11-04T14:01:00Z".parse().unwrap());
+        assert!(model_hits(&conversation, &cli, &report).is_empty());
+        report.period.end = None;
+        conversation.turns[1].inherited = true;
+        assert!(model_hits(&conversation, &cli, &report).is_empty());
+    }
+    #[test]
+    fn outline_moves_only_when_selection_leaves_its_visible_rows() {
+        let mut state = State::default();
+        for selected in 0..9 {
+            state.selected_turn = selected;
+            keep_turn_visible(&mut state, 10);
+            assert_eq!(state.outline_offset, 0);
+        }
+        state.selected_turn = 9;
+        keep_turn_visible(&mut state, 10);
+        assert_eq!(state.outline_offset, 1);
+        state.selected_turn = 2;
+        keep_turn_visible(&mut state, 10);
+        assert_eq!(state.outline_offset, 1);
+        state.selected_turn = 0;
+        keep_turn_visible(&mut state, 10);
+        assert_eq!(state.outline_offset, 0);
+    }
+    #[test]
+    fn model_navigation_reveals_invocations_after_long_prompts_and_hidden_tools() {
+        for kind in [BlockKind::Assistant, BlockKind::Tool] {
+            let (mut cli, mut conversation, report) = fixture();
+            cli.models = vec!["gpt-5.6-sol".into()];
+            cli.mode = Some(crate::cli::Mode::Fast);
+            conversation.turns[0].blocks[0].text =
+                (0..50).map(|i| format!("long prompt line {i}\n")).collect();
+            let target = conversation.turns[0]
+                .blocks
+                .iter_mut()
+                .find(|block| block.kind == kind)
+                .unwrap();
+            target.model = Some("gpt-5.6-sol".into());
+            target.mode = Some("fast".into());
+            let hit = model_hits(&conversation, &cli, &report).remove(0);
+            let mut state = State::default();
+            reveal_model(&conversation, &mut state, &hit);
+            assert_eq!(state.tools, kind == BlockKind::Tool);
+            let doc = document(
+                &conversation,
+                &state,
+                78,
+                chrono_tz::UTC,
+                false,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            let offset = model_offset(&doc, &hit, 10);
+            let target = locate_block(&doc, &hit.block).unwrap();
+            assert!(
+                offset <= target && target < offset + 10,
+                "matching invocation must be visible"
+            );
+            assert!(doc.lines[target].text.contains("gpt-5.6-sol"));
+            assert!(
+                offset > locate_turn(&doc, hit.turn),
+                "long prompts must not hide target below viewport"
+            );
+        }
+    }
+    #[test]
+    fn model_focus_preserves_partial_warning_and_only_advertises_real_matches() {
+        let (cli, mut conversation, report) = fixture();
+        conversation
+            .warnings
+            .push("Incomplete retained message".into());
+        let mut state = State {
+            model_focus: "gpt-5.6-sol / Fast".into(),
+            ..Default::default()
+        };
+        let style = Style::new(&cli, false);
+        let paint = Paint {
+            cli: &cli,
+            report: &report,
+            style: &style,
+            width: 80,
+            height: 25,
+            updated: false,
+            loading: false,
+        };
+        let c = chrome(&conversation, &state, &paint);
+        assert!(c.header.join("\n").contains("partial data"));
+        assert!(!c.footer.join("\n").contains("m/M Model"));
+        state.model_hits.push(ModelHit {
+            turn: 0,
+            block: "assistant-1".into(),
+        });
+        assert!(chrome(&conversation, &state, &paint)
+            .footer
+            .join("\n")
+            .contains("m/M Model"));
     }
 }

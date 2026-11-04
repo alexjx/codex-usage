@@ -214,6 +214,8 @@ pub struct View {
 }
 pub struct SessionRow {
     pub session: String,
+    pub model: Option<String>,
+    pub mode: Option<String>,
     pub start: usize,
     pub end: usize,
 }
@@ -646,6 +648,11 @@ pub fn view(cli: &Cli, report: &Report, style: &Style, width: usize, help: bool)
             if let Some(session) = row.dimensions.get("session") {
                 session_rows.push(SessionRow {
                     session: session.clone(),
+                    model: row.dimensions.get("model").cloned(),
+                    mode: row.dimensions.get("mode").cloned().or_else(|| {
+                        (row.counts.modes.len() == 1)
+                            .then(|| row.counts.modes.first().unwrap().clone())
+                    }),
                     start: row_start,
                     end: b.len(),
                 });
@@ -773,13 +780,23 @@ mod regression_tests {
                     input: 10,
                     output: 5,
                     total: 15,
+                    modes: ["regular".into()].into(),
                     ..Default::default()
                 },
             });
         }
+        report.rows[0]
+            .dimensions
+            .insert("mode".into(), "fast".into());
         for width in [40, 80, 140] {
             let view = view(&cli, &report, &Style::new(&cli, false), width, false);
             assert_eq!(view.session_rows.len(), 2);
+            assert_eq!(
+                view.session_rows[0].model.as_deref(),
+                Some("synthetic-model")
+            );
+            assert_eq!(view.session_rows[0].mode.as_deref(), Some("fast"));
+            assert_eq!(view.session_rows[1].mode.as_deref(), Some("regular"));
             assert_eq!(
                 view.session_rows[0].session,
                 "session-alpha-with-a-long-stable-identifier"
@@ -886,6 +903,65 @@ mod regression_tests {
                 "{output}"
             );
             assert!(output.contains("n/a est."));
+        }
+    }
+
+    #[test]
+    fn selected_model_and_mode_survive_date_subtotal_and_mixed_mode_rows() {
+        let cli = Cli::parse_from([
+            "codex-usage",
+            "sessions",
+            "--all",
+            "--group-by",
+            "day,session,model",
+            "--color",
+            "never",
+        ]);
+        let mut report = report::build(
+            &cli,
+            chrono_tz::UTC,
+            &Scan::default(),
+            None,
+            chrono::Utc::now(),
+        )
+        .unwrap();
+        report.rows.push(Row {
+            dimensions: [
+                ("day".into(), "2026-11-04".into()),
+                ("session".into(), "full-stable-session-id".into()),
+                ("model".into(), "gpt-5.6-sol".into()),
+            ]
+            .into(),
+            counts: Counts {
+                total: 30,
+                modes: ["fast".into(), "regular".into()].into(),
+                ..Default::default()
+            },
+        });
+        report.subtotals.push(Row {
+            dimensions: [("day".into(), "2026-11-04".into())].into(),
+            counts: Counts {
+                total: 30,
+                ..Default::default()
+            },
+        });
+        for width in [40, 80, 140] {
+            let view = view(&cli, &report, &Style::new(&cli, false), width, false);
+            let selected = &view.session_rows[0];
+            assert_eq!(selected.session, "full-stable-session-id");
+            assert_eq!(selected.model.as_deref(), Some("gpt-5.6-sol"));
+            assert_eq!(
+                selected.mode, None,
+                "a mixed row must not invent a target mode"
+            );
+            assert_eq!(
+                selected.end,
+                view.body.len(),
+                "trailing subtotal remains reachable"
+            );
+            assert!(view.body[selected.start..selected.end]
+                .iter()
+                .any(|line| line.contains("Subtotal")));
         }
     }
 
