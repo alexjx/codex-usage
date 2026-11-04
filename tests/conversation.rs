@@ -128,7 +128,16 @@ fn conversation_json_keeps_messages_tools_and_usage_independent() {
         "--format",
         "json",
     ]);
-    let explored = f.json(&["session", SESSION, "--conversation"]);
+    let explored = f.json(&[
+        "session",
+        SESSION,
+        "--conversation",
+        "--all",
+        "--root",
+        f.root(),
+        "--format",
+        "json",
+    ]);
     assert_eq!(explored["schema_version"], 1);
     assert_eq!(explored["conversation"]["session_id"], SESSION);
     assert_eq!(explored["usage"]["totals"], usage["totals"]);
@@ -291,9 +300,13 @@ fn copied_logs_do_not_duplicate_conversation_or_accounting() {
 }
 
 #[test]
-fn conversation_history_replays_same_session_and_clears_on_switch_or_reset() {
+fn conversation_and_monitor_options_do_not_carry_over_to_later_invocations() {
     let f = Fixture::new();
     f.write("session-alpha", &records(SESSION, &Utc::now().to_rfc3339()));
+    fs::create_dir_all(f.config.parent().unwrap()).unwrap();
+    let legacy_history = f.config.with_file_name("config.toml.last-report.json");
+    let legacy_contents = b"legacy history must be ignored, even when invalid JSON";
+    fs::write(&legacy_history, legacy_contents).unwrap();
     let first = f.json(&[
         "session",
         SESSION,
@@ -304,28 +317,41 @@ fn conversation_history_replays_same_session_and_clears_on_switch_or_reset() {
         "--format",
         "json",
     ]);
-    for args in [vec!["session", SESSION], vec![]] {
-        let repeated = f.json(&args);
-        assert_eq!(repeated["conversation"], first["conversation"]);
-        assert_eq!(repeated["usage"]["totals"], first["usage"]["totals"]);
-    }
-    let reset = f.json(&[
+    let usage = f.json(&[
         "session",
         SESSION,
-        "--reset",
         "--all",
         "--root",
         f.root(),
         "--format",
         "json",
     ]);
-    assert_eq!(reset["kind"], "Session");
-    assert!(reset.get("conversation").is_none());
-    f.json(&["session", SESSION, "--conversation"]);
-    let switched = f.json(&["sessions", "--root", f.root(), "--all", "--format", "json"]);
-    assert_eq!(switched["kind"], "Sessions");
-    assert!(switched.get("conversation").is_none());
-    assert_eq!(f.json(&[])["kind"], "Sessions");
+    assert_eq!(usage["kind"], "Session");
+    assert!(usage.get("conversation").is_none());
+    assert_eq!(usage["totals"], first["usage"]["totals"]);
+
+    let daily = f.run(&["--root", f.root(), "--color", "never"]);
+    success(&daily);
+    let text = String::from_utf8(daily.stdout).unwrap();
+    assert!(text.contains("Codex Usage / Daily"), "{text}");
+    assert!(!text.contains("Please check the costs."), "{text}");
+    assert!(serde_json::from_str::<Value>(&text).is_err());
+
+    let monitor = f.run(&[
+        "monitor",
+        "--root",
+        f.root(),
+        "--frames",
+        "1",
+        "--format",
+        "jsonl",
+    ]);
+    success(&monitor);
+    let daily = f.json(&["--root", f.root(), "--format", "json"]);
+    assert_eq!(daily["kind"], "Daily");
+    assert!(daily.get("conversation").is_none());
+    assert_eq!(daily["totals"], usage["totals"]);
+    assert_eq!(fs::read(legacy_history).unwrap(), legacy_contents);
 }
 
 #[test]
@@ -398,7 +424,16 @@ fn incomplete_trailing_messages_remain_pending_until_the_record_is_complete() {
     writer.write_all(&next.as_bytes()[split..]).unwrap();
     writer.write_all(b"\n").unwrap();
     writer.flush().unwrap();
-    let complete = f.json(&["session", SESSION]);
+    let complete = f.json(&[
+        "session",
+        SESSION,
+        "--conversation",
+        "--all",
+        "--root",
+        f.root(),
+        "--format",
+        "json",
+    ]);
     assert_eq!(complete["conversation"]["pending"], 0);
     assert_eq!(
         blocks(&complete["conversation"])

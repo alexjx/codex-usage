@@ -29,7 +29,10 @@ impl Period {
             (None, None)
         } else if cli.since.is_some() || cli.until.is_some() {
             (cli.since, cli.until)
-        } else if let Some(days) = cli.last {
+        } else if let Some(days) = cli
+            .last
+            .or_else(|| matches!(cli.command, None | Some(Command::Daily)).then_some(7))
+        {
             (
                 Some(
                     today
@@ -708,7 +711,7 @@ mod tests {
     }
     #[test]
     fn last_days_counts_calendar_dates_across_daylight_saving() {
-        let cli = Cli::parse_from(["codex-usage", "daily", "--last", "7"]);
+        let cli = Cli::parse_from(["codex-usage", "daily"]);
         let p = Period::make(
             &cli,
             chrono_tz::America::New_York,
@@ -736,7 +739,14 @@ mod tests {
                 "2026-11-01–2026-11-03",
             ),
             (vec!["codex-usage", "models"], "2026-11-01–2026-11-05"),
-            (vec!["codex-usage", "daily"], "2026-11-01–2026-11-05"),
+            (vec!["codex-usage"], "2026-10-30–2026-11-05"),
+            (vec!["codex-usage", "daily"], "2026-10-30–2026-11-05"),
+            (vec!["codex-usage", "monthly"], "2026-11-01–2026-11-05"),
+            (vec!["codex-usage", "sessions"], "2026-11-01–2026-11-05"),
+            (
+                vec!["codex-usage", "session", "example"],
+                "2026-11-01–2026-11-05",
+            ),
             (
                 vec!["codex-usage", "daily", "--last", "7"],
                 "2026-10-30–2026-11-05",

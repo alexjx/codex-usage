@@ -362,7 +362,7 @@ where
                             notice = None;
                             let selected = &v.session_rows[selected_session];
                             let id = &selected.session;
-                            // Reader context is transient: the saved report remains untouched.
+                            // Row context affects only reader navigation, not the report.
                             let mut reader_cli = cli.clone();
                             if let Some(model) = &selected.model {
                                 reader_cli.models = vec![model.clone()];

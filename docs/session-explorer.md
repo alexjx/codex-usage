@@ -105,7 +105,7 @@ Selected session → matching log files → message/tool blocks → conversation
 - The report retains its selected date/model/mode filters. The conversation opens all retained messages for the selected session and source scope, preserving context. The header explicitly labels `All retained conversation` so users do not confuse the two scopes.
 - A collapsed details panel, opened with `i`, shows full session ID, project, contributing sources/files, original report period, and usage totals for that period. Normal reader chrome stays compact.
 - Per-turn token/cost annotations are optional details and appear only where usage has a reliable matching turn ID. Leave unavailable values as `n/a`; do not divide a session estimate evenly across turns.
-- Reading a conversation or going Back does not replace remembered command/options. An explicitly invoked `session ID --conversation` is remembered under the existing single-command history rules; navigation focus, search text, expansions, and scroll position remain transient.
+- Reading a conversation or going Back preserves the current report and its options. Commands and options are not remembered across invocations; use `session ID --conversation` explicitly to open the reader. Navigation focus, search text, expansions, and scroll position remain transient.
 
 ## Data loading and integrity
 
@@ -124,7 +124,7 @@ Observed locally on both WSL and Windows logs: `response_item` contains message 
 
 1. **Conversation data:** lazy selected-session parsing, typed message/tool blocks, provenance and fixtures for current/legacy formats, mirrored records, copies/forks, missing content, and partial writes. Existing accounting results must remain unchanged.
 2. **Session selection and reader:** Enter/Back, one/two-pane layout, wrapping, tools, details and search. Verify 40/80/120/200-column terminals, short screens, Unicode/ASCII/no-color, large messages, and return to the exact report position.
-3. **Direct command and integration:** `--conversation` on `session`, explicit handling of pipes (plain text or structured JSON; reject unsupported CSV), remembered-command compatibility, errors and cancellation. On a pipe, emit complete selected conversation text unless explicit output limits are requested; a page preview must not silently truncate exports.
+3. **Direct command and integration:** `--conversation` on `session`, explicit handling of pipes (plain text or structured JSON; reject unsupported CSV), fresh-command defaults, errors and cancellation. On a pipe, emit complete selected conversation text unless explicit output limits are requested; a page preview must not silently truncate exports.
 
 Prove the feature with synthetic conversation fixtures and actual terminal interaction before calling it complete. No user messages, logs, or local caches belong in the repository's published examples.
 

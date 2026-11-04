@@ -26,7 +26,9 @@ fn ctrl_c_cancels_report_and_monitor_loading_without_a_partial_snapshot() {
         .output()
         .unwrap();
     assert!(baseline.status.success());
-    let previous = fs::read(&history).unwrap();
+    // Legacy command state is ignored, including when a load is interrupted.
+    let previous = b"legacy command state";
+    fs::write(&history, previous).unwrap();
     let mut file = File::create(&path).unwrap();
     file.write_all(b"{\"type\":\"response_item\",\"payload\":\"")
         .unwrap();

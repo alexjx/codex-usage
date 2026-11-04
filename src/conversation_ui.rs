@@ -1,4 +1,4 @@
-//! Read-only terminal conversation reader. It never changes accounting or history.
+//! Read-only terminal conversation reader. It never changes accounting or source logs.
 use crate::{
     cli::Cli,
     conversation::{self, Block, BlockKind, Conversation},

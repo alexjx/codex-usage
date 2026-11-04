@@ -5,7 +5,7 @@ use codex_usage::{
     cancel,
     cli::{Cli, Command, Format, SourceCommand},
     config::{self, Config},
-    conversation_ui, export, history,
+    conversation_ui, export,
     model::{Scan, Source},
     monitor::Tracker,
     pricing::Pricer,
@@ -47,7 +47,6 @@ fn main() {
         fail(error.into(), 1);
     }
     let path = config::config_path(cli.config.as_deref()).unwrap_or_else(|e| fail(e, 2));
-    let cli = history::resolve(cli, &path).unwrap_or_else(|e| fail(e, 2));
     if cli.conversation && !cli.conversation() {
         fail(
             anyhow::anyhow!("--conversation requires session SESSION_ID"),
@@ -113,9 +112,6 @@ fn main() {
     };
     if let Err(error) = run(&cli, tz, &selected, pricer.as_ref(), format, stopped) {
         fail(error, 1);
-    }
-    if let Err(error) = history::save(&cli, &path) {
-        eprintln!("Could not remember report options: {error:#}");
     }
 }
 fn local_timezone() -> String {

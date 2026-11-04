@@ -5,7 +5,6 @@ pub mod config;
 pub mod conversation;
 pub mod conversation_ui;
 pub mod export;
-pub mod history;
 pub mod model;
 pub mod monitor;
 pub mod pricing;

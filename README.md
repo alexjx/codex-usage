@@ -85,23 +85,16 @@ codex-usage models --root /path/to/.codex --today
 | `sessions` | Each session's model/mode breakdown |
 | `session SESSION_ID` | One session's usage |
 
-Bare `codex-usage` repeats your last successful usage command and its options. With no saved command, it runs **daily for this calendar month**.
-
-Repeating the same command reuses its saved options. Only options you explicitly supply replace their remembered values. Switching to a different command starts with defaults and replaces the remembered command; there is just one saved command, not a separate history for each command.
+Bare `codex-usage` runs **daily for the last 7 days, including today**. Every invocation starts with fresh options; commands, filters, date ranges, and output formats are not remembered.
 
 ```sh
 codex-usage daily --last 7 --mode fast
-codex-usage daily                   # same daily report, last 7 days, Fast mode
-codex-usage daily --last 1          # keep Fast mode, change the period to today
-codex-usage                         # repeat the same daily report
-codex-usage models                  # switch: model report with default options
-codex-usage daily                   # switch again: daily defaults, not the old 7-day settings
-codex-usage daily --reset           # reset this command's options to defaults
+codex-usage daily                   # last 7 days, all modes
+codex-usage                         # daily for the last 7 days
+codex-usage models --today          # model report for today
 ```
 
-`--reset` clears remembered options before applying the options supplied on that run. Without a subcommand, it keeps the remembered command (or `daily` if none exists). For a report, `codex-usage --reset --last 7` keeps that command but resets other filters and display settings. Output format is remembered too: use `--format table` to override a previous JSON/CSV export.
-
-Relative periods are recalculated each run. Monitor is also remembered, including its interval, frame limit, and filters; bare `codex-usage` repeats it after a successful monitor run. Source-management, pricing, and doctor commands do not replace the remembered usage command. Failed or cancelled loading does not save options.
+`--last N` selects a date window for that run. Source paths, enabled sources, and configured timezone remain persistent settings.
 
 ### Read a session conversation
 
@@ -115,9 +108,9 @@ In the sessions viewer, select a row with arrows or `j`/`k` and press **Enter**.
 
 The reader shows user and assistant messages, with a turn outline on wide terminals. Tools and long output start collapsed. Use `Tab` to focus a block and Enter to expand it, `t` to show tools, `[` / `]` to jump turns, **m/M** to move between turns matching the selected model/mode, `/` to search text or model labels, `n` / `N` for matches, and `i` for session/source details. `r` reloads logs when they change. Ctrl+C cancels loading and restores the terminal.
 
-Opening a model/mode row starts at a matching invocation, keeping nearby prompt context visible. Page keys use the actual visible page, and resizing preserves the position within a message. Conversations include all retained context for the selected session and sources, even when the usage report is date-filtered. Model focus guides navigation; the details panel retains the session usage estimate under the original report filters and period. Messages load only when opened; browsing does not change token/cost accounting or your remembered report options.
+Opening a model/mode row starts at a matching invocation, keeping nearby prompt context visible. Page keys use the actual visible page, and resizing preserves the position within a message. Conversations include all retained context for the selected session and sources, even when the usage report is date-filtered. Model focus guides navigation; the details panel retains the session usage estimate under the original report filters and period. Messages load only when opened; browsing does not change token/cost accounting or your command options.
 
-A direct `session ID --conversation` invocation is remembered like other commands. Piped output and `--pager never` produce the full conversation, including tool results; JSON wraps `conversation` and the filtered `usage` report. CSV is for usage reports and is rejected for conversations. Missing or encrypted text is shown as unavailable; attachments are labeled rather than opened.
+Use `--conversation` explicitly whenever you want the reader. Piped output and `--pager never` produce the full conversation, including tool results; JSON wraps `conversation` and the filtered `usage` report. CSV is for usage reports and is rejected for conversations. Missing or encrypted text is shown as unavailable; attachments are labeled rather than opened.
 
 ### Dates and filters
 
@@ -230,7 +223,7 @@ Exports contain exact counts and decimal cost values without terminal colors. JS
 
 ## Configuration and troubleshooting
 
-On Linux/WSL, configuration normally lives at `~/.config/codex-usage/config.toml` (subject to XDG settings). Use `--config PATH` or `CODEX_USAGE_CONFIG` for another location on any platform. The last successful usage command and its options are saved separately beside that file as `<config filename>.last-report.json`. Each configuration profile has its own saved command. The file stores options, not session data. Existing saved report settings are reused.
+On Linux/WSL, configuration normally lives at `~/.config/codex-usage/config.toml` (subject to XDG settings). Use `--config PATH` or `CODEX_USAGE_CONFIG` for another location on any platform. Command options are never saved. Old `<config filename>.last-report.json` files are ignored.
 
 ```sh
 codex-usage sources

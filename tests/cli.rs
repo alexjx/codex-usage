@@ -189,15 +189,8 @@ fn separate_source_configuration_persists_and_selects_only_requested_roots() {
     let report: Value = serde_json::from_slice(&selected.stdout).unwrap();
     assert_eq!(report["totals"]["total"], 240);
     success(&f.run(&["sources", "enable", "windows"]));
-    // Clear the remembered --source windows selection to use enabled sources.
-    let combined = f.run(&[
-        "models",
-        "--reset",
-        "--all",
-        "--no-cost",
-        "--format",
-        "json",
-    ]);
+    // With no source override, use all enabled configured sources.
+    let combined = f.run(&["models", "--all", "--no-cost", "--format", "json"]);
     success(&combined);
     assert_eq!(
         serde_json::from_slice::<Value>(&combined.stdout).unwrap()["totals"]["total"],
@@ -1341,7 +1334,6 @@ fn default_model_groups_separate_fast_regular_and_unknown_and_mode_filter_is_exa
         .command()
         .args([
             "models",
-            "--reset",
             "--all",
             "--no-cost",
             "--color",
@@ -1765,17 +1757,9 @@ fn date_subtotals_are_separate_exact_counts_with_distinct_sessions_and_known_cos
         ),
     ] {
         let mut cmd = f.command();
-        cmd.args([
-            command,
-            "--reset",
-            "--all",
-            "--format",
-            "json",
-            "--timezone",
-            "UTC",
-        ])
-        .arg("--root")
-        .arg(&f.root);
+        cmd.args([command, "--all", "--format", "json", "--timezone", "UTC"])
+            .arg("--root")
+            .arg(&f.root);
         if let Some(grouping) = grouping {
             cmd.args(["--group-by", grouping]);
         }
@@ -1836,7 +1820,7 @@ fn date_subtotals_are_separate_exact_counts_with_distinct_sessions_and_known_cos
     }
     let output = f
         .command()
-        .args(["models", "--reset", "--all", "--format", "json"])
+        .args(["models", "--all", "--format", "json"])
         .arg("--root")
         .arg(&f.root)
         .output()
@@ -1857,7 +1841,7 @@ fn date_subtotals_follow_timezone_filters_and_disabled_or_missing_prices() {
     let get = |extra: &[&str]| {
         let output = f
             .command()
-            .args(["daily", "--reset", "--format", "json"])
+            .args(["daily", "--format", "json"])
             .args(extra)
             .arg("--root")
             .arg(&f.root)
@@ -1909,7 +1893,6 @@ fn human_date_subtotals_follow_each_period_and_keep_wide_alignment_and_csv_rows(
         let mut cmd = f.command();
         cmd.args([
             command,
-            "--reset",
             "--all",
             "--wide",
             "--exact",
@@ -1988,7 +1971,6 @@ fn human_date_subtotals_follow_each_period_and_keep_wide_alignment_and_csv_rows(
         .command()
         .args([
             "daily",
-            "--reset",
             "--all",
             "--no-cost",
             "--exact",
@@ -2018,15 +2000,7 @@ fn human_date_subtotals_follow_each_period_and_keep_wide_alignment_and_csv_rows(
     assert!(!no_cost.contains('$') && !no_cost.contains("USD"));
     let output = f
         .command()
-        .args([
-            "daily",
-            "--reset",
-            "--all",
-            "--format",
-            "csv",
-            "--timezone",
-            "UTC",
-        ])
+        .args(["daily", "--all", "--format", "csv", "--timezone", "UTC"])
         .arg("--root")
         .arg(&f.root)
         .output()
