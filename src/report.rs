@@ -1,7 +1,7 @@
 use crate::{
     cli::{Cli, Command, Group, Sort},
     model::{Coverage, Scan, SourceStatus, UsageEvent},
-    pricing::Pricer,
+    pricing::{Estimate, Pricer},
 };
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Datelike, Days, NaiveDate, TimeZone, Utc};
@@ -107,7 +107,7 @@ pub struct Counts {
     pub modes: BTreeSet<String>,
 }
 impl Counts {
-    fn add(&mut self, event: &UsageEvent, pricer: Option<&Pricer>) -> Result<()> {
+    fn add(&mut self, event: &UsageEvent, estimate: Option<&Estimate>) -> Result<()> {
         let u = &event.usage;
         self.modes.insert(event.mode().to_string());
         macro_rules! sum {
@@ -128,8 +128,7 @@ impl Counts {
         self.cache_write_missing += usize::from(u.cache_write.is_none());
         self.reasoning_missing += usize::from(u.reasoning.is_none());
         self.events += 1;
-        if let Some(p) = pricer {
-            let estimate = p.estimate(event);
+        if let Some(estimate) = estimate {
             if let Some(cost) = estimate.cost {
                 self.cost_usd = Some(
                     self.cost_usd
@@ -144,15 +143,16 @@ impl Counts {
             if !estimate.assumptions.is_empty() {
                 self.assumed_events += 1;
             }
-            self.assumptions.extend(estimate.assumptions);
-            if let Some(reason) = estimate.reason {
-                self.pricing_reasons.insert(reason);
+            self.assumptions
+                .extend(estimate.assumptions.iter().cloned());
+            if let Some(reason) = &estimate.reason {
+                self.pricing_reasons.insert(reason.clone());
             }
-            if let Some(id) = estimate.rate_id {
-                self.rate_ids.insert(id);
+            if let Some(id) = &estimate.rate_id {
+                self.rate_ids.insert(id.clone());
             }
         }
-        self.pricing_status = if pricer.is_none() {
+        self.pricing_status = if estimate.is_none() {
             "disabled"
         } else if self.priced_tokens == 0 && self.unpriced_tokens > 0 {
             "unpriced"
@@ -221,6 +221,8 @@ pub struct Report {
     pub kind: String,
     pub period: Period,
     pub rows: Vec<Row>,
+    /// Outer date-section totals, separate from data rows to avoid additive exports.
+    pub subtotals: Vec<Row>,
     pub totals: Counts,
     pub sources: Vec<SourceStatus>,
     pub coverage: Coverage,
@@ -274,7 +276,15 @@ pub fn build_cancellable(
     crate::cancel::check(stopped)?;
     let period = Period::make(cli, tz, now)?;
     let groups = cli.groups();
+    let date_key = if groups.contains(&Group::Day) {
+        Some("day")
+    } else if groups.contains(&Group::Month) {
+        Some("month")
+    } else {
+        None
+    };
     let mut grouped: BTreeMap<Vec<String>, (Row, BTreeSet<String>)> = BTreeMap::new();
+    let mut dated: BTreeMap<String, (Row, BTreeSet<String>)> = BTreeMap::new();
     let mut total = Counts::default();
     let mut sessions = BTreeSet::new();
     for event in &scan.events {
@@ -310,6 +320,7 @@ pub fn build_cancellable(
             .map(|(k, v)| (k.to_string(), v))
             .collect();
         let key = dimensions.iter().map(|(k, v)| format!("{k}:{v}")).collect();
+        let date = date_key.and_then(|key| dimensions.get(key).cloned());
         let (row, group_sessions) = grouped.entry(key).or_insert_with(|| {
             (
                 Row {
@@ -319,9 +330,23 @@ pub fn build_cancellable(
                 BTreeSet::new(),
             )
         });
-        row.counts.add(event, pricer)?;
+        let estimate = pricer.map(|pricer| pricer.estimate(event));
+        row.counts.add(event, estimate.as_ref())?;
         group_sessions.insert(event.session.clone());
-        total.add(event, pricer)?;
+        if let (Some(date_key), Some(date)) = (date_key, date) {
+            let (subtotal, date_sessions) = dated.entry(date.clone()).or_insert_with(|| {
+                (
+                    Row {
+                        dimensions: [(date_key.to_string(), date)].into(),
+                        counts: Counts::default(),
+                    },
+                    BTreeSet::new(),
+                )
+            });
+            subtotal.counts.add(event, estimate.as_ref())?;
+            date_sessions.insert(event.session.clone());
+        }
+        total.add(event, estimate.as_ref())?;
         sessions.insert(event.session.clone());
     }
     total.sessions = sessions.len();
@@ -339,6 +364,13 @@ pub fn build_cancellable(
         .map(|(mut r, s)| {
             r.counts.sessions = s.len();
             r
+        })
+        .collect();
+    let subtotals = dated
+        .into_values()
+        .map(|(mut row, sessions)| {
+            row.counts.sessions = sessions.len();
+            row
         })
         .collect();
     let sort = cli.sort.unwrap_or(if cli.monitor() {
@@ -369,6 +401,7 @@ pub fn build_cancellable(
         kind: cli.kind().into(),
         period,
         rows,
+        subtotals,
         totals: total,
         sources: scan.sources.clone(),
         coverage: scan.coverage.clone(),
@@ -382,7 +415,251 @@ pub fn build_cancellable(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Usage;
     use clap::Parser;
+
+    fn event(id: &str, session: &str, model: &str, tier: Option<&str>, time: &str) -> UsageEvent {
+        UsageEvent {
+            id: id.into(),
+            timestamp: time.parse().unwrap(),
+            session: session.into(),
+            model: model.into(),
+            provider: "openai".into(),
+            tier: tier.map(str::to_owned),
+            project: Some("/work/test-project".into()),
+            usage: Usage {
+                input: 100,
+                cached: Some(60),
+                cache_write: Some(0),
+                output: 20,
+                reasoning: Some(10),
+            },
+            source: "fixture".into(),
+            origins: BTreeSet::new(),
+            context_tokens: None,
+            cache_retention: None,
+        }
+    }
+
+    fn dated_report(args: &[&str], scan: &Scan, pricer: Option<&Pricer>, tz: Tz) -> Report {
+        let cli = Cli::parse_from(std::iter::once("codex-usage").chain(args.iter().copied()));
+        build(
+            &cli,
+            tz,
+            scan,
+            pricer,
+            "2026-11-04T12:00:00Z".parse().unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn date_subtotals_count_sessions_once_across_model_and_mode_rows() {
+        let scan = Scan {
+            events: vec![
+                event(
+                    "a",
+                    "shared",
+                    "gpt-6.1-sol",
+                    Some("standard"),
+                    "2026-11-01T00:00:00Z",
+                ),
+                event(
+                    "b",
+                    "shared",
+                    "gpt-5.6-sol",
+                    Some("standard"),
+                    "2026-11-01T01:00:00Z",
+                ),
+                event(
+                    "c",
+                    "other",
+                    "gpt-6.1-sol",
+                    Some("fast"),
+                    "2026-11-01T02:00:00Z",
+                ),
+                event(
+                    "d",
+                    "shared",
+                    "gpt-6.1-sol",
+                    Some("standard"),
+                    "2026-11-02T00:00:00Z",
+                ),
+            ],
+            ..Default::default()
+        };
+        let pricer = Pricer::load_current(None).unwrap();
+        let report = dated_report(
+            &["daily", "--all", "--sort", "cost"],
+            &scan,
+            Some(&pricer),
+            chrono_tz::UTC,
+        );
+        assert_eq!(report.rows.len(), 4);
+        assert_eq!(report.subtotals.len(), 2);
+        assert_eq!(
+            report.subtotals[0].dimensions,
+            [("day".into(), "2026-11-01".into())].into()
+        );
+        assert_eq!(report.subtotals[0].counts.total, 360);
+        assert_eq!(report.subtotals[0].counts.sessions, 2);
+        assert_eq!(report.subtotals[0].counts.events, 3);
+        assert_eq!(
+            report.subtotals[0].counts.cost_usd,
+            Some(Decimal::new(1442, 6))
+        );
+        assert_eq!(report.subtotals[1].dimensions["day"], "2026-11-02");
+        assert_eq!(report.subtotals[1].counts.total, 120);
+        assert_eq!(report.subtotals[1].counts.sessions, 1);
+        assert_eq!(report.totals.total, 480);
+        assert_eq!(report.totals.sessions, 2);
+        assert_eq!(report.totals.cost_usd, Some(Decimal::new(1728, 6)));
+        assert_eq!(
+            report.subtotals.iter().map(|r| r.counts.total).sum::<u64>(),
+            report.totals.total
+        );
+    }
+
+    #[test]
+    fn date_subtotals_preserve_partial_assumed_unpriced_and_disabled_costs() {
+        let scan = Scan {
+            events: vec![
+                event(
+                    "a",
+                    "shared",
+                    "gpt-6.1-sol",
+                    Some("standard"),
+                    "2026-11-01T00:00:00Z",
+                ),
+                event(
+                    "b",
+                    "shared",
+                    "unknown-model",
+                    Some("standard"),
+                    "2026-11-01T01:00:00Z",
+                ),
+                event("c", "other", "gpt-6.1-sol", None, "2026-11-01T02:00:00Z"),
+                event(
+                    "d",
+                    "shared",
+                    "unknown-model",
+                    Some("standard"),
+                    "2026-11-02T00:00:00Z",
+                ),
+            ],
+            ..Default::default()
+        };
+        let pricer = Pricer::load_current(None).unwrap();
+        let report = dated_report(&["daily", "--all"], &scan, Some(&pricer), chrono_tz::UTC);
+        let mixed = &report.subtotals[0].counts;
+        assert_eq!(mixed.total, 360);
+        assert_eq!(mixed.priced_tokens, 240);
+        assert_eq!(mixed.unpriced_tokens, 120);
+        assert_eq!(mixed.assumed_events, 1);
+        assert_eq!(mixed.pricing_status, "partial");
+        assert_eq!(mixed.cost_usd, Some(Decimal::new(572, 6)));
+        assert!(!mixed.assumptions.is_empty());
+        let unknown = &report.subtotals[1].counts;
+        assert_eq!(unknown.pricing_status, "unpriced");
+        assert_eq!(unknown.cost_usd, None);
+        assert_eq!(unknown.unpriced_tokens, 120);
+        let disabled = dated_report(
+            &["daily", "--all", "--no-cost"],
+            &scan,
+            None,
+            chrono_tz::UTC,
+        );
+        assert!(disabled
+            .subtotals
+            .iter()
+            .all(|r| r.counts.pricing_status == "disabled" && r.counts.cost_usd.is_none()));
+    }
+
+    #[test]
+    fn date_subtotals_follow_timezone_filters_and_outer_day_or_month_dimension() {
+        let scan = Scan {
+            events: vec![
+                event(
+                    "a",
+                    "shared",
+                    "gpt-6.1-sol",
+                    Some("standard"),
+                    "2026-10-31T15:59:59Z",
+                ),
+                event(
+                    "b",
+                    "shared",
+                    "gpt-6.1-sol",
+                    Some("fast"),
+                    "2026-10-31T16:00:00Z",
+                ),
+                event(
+                    "c",
+                    "other",
+                    "gpt-5.6-sol",
+                    Some("standard"),
+                    "2026-11-01T16:00:00Z",
+                ),
+            ],
+            ..Default::default()
+        };
+        let monthly = dated_report(
+            &["monthly", "--all"],
+            &scan,
+            None,
+            chrono_tz::Asia::Shanghai,
+        );
+        assert_eq!(monthly.subtotals.len(), 2);
+        assert_eq!(
+            monthly.subtotals[0].dimensions,
+            [("month".into(), "2026-10".into())].into()
+        );
+        assert_eq!(monthly.subtotals[0].counts.total, 120);
+        assert_eq!(monthly.subtotals[1].dimensions["month"], "2026-11");
+        assert_eq!(monthly.subtotals[1].counts.total, 240);
+        let both = dated_report(
+            &["models", "--all", "--group-by", "month,day,model"],
+            &scan,
+            None,
+            chrono_tz::Asia::Shanghai,
+        );
+        assert_eq!(both.subtotals.len(), 3);
+        assert!(both
+            .subtotals
+            .iter()
+            .all(|r| r.dimensions.len() == 1 && r.dimensions.contains_key("day")));
+        let filtered = dated_report(
+            &[
+                "daily",
+                "--since",
+                "2026-11-01",
+                "--until",
+                "2026-11-01",
+                "--model",
+                "gpt-6.1-sol",
+                "--mode",
+                "fast",
+                "--project",
+                "test-project",
+            ],
+            &scan,
+            None,
+            chrono_tz::Asia::Shanghai,
+        );
+        assert_eq!(filtered.subtotals.len(), 1);
+        assert_eq!(filtered.subtotals[0].dimensions["day"], "2026-11-01");
+        assert_eq!(filtered.subtotals[0].counts.total, 120);
+        let ungrouped = dated_report(
+            &["daily", "--all", "--group-by", "model,mode"],
+            &scan,
+            None,
+            chrono_tz::UTC,
+        );
+        assert!(ungrouped.subtotals.is_empty());
+        let empty = dated_report(&["daily", "--all"], &Scan::default(), None, chrono_tz::UTC);
+        assert!(empty.subtotals.is_empty());
+        assert_eq!(empty.totals.total, 0);
+    }
     #[test]
     fn timezone_dates_and_end_bounds() {
         let cli = Cli::parse_from([

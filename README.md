@@ -144,7 +144,7 @@ codex-usage models --today --mode fast
 codex-usage models --all --group-by source,model
 ```
 
-Daily reports show each date once. Every table ends with a **Total** for the full selection, including offscreen rows. Long reports open a scrollable viewer with pinned headings and totals.
+Daily reports show each date once. Every table ends with a **Total** for the full selection, including offscreen rows. Each date section ends with a **Subtotal** in the same columns; monthly sections get their own subtotal too. Session counts are unique within each period. JSON exposes these in a separate `subtotals` array; CSV keeps only data rows so aggregates are not counted twice. Long reports open a scrollable viewer with pinned headings and totals.
 
 ### Display and navigation
 

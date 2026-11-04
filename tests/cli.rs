@@ -1669,3 +1669,452 @@ fn listed_implicit_native_source_can_be_enabled_and_disabled() {
     let config: toml::Value = toml::from_str(&fs::read_to_string(&f.config).unwrap()).unwrap();
     assert_eq!(config["sources"][0]["enabled"].as_bool(), Some(false));
 }
+
+fn date_subtotal_fixture() -> Fixture {
+    let f = Fixture::new();
+    for (session, requests) in [
+        (
+            "subtotal-shared",
+            vec![
+                (
+                    "oct-regular",
+                    "gpt-6.1-sol",
+                    "standard",
+                    "2026-10-31T23:30:00Z",
+                    100_000,
+                    60_000,
+                    20_000,
+                ),
+                (
+                    "oct-fast",
+                    "gpt-6.1-sol",
+                    "priority",
+                    "2026-10-31T23:31:00Z",
+                    200_000,
+                    100_000,
+                    10_000,
+                ),
+                (
+                    "nov-regular",
+                    "gpt-6.1-sol",
+                    "standard",
+                    "2026-11-01T00:05:00Z",
+                    1_000,
+                    0,
+                    100,
+                ),
+                (
+                    "nov-unpriced",
+                    "unsupported-model",
+                    "standard",
+                    "2026-11-01T00:06:00Z",
+                    2_000,
+                    0,
+                    500,
+                ),
+            ],
+        ),
+        (
+            "subtotal-other",
+            vec![
+                (
+                    "oct-other",
+                    "gpt-5.6-sol",
+                    "standard",
+                    "2026-10-31T23:40:00Z",
+                    10_000,
+                    5_000,
+                    1_000,
+                ),
+                (
+                    "nov-other",
+                    "gpt-6.1-sol",
+                    "standard",
+                    "2026-11-01T00:10:00Z",
+                    2_000,
+                    1_000,
+                    200,
+                ),
+            ],
+        ),
+    ] {
+        let mut events = vec![dated_metadata(session, "2026-10-31T23:00:00Z")];
+        for (turn, model, tier, time, input, cached, output) in requests {
+            events.extend([
+                mode_context(turn, model, time),
+                recorded_mode(time, Some(tier)),
+                usage(session, turn, turn, time, input, cached, output),
+            ]);
+        }
+        f.write(session, events);
+    }
+    f
+}
+
+#[test]
+fn date_subtotals_are_separate_exact_counts_with_distinct_sessions_and_known_costs() {
+    let f = date_subtotal_fixture();
+    for (command, grouping, key, periods) in [
+        ("daily", None, "day", ["2026-10-31", "2026-11-01"]),
+        ("monthly", None, "month", ["2026-10", "2026-11"]),
+        (
+            "models",
+            Some("day,model,mode"),
+            "day",
+            ["2026-10-31", "2026-11-01"],
+        ),
+    ] {
+        let mut cmd = f.command();
+        cmd.args([
+            command,
+            "--reset",
+            "--all",
+            "--format",
+            "json",
+            "--timezone",
+            "UTC",
+        ])
+        .arg("--root")
+        .arg(&f.root);
+        if let Some(grouping) = grouping {
+            cmd.args(["--group-by", grouping]);
+        }
+        let output = cmd.output().unwrap();
+        success(&output);
+        no_ansi(&output.stdout);
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let subtotals = report["subtotals"].as_array().unwrap();
+        assert_eq!(subtotals.len(), 2, "{report}");
+        assert_eq!(report["rows"].as_array().unwrap().len(), 5);
+        assert_eq!(report["totals"]["total"], 346_800);
+        assert_eq!(report["totals"]["sessions"], 2);
+        assert_eq!(
+            Decimal::from_str(report["totals"]["cost_usd"].as_str().unwrap()).unwrap(),
+            Decimal::from_str("0.9551").unwrap()
+        );
+        for (index, (input, cached, output, total, cost, unpriced)) in [
+            (310_000, 165_000, 31_000, 341_000, "0.948", 0),
+            (5_000, 1_000, 800, 5_800, "0.0071", 2_500),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let row = &subtotals[index];
+            assert_eq!(row["dimensions"], json!({key: periods[index]}));
+            let counts = &row["counts"];
+            assert_eq!(counts["input"], input);
+            assert_eq!(counts["cached"], cached);
+            assert_eq!(counts["output"], output);
+            assert_eq!(counts["total"], total);
+            assert_eq!(
+                counts["sessions"], 2,
+                "a session switching models/modes must count once per period"
+            );
+            assert_eq!(counts["unpriced_tokens"], unpriced);
+            assert_eq!(
+                Decimal::from_str(counts["cost_usd"].as_str().unwrap()).unwrap(),
+                Decimal::from_str(cost).unwrap()
+            );
+        }
+        assert_eq!(
+            subtotals
+                .iter()
+                .map(|row| row["counts"]["total"].as_u64().unwrap())
+                .sum::<u64>(),
+            346_800
+        );
+        assert_eq!(
+            report["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["counts"]["total"].as_u64().unwrap())
+                .sum::<u64>(),
+            346_800,
+            "subtotal rows must not enter raw data rows"
+        );
+    }
+    let output = f
+        .command()
+        .args(["models", "--reset", "--all", "--format", "json"])
+        .arg("--root")
+        .arg(&f.root)
+        .output()
+        .unwrap();
+    success(&output);
+    assert!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()["subtotals"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "non-date grouping must not invent a subtotal section"
+    );
+}
+
+#[test]
+fn date_subtotals_follow_timezone_filters_and_disabled_or_missing_prices() {
+    let f = date_subtotal_fixture();
+    let get = |extra: &[&str]| {
+        let output = f
+            .command()
+            .args(["daily", "--reset", "--format", "json"])
+            .args(extra)
+            .arg("--root")
+            .arg(&f.root)
+            .output()
+            .unwrap();
+        success(&output);
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+    let shanghai = get(&["--all", "--timezone", "Asia/Shanghai"]);
+    assert_eq!(shanghai["subtotals"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        shanghai["subtotals"][0]["dimensions"],
+        json!({"day":"2026-11-01"})
+    );
+    assert_eq!(shanghai["subtotals"][0]["counts"]["total"], 346_800);
+    assert_eq!(shanghai["subtotals"][0]["counts"]["sessions"], 2);
+    let selected = get(&[
+        "--since",
+        "2026-11-01",
+        "--until",
+        "2026-11-01",
+        "--timezone",
+        "UTC",
+    ]);
+    assert_eq!(selected["subtotals"].as_array().unwrap().len(), 1);
+    assert_eq!(selected["subtotals"][0]["counts"]["total"], 5_800);
+    assert_eq!(selected["totals"]["total"], 5_800);
+    let no_cost = get(&["--all", "--timezone", "UTC", "--no-cost"]);
+    assert!(no_cost["subtotals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|row| row["counts"]["cost_usd"].is_null()
+            && row["counts"]["pricing_status"] == "disabled"));
+    let unknown = get(&["--all", "--timezone", "UTC", "--model", "unsupported-model"]);
+    assert_eq!(unknown["subtotals"].as_array().unwrap().len(), 1);
+    assert_eq!(unknown["subtotals"][0]["counts"]["total"], 2_500);
+    assert_eq!(unknown["subtotals"][0]["counts"]["unpriced_tokens"], 2_500);
+    assert!(unknown["subtotals"][0]["counts"]["cost_usd"].is_null());
+    let empty = get(&["--all", "--model", "absent-model"]);
+    assert!(empty["rows"].as_array().unwrap().is_empty());
+    assert!(empty["subtotals"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn human_date_subtotals_follow_each_period_and_keep_wide_alignment_and_csv_rows() {
+    let f = date_subtotal_fixture();
+    for command in ["daily", "monthly", "models"] {
+        let mut cmd = f.command();
+        cmd.args([
+            command,
+            "--reset",
+            "--all",
+            "--wide",
+            "--exact",
+            "--format",
+            "table",
+            "--color",
+            "never",
+            "--pager",
+            "never",
+            "--timezone",
+            "UTC",
+        ])
+        .arg("--root")
+        .arg(&f.root);
+        if command == "models" {
+            cmd.args(["--group-by", "day,model,mode"]);
+        }
+        let output = cmd.output().unwrap();
+        success(&output);
+        no_ansi(&output.stdout);
+        let text = String::from_utf8(output.stdout).unwrap();
+        let subtotals: Vec<_> = text
+            .lines()
+            .filter(|line| line.starts_with("Subtotal "))
+            .collect();
+        assert_eq!(subtotals.len(), 2, "{command}: {text}");
+        assert_eq!(
+            subtotals[0].split_whitespace().collect::<Vec<_>>(),
+            [
+                "Subtotal", "310,000", "165,000", "31,000", "15,500", "0", "2", "341,000",
+                "$0.9480"
+            ],
+            "{text}"
+        );
+        assert_eq!(
+            subtotals[1].split_whitespace().collect::<Vec<_>>(),
+            ["Subtotal", "5,000", "1,000", "800", "400", "0", "2", "5,800", "$0.0071*"],
+            "{text}"
+        );
+        let positions: Vec<_> = text
+            .match_indices("\nSubtotal ")
+            .map(|(index, _)| index)
+            .collect();
+        let second_heading = if command == "monthly" {
+            text.find("November 2026")
+        } else {
+            text.find("Nov 01 2026")
+        }
+        .unwrap_or_else(|| panic!("{text}"));
+        assert!(
+            positions[0] < second_heading && second_heading < positions[1],
+            "{text}"
+        );
+        let total = text.lines().last().unwrap();
+        assert!(total.starts_with("Total "), "{text}");
+        assert_eq!(
+            total.split_whitespace().collect::<Vec<_>>(),
+            ["Total", "315,000", "166,000", "31,800", "15,900", "0", "2", "346,800", "$0.9551*"],
+            "{text}"
+        );
+        let cost_column = text
+            .lines()
+            .find(|line| line.contains("Est. USD"))
+            .unwrap()
+            .find("Est. USD")
+            .unwrap();
+        for line in subtotals.into_iter().chain(std::iter::once(total)) {
+            assert_eq!(
+                line.len(),
+                cost_column + "Est. USD".len(),
+                "subtotal cost cells must retain the table's right edge: {text}"
+            );
+        }
+    }
+    let output = f
+        .command()
+        .args([
+            "daily",
+            "--reset",
+            "--all",
+            "--no-cost",
+            "--exact",
+            "--format",
+            "table",
+            "--color",
+            "never",
+            "--pager",
+            "never",
+            "--timezone",
+            "UTC",
+        ])
+        .arg("--root")
+        .arg(&f.root)
+        .output()
+        .unwrap();
+    success(&output);
+    let no_cost = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(
+        no_cost
+            .lines()
+            .filter(|line| line.starts_with("Subtotal "))
+            .count(),
+        2,
+        "{no_cost}"
+    );
+    assert!(!no_cost.contains('$') && !no_cost.contains("USD"));
+    let output = f
+        .command()
+        .args([
+            "daily",
+            "--reset",
+            "--all",
+            "--format",
+            "csv",
+            "--timezone",
+            "UTC",
+        ])
+        .arg("--root")
+        .arg(&f.root)
+        .output()
+        .unwrap();
+    success(&output);
+    no_ansi(&output.stdout);
+    let mut reader = csv::Reader::from_reader(output.stdout.as_slice());
+    let total = reader
+        .headers()
+        .unwrap()
+        .iter()
+        .position(|name| name == "total")
+        .unwrap();
+    let rows: Vec<_> = reader.records().map(Result::unwrap).collect();
+    assert_eq!(
+        rows.len(),
+        5,
+        "CSV must contain only raw grouped rows, not extra aggregate rows"
+    );
+    assert_eq!(
+        rows.iter()
+            .map(|row| row[total].parse::<u64>().unwrap())
+            .sum::<u64>(),
+        346_800
+    );
+}
+
+#[test]
+fn stacked_date_subtotals_remain_complete_after_wrapped_long_model_rows() {
+    let f = Fixture::new();
+    let model = "long-model-".repeat(16);
+    f.write(
+        "wrapped",
+        vec![
+            dated_metadata("wrapped-session", "2026-10-31T10:00:00Z"),
+            context("wrapped-one", &model),
+            usage(
+                "wrapped-session",
+                "wrapped-one",
+                "wrapped-one",
+                "2026-10-31T10:01:00Z",
+                100,
+                0,
+                15,
+            ),
+            context("wrapped-two", &model),
+            usage(
+                "wrapped-session",
+                "wrapped-two",
+                "wrapped-two",
+                "2026-11-01T10:01:00Z",
+                200,
+                0,
+                20,
+            ),
+        ],
+    );
+    let output = f
+        .command()
+        .args([
+            "daily",
+            "--all",
+            "--no-cost",
+            "--exact",
+            "--format",
+            "table",
+            "--color",
+            "never",
+            "--pager",
+            "never",
+            "--timezone",
+            "UTC",
+        ])
+        .arg("--root")
+        .arg(&f.root)
+        .output()
+        .unwrap();
+    success(&output);
+    let text = String::from_utf8(output.stdout).unwrap();
+    let lines: Vec<_> = text.lines().collect();
+    let positions: Vec<_> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(i, line)| (*line == "Subtotal").then_some(i))
+        .collect();
+    assert_eq!(positions.len(), 2, "{text}");
+    assert_eq!(lines[positions[0] + 1], "115 tokens", "{text}");
+    assert_eq!(lines[positions[1] + 1], "220 tokens", "{text}");
+    assert_eq!(lines[lines.len() - 2], "Total", "{text}");
+    assert_eq!(lines.last(), Some(&"335 tokens"), "{text}");
+}

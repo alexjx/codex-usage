@@ -937,6 +937,7 @@ mod regression_tests {
                 end: None,
             },
             rows: Vec::new(),
+            subtotals: Vec::new(),
             totals: Counts {
                 total,
                 cost_usd: cost,

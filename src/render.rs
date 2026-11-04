@@ -30,6 +30,18 @@ impl Style {
         }
         let code = match (self.theme, role) {
             (_, "bold") => "1",
+            (Theme::Dark, "subtotal") => "38;2;146;183;191",
+            (Theme::Dark, "subtotal_cost") => "38;2;172;159;206",
+            (Theme::Dark, "total") => "1;38;2;103;212;232",
+            (Theme::Dark, "total_cost") => "1;38;2;196;181;253",
+            (Theme::Light, "subtotal") => "38;2;82;111;120",
+            (Theme::Light, "subtotal_cost") => "38;2;112;100;139",
+            (Theme::Light, "total") => "1;38;2;0;103;125",
+            (Theme::Light, "total_cost") => "1;38;2;107;63;160",
+            (_, "subtotal") => "36",
+            (_, "subtotal_cost") => "35",
+            (_, "total") => "1;96",
+            (_, "total_cost") => "1;95",
             (Theme::Dark, "accent") => "38;2;103;212;232",
             (Theme::Dark, "cost") => "38;2;196;181;253",
             (Theme::Dark, "ok") => "38;2;134;211;165",
@@ -205,6 +217,73 @@ pub struct SessionRow {
     pub start: usize,
     pub end: usize,
 }
+
+struct SummaryLayout<'a> {
+    cli: &'a Cli,
+    style: &'a Style,
+    width: usize,
+    id_width: usize,
+    stacked: bool,
+    titles: &'a [&'a str],
+    widths: &'a [usize],
+}
+
+fn summary_lines(
+    label: &str,
+    counts: &Counts,
+    cells: &[String],
+    layout: &SummaryLayout<'_>,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    let SummaryLayout {
+        cli,
+        style,
+        width,
+        id_width,
+        stacked,
+        titles,
+        widths,
+    } = layout;
+    let (role, cost_role) = if label == "Subtotal" {
+        ("subtotal", "subtotal_cost")
+    } else {
+        ("total", "total_cost")
+    };
+    if *stacked {
+        text(&mut lines, style, role, label, *width);
+        let detail = if cli.wide {
+            titles
+                .iter()
+                .zip(cells)
+                .skip(1)
+                .map(|(label, value)| format!("{label} {value}"))
+                .collect::<Vec<_>>()
+                .join(" / ")
+        } else {
+            let mut detail = format!("{} tokens", number(counts.total, cli.exact));
+            if !cli.no_cost {
+                detail.push_str(&format!(" / {}", cells.last().unwrap()));
+            }
+            detail
+        };
+        text(&mut lines, style, role, &detail, *width);
+    } else {
+        let mut line = style.paint(role, pad(label, *id_width, false));
+        for (index, (value, width)) in cells.iter().zip(*widths).enumerate() {
+            line.push_str("  ");
+            line.push_str(&style.paint(
+                if !cli.no_cost && index + 1 == cells.len() {
+                    cost_role
+                } else {
+                    role
+                },
+                pad(value, *width, true),
+            ));
+        }
+        lines.push(line);
+    }
+    lines
+}
 pub fn view(cli: &Cli, report: &Report, style: &Style, width: usize, help: bool) -> View {
     let mut h = Vec::new();
     let mut b = Vec::new();
@@ -363,6 +442,11 @@ pub fn view(cli: &Cli, report: &Report, style: &Style, width: usize, help: bool)
         .max()
         .unwrap_or(16)
         .max(labels[0].len());
+    let id_width = if report.subtotals.is_empty() {
+        id_width
+    } else {
+        id_width.max("Subtotal".len())
+    };
     let mut detailed = cli.wide || width >= id_width + if cli.no_cost { 40 } else { 53 };
     let columns = |detailed: bool| {
         let mut labels = vec!["Mode"];
@@ -385,6 +469,7 @@ pub fn view(cli: &Cli, report: &Report, style: &Style, width: usize, help: bool)
             .rows
             .iter()
             .map(|r| &r.counts)
+            .chain(report.subtotals.iter().map(|row| &row.counts))
             .chain(std::iter::once(&report.totals))
         {
             for (i, v) in values(row, cli, detailed).iter().enumerate() {
@@ -401,6 +486,15 @@ pub fn view(cli: &Cli, report: &Report, style: &Style, width: usize, help: bool)
     let stacked = id_width + widths.iter().sum::<usize>() + widths.len() * 2 > width;
     h.push(String::new());
     let titles = columns(detailed);
+    let summary_layout = SummaryLayout {
+        cli,
+        style,
+        width,
+        id_width,
+        stacked,
+        titles: &titles,
+        widths: &widths,
+    };
     if help {
         text(&mut h, style, "meta", "Help", width);
         let mut details=vec!["Arrows/j/k Scroll | PgUp/PgDn Page | Home/End | q Quit | ? Back".into(),
@@ -474,8 +568,19 @@ pub fn view(cli: &Cli, report: &Report, style: &Style, width: usize, help: bool)
         } else {
             None
         };
+        let date_totals: std::collections::BTreeMap<_, _> = report
+            .subtotals
+            .iter()
+            .filter_map(|row| {
+                date_key.and_then(|key| {
+                    row.dimensions
+                        .get(key)
+                        .map(|date| (date.as_str(), &row.counts))
+                })
+            })
+            .collect();
         let mut previous_date = None;
-        for row in &report.rows {
+        for (row_index, row) in report.rows.iter().enumerate() {
             if let Some((key, date)) =
                 date_key.and_then(|key| row.dimensions.get(key).map(|date| (key, date)))
             {
@@ -545,6 +650,29 @@ pub fn view(cli: &Cli, report: &Report, style: &Style, width: usize, help: bool)
                     end: b.len(),
                 });
             }
+            if let Some((key, date)) =
+                date_key.and_then(|key| row.dimensions.get(key).map(|date| (key, date)))
+            {
+                let next_date = report
+                    .rows
+                    .get(row_index + 1)
+                    .and_then(|row| row.dimensions.get(key));
+                if next_date != Some(date) {
+                    if let Some(counts) = date_totals.get(date.as_str()) {
+                        let mut cells = values(counts, cli, detailed);
+                        cells[0].clear();
+                        let subtotal_start = b.len();
+                        identities.push((format!("subtotal:{key}:{date}"), b.len()));
+                        b.extend(summary_lines("Subtotal", counts, &cells, &summary_layout));
+                        // Selection must scroll the trailing subtotal into view too.
+                        if let Some(row) = session_rows.last_mut() {
+                            if row.end == subtotal_start {
+                                row.end = b.len();
+                            }
+                        }
+                    }
+                }
+            }
         }
         if report.rows.is_empty() {
             text(
@@ -575,39 +703,12 @@ pub fn view(cli: &Cli, report: &Report, style: &Style, width: usize, help: bool)
         }
         // A grand total spans all modes; leave that categorical cell empty.
         totals[0].clear();
-        if stacked {
-            text(&mut total_footer, style, "bold", "Total", width);
-            let detail = if cli.wide {
-                titles
-                    .iter()
-                    .zip(&totals)
-                    .skip(1)
-                    .map(|(label, value)| format!("{label} {value}"))
-                    .collect::<Vec<_>>()
-                    .join(" / ")
-            } else {
-                let mut detail = format!("{} tokens", number(report.totals.total, cli.exact));
-                if !cli.no_cost {
-                    detail.push_str(&format!(" / {}", totals.last().unwrap()));
-                }
-                detail
-            };
-            text(&mut total_footer, style, "bold", &detail, width);
-        } else {
-            let mut line = style.paint("bold", pad("Total", id_width, false));
-            for (i, (value, w)) in totals.iter().zip(&widths).enumerate() {
-                line.push_str("  ");
-                line.push_str(&style.paint(
-                    if !cli.no_cost && i == totals.len() - 1 {
-                        "cost"
-                    } else {
-                        "bold"
-                    },
-                    pad(value, *w, true),
-                ));
-            }
-            total_footer.push(line);
-        }
+        total_footer.extend(summary_lines(
+            "Total",
+            &report.totals,
+            &totals,
+            &summary_layout,
+        ));
     }
     View {
         header: h,
