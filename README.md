@@ -103,6 +103,22 @@ codex-usage daily --reset           # reset this command's options to defaults
 
 Relative periods are recalculated each run. Monitor is also remembered, including its interval, frame limit, and filters; bare `codex-usage` repeats it after a successful monitor run. Source-management, pricing, and doctor commands do not replace the remembered usage command. Failed or cancelled loading does not save options.
 
+### Read a session conversation
+
+```sh
+codex-usage sessions --last 7
+codex-usage session SESSION_ID --conversation
+codex-usage session SESSION_ID --conversation --format json > conversation.json
+```
+
+In the sessions viewer, select a row with arrows or `j`/`k` and press **Enter**. `Esc` returns to the same selected row; `q` quits. Short session reports also open the viewer; `--pager never` keeps normal linear output.
+
+The reader shows user and assistant messages, with a turn outline on wide terminals. Tools and long output start collapsed. Use `Tab` to focus a block and Enter to expand it, `t` to show tools, `[` / `]` to jump turns, `/` to search, `n` / `N` for matches, and `i` for session/source details. `r` reloads logs when they change. Ctrl+C cancels loading and restores the terminal.
+
+Conversations include all retained context for the selected session and sources, even when the usage report is date-filtered. The details panel labels the original report period and its usage estimate. Messages load only when opened; browsing does not change token/cost accounting or your remembered report options.
+
+A direct `session ID --conversation` invocation is remembered like other commands. Piped output and `--pager never` produce the full conversation, including tool results; JSON wraps `conversation` and the filtered `usage` report. CSV is for usage reports and is rejected for conversations. Missing or encrypted text is shown as unavailable; attachments are labeled rather than opened.
+
 ### Dates and filters
 
 | Option | Meaning |

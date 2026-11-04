@@ -2,6 +2,31 @@ use crate::report::Report;
 use anyhow::Result;
 use std::io::Write;
 
+/// Serialize retained text directly, without copying the transcript into a JSON value.
+pub fn conversation_json(
+    conversation: &crate::conversation::Conversation,
+    usage: &Report,
+    mut out: impl Write,
+) -> Result<()> {
+    #[derive(serde::Serialize)]
+    struct Envelope<'a> {
+        schema_version: u32,
+        conversation: &'a crate::conversation::Conversation,
+        usage: &'a Report,
+    }
+    serde_json::to_writer_pretty(
+        &mut out,
+        &Envelope {
+            schema_version: 1,
+            conversation,
+            usage,
+        },
+    )?;
+    writeln!(out)?;
+    out.flush()?;
+    Ok(())
+}
+
 pub fn json(report: &Report, mut out: impl Write, lines: bool) -> Result<()> {
     if lines {
         serde_json::to_writer(&mut out, report)?;

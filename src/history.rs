@@ -211,7 +211,8 @@ pub fn resolve(mut cli: Cli, config_path: &Path) -> Result<Cli> {
         no_cost,
         strict,
         pricing_file,
-        pricing_date
+        pricing_date,
+        conversation
     );
     // Explicit relative paths are valid at invocation time; normalize them before validation.
     // All paths retained from the saved record were already required to be absolute above.

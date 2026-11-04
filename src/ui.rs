@@ -1,5 +1,8 @@
 use crate::{
-    cli::{Cli, Pager},
+    cli::{Cli, Command, Pager},
+    conversation::{self, Conversation},
+    conversation_ui::{self, ReaderExit},
+    model::Source,
     render::{self, Style},
     report::Report,
 };
@@ -64,14 +67,20 @@ fn nav(
     b: usize,
     total: usize,
     chart_control: bool,
+    conversation_control: bool,
 ) -> Vec<String> {
     let mut v = Vec::new();
     text(
         &mut v,
         style,
         &format!(
-            "{a}-{b}/{total}{}  q Quit  ? Help",
-            if chart_control { "  c Chart" } else { "" }
+            "{a}-{b}/{total}{}{}  q Quit  ? Help",
+            if chart_control { "  c Chart" } else { "" },
+            if conversation_control {
+                "  Enter Conversation"
+            } else {
+                ""
+            }
         ),
         width,
     );
@@ -83,6 +92,7 @@ fn nav(
 pub fn run<F>(
     cli: &Cli,
     mut report: Report,
+    sources: &[Source],
     stopped: Arc<AtomicBool>,
     mut refresh: F,
 ) -> Result<Report>
@@ -95,6 +105,9 @@ where
     let first = render::view(cli, &report, &style, width, false);
     let use_screen = tty
         && (cli.monitor()
+            || (matches!(cli.command, Some(Command::Sessions))
+                && !first.session_rows.is_empty()
+                && cli.pager != Pager::Never)
             || cli.pager == Pager::Always
             || (cli.pager == Pager::Auto
                 && first.header.len() + first.body.len() + first.footer.len() + 1 > height));
@@ -137,6 +150,8 @@ where
         let mut next = Instant::now() + cli.interval();
         let mut reanchor = false;
         let mut pending = false;
+        let mut selected_session = 0usize;
+        let mut notice: Option<String> = None;
         loop {
             if stopped.load(Ordering::Relaxed) {
                 break;
@@ -151,7 +166,44 @@ where
                 reanchor = true;
             }
             let (width, height) = size();
-            let mut v = render::view(cli, &report, &style, width, help);
+            let selecting = matches!(cli.command, Some(Command::Sessions)) && !help;
+            let mut v = render::view(
+                cli,
+                &report,
+                &style,
+                if selecting {
+                    width.saturating_sub(2).max(1)
+                } else {
+                    width
+                },
+                help,
+            );
+            let selecting = selecting && !v.session_rows.is_empty();
+            if selecting {
+                selected_session = selected_session.min(v.session_rows.len() - 1);
+                let row = &v.session_rows[selected_session];
+                for (index, line) in v.body.iter_mut().enumerate() {
+                    *line = format!(
+                        "{}{}",
+                        if index == row.start {
+                            style.paint("accent", if cli.ascii { "> " } else { "› " })
+                        } else {
+                            "  ".into()
+                        },
+                        line
+                    );
+                }
+                for line in v.header.iter_mut().chain(v.footer.iter_mut()) {
+                    line.insert_str(0, "  ");
+                }
+            }
+            if let Some(message) = &notice {
+                v.header.extend(
+                    render::wrap(message, width)
+                        .iter()
+                        .map(|line| style.paint("warn", line)),
+                );
+            }
             // Preserve the top logical identity through reflow or report reordering.
             let anchor = old_identities
                 .iter()
@@ -174,6 +226,7 @@ where
                 v.body.len(),
                 v.body.len(),
                 cli.monitor(),
+                selecting,
             );
             let mut footer_size = v.footer.len() + reserve_nav.len();
             let date_rows = v
@@ -192,6 +245,7 @@ where
                     v.body.len(),
                     v.body.len(),
                     false,
+                    selecting,
                 );
                 footer_size = v.footer.len() + reserve_nav.len();
             }
@@ -214,6 +268,14 @@ where
             }
             let chrome = v.header.len() + footer_size + date_rows;
             let page = height.saturating_sub(chrome).max(1);
+            if selecting {
+                let row = &v.session_rows[selected_session];
+                if row.start < offset || row.end - row.start > page {
+                    offset = row.start;
+                } else if row.end > offset + page {
+                    offset = row.end.saturating_sub(page);
+                }
+            }
             offset = offset.min(v.body.len().saturating_sub(page));
             let mut lines = if chrome >= height {
                 let mut lines = Vec::new();
@@ -247,6 +309,7 @@ where
                     (offset + page).min(v.body.len()),
                     v.body.len(),
                     chart_available,
+                    selecting,
                 );
                 while navigation.len() < reserve_nav.len() {
                     navigation.push(String::new());
@@ -293,6 +356,60 @@ where
                         KeyCode::Char('q') | KeyCode::Esc => break,
                         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             break
+                        }
+                        KeyCode::Enter if selecting => {
+                            notice = None;
+                            let id = &v.session_rows[selected_session].session;
+                            match load_conversation(cli, sources, id, &stopped, true) {
+                                Ok(conversation) => {
+                                    if conversation_ui::run(
+                                        cli,
+                                        conversation,
+                                        &report,
+                                        sources,
+                                        Arc::clone(&stopped),
+                                        false,
+                                    )? == ReaderExit::Quit
+                                    {
+                                        break;
+                                    }
+                                }
+                                Err(error) if crate::cancel::is_cancelled(&error) => {
+                                    if stopped.load(Ordering::Relaxed) {
+                                        break;
+                                    }
+                                }
+                                Err(error) => notice = Some(error.to_string()),
+                            }
+                            previous.clear();
+                            last_size = (0, 0);
+                        }
+                        KeyCode::Down | KeyCode::Char('j') if selecting => {
+                            selected_session = (selected_session + 1).min(v.session_rows.len() - 1)
+                        }
+                        KeyCode::Up | KeyCode::Char('k') if selecting => {
+                            selected_session = selected_session.saturating_sub(1)
+                        }
+                        KeyCode::PageDown | KeyCode::Char(' ') if selecting => {
+                            let target = v.session_rows[selected_session].start + page;
+                            selected_session = v
+                                .session_rows
+                                .iter()
+                                .position(|row| row.start >= target)
+                                .unwrap_or(v.session_rows.len() - 1);
+                        }
+                        KeyCode::PageUp if selecting => {
+                            let target =
+                                v.session_rows[selected_session].start.saturating_sub(page);
+                            selected_session = v
+                                .session_rows
+                                .iter()
+                                .rposition(|row| row.start <= target)
+                                .unwrap_or(0);
+                        }
+                        KeyCode::Home | KeyCode::Char('g') if selecting => selected_session = 0,
+                        KeyCode::End | KeyCode::Char('G') if selecting => {
+                            selected_session = v.session_rows.len() - 1
                         }
                         KeyCode::Char('c') if chart_available => {
                             if offset.saturating_add(page) >= v.body.len() {
@@ -351,4 +468,98 @@ where
         );
         Ok(report)
     })
+}
+
+/// Lazy content loading without blocking terminal cancellation/navigation.
+pub fn load_conversation(
+    cli: &Cli,
+    sources: &[Source],
+    session: &str,
+    stopped: &Arc<AtomicBool>,
+    in_screen: bool,
+) -> Result<Conversation> {
+    if !interactive() {
+        return conversation::load(sources, session, stopped);
+    }
+    struct RawGuard(bool);
+    impl Drop for RawGuard {
+        fn drop(&mut self) {
+            if self.0 {
+                let _ = terminal::disable_raw_mode();
+            }
+        }
+    }
+    let enable_raw = !terminal::is_raw_mode_enabled()?;
+    if enable_raw {
+        terminal::enable_raw_mode()?;
+    }
+    let _raw = RawGuard(enable_raw);
+    let token = Arc::new(AtomicBool::new(false));
+    struct CancelOnDrop(Arc<AtomicBool>);
+    impl Drop for CancelOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+    let style = Style::new(cli, true);
+    if in_screen {
+        execute!(
+            io::stdout(),
+            Clear(ClearType::All),
+            MoveTo(0, 0),
+            Print(style.paint("meta", "Reading conversation… Esc Back / q Quit"))
+        )?;
+    } else {
+        eprint!("Reading conversation… Ctrl+C to cancel");
+        io::stderr().flush()?;
+    }
+    let result = std::thread::scope(|scope| {
+        let _cancel = CancelOnDrop(Arc::clone(&token));
+        let (send, receive) = std::sync::mpsc::channel();
+        let child = Arc::clone(&token);
+        scope.spawn(move || {
+            let _ = send.send(conversation::load(sources, session, &child));
+        });
+        loop {
+            if stopped.load(Ordering::Relaxed) {
+                token.store(true, Ordering::Relaxed);
+            }
+            match receive.try_recv() {
+                Ok(result) => {
+                    crate::cancel::check(&token)?;
+                    break result;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    break Err(anyhow::anyhow!("Conversation reader stopped unexpectedly"))
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+            if event::poll(Duration::from_millis(50))? {
+                if let Event::Key(key) = event::read()? {
+                    if key.kind == KeyEventKind::Release {
+                        continue;
+                    }
+                    match key.code {
+                        KeyCode::Esc => token.store(true, Ordering::Relaxed),
+                        KeyCode::Char('q') => {
+                            token.store(true, Ordering::Relaxed);
+                            if in_screen {
+                                stopped.store(true, Ordering::Relaxed);
+                            }
+                        }
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            token.store(true, Ordering::Relaxed);
+                            stopped.store(true, Ordering::Relaxed);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    });
+    if !in_screen {
+        eprint!("\r\x1b[2K");
+        io::stderr().flush()?;
+    }
+    result
 }

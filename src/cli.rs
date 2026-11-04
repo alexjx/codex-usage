@@ -90,6 +90,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     #[serde(skip)]
     pub reset: bool,
+    /// Read this session's conversation, including messages and tool activity.
+    #[arg(long, global = true, hide = true)]
+    #[serde(default)]
+    pub conversation: bool,
     /// Select named source; repeat to combine Windows and WSL.
     #[arg(
         long = "source",
@@ -195,7 +199,7 @@ pub enum Command {
     Sessions,
     /// Report usage for one session ID.
     #[command(
-        after_help = "Examples:\n  codex-usage session SESSION_ID --all\n  codex-usage session SESSION_ID --last 7\n\nOn a command switch, the period defaults to this month. Repeating this command reuses saved options; --reset restores defaults. Use --all for the session's complete retained history."
+        after_help = "Examples:\n  codex-usage session SESSION_ID --all\n  codex-usage session SESSION_ID --last 7\n  codex-usage session SESSION_ID --conversation\n  codex-usage session SESSION_ID --conversation --format json\n\nOn a command switch, the period defaults to this month. Repeating this command reuses saved options; --reset restores defaults. Use --all for the session's complete retained history."
     )]
     Session {
         /// Session ID shown by the sessions report.
@@ -303,6 +307,9 @@ impl Cli {
         // Global report flags still parse before/after subcommands, but do not
         // advertise historical ranges on the today-only monitor.
         let mut command = Self::command()
+            .mut_subcommand("session", |session| {
+                session.defer(|session| session.mut_arg("conversation", |arg| arg.hide(false)))
+            })
             .mut_subcommand("monitor", |monitor| {
                 monitor.defer(|mut monitor| {
                     for name in ["today", "all", "since", "until", "last"] {
@@ -373,6 +380,9 @@ impl Cli {
     }
     pub fn monitor(&self) -> bool {
         matches!(self.command, Some(Command::Monitor { .. }))
+    }
+    pub fn conversation(&self) -> bool {
+        self.conversation && matches!(self.command, Some(Command::Session { .. }))
     }
     pub fn interval(&self) -> std::time::Duration {
         if let Some(Command::Monitor { interval, .. }) = self.command {

@@ -198,6 +198,12 @@ pub struct View {
     pub footer: Vec<String>,
     pub identities: Vec<(String, usize)>,
     pub sections: Vec<(String, usize)>,
+    pub session_rows: Vec<SessionRow>,
+}
+pub struct SessionRow {
+    pub session: String,
+    pub start: usize,
+    pub end: usize,
 }
 pub fn view(cli: &Cli, report: &Report, style: &Style, width: usize, help: bool) -> View {
     let mut h = Vec::new();
@@ -205,6 +211,7 @@ pub fn view(cli: &Cli, report: &Report, style: &Style, width: usize, help: bool)
     let mut total_footer = Vec::new();
     let mut identities = Vec::new();
     let mut sections = Vec::new();
+    let mut session_rows = Vec::new();
     let sep = if cli.ascii { " / " } else { " · " };
     let filtered = cli.monitor()
         && (!cli.models.is_empty()
@@ -404,6 +411,9 @@ pub fn view(cli: &Cli, report: &Report, style: &Style, width: usize, help: bool)
             format!("Unpriced: {} tokens",number(report.totals.unpriced_tokens,cli.exact)),
             format!("Data warnings: {} / Pending: {}",report.coverage.malformed+report.coverage.conflicts+report.coverage.uncertain,report.coverage.pending),
             format!("Pricing assumptions: {}",report.totals.assumed_events)];
+        if matches!(cli.command, Some(crate::cli::Command::Sessions)) {
+            details.push("Session rows: arrows or j/k select a row; Enter reads its retained conversation. Esc returns to the same report position. Source selection is preserved; conversation text includes older context outside the report period. Use --pager never for a linear usage report.".into());
+        }
         if cli.monitor() {
             details.push("Monitor range: today's local midnight through the displayed snapshot time, in the title's timezone. Cost includes today's loaded history. Stale sources or partial data can omit usage.".into());
             details.push("c toggles the output-speed chart. It shows up to 60 chart points, newest on the right; dots mark zero and ? marks unavailable data. The chart starts with recent logged history and continues with 30s rolling aggregate output (including idle time), sampled each refresh; the parenthesized rate averages per session. The chart hides when space is limited.".into());
@@ -480,6 +490,7 @@ pub fn view(cli: &Cli, report: &Report, style: &Style, width: usize, help: bool)
                     previous_date = Some(date);
                 }
             }
+            let row_start = b.len();
             let id = row.label();
             identities.push((row.identity(), b.len()));
             if stacked {
@@ -526,6 +537,13 @@ pub fn view(cli: &Cli, report: &Report, style: &Style, width: usize, help: bool)
                     line.push_str(&style.paint(role, pad(value, *w, true)));
                 }
                 b.push(line);
+            }
+            if let Some(session) = row.dimensions.get("session") {
+                session_rows.push(SessionRow {
+                    session: session.clone(),
+                    start: row_start,
+                    end: b.len(),
+                });
             }
         }
         if report.rows.is_empty() {
@@ -598,6 +616,7 @@ pub fn view(cli: &Cli, report: &Report, style: &Style, width: usize, help: bool)
         footer: total_footer,
         identities,
         sections,
+        session_rows,
     }
 }
 
@@ -628,6 +647,57 @@ mod regression_tests {
         report::{self, Row},
     };
     use clap::Parser;
+    #[test]
+    fn session_selection_ranges_keep_full_ids_through_wrapping_and_help() {
+        let cli = Cli::parse_from(["codex-usage", "sessions", "--all", "--color", "never"]);
+        let mut report = report::build(
+            &cli,
+            chrono_tz::UTC,
+            &Scan::default(),
+            None,
+            chrono::Utc::now(),
+        )
+        .unwrap();
+        for id in [
+            "session-alpha-with-a-long-stable-identifier",
+            "session-beta",
+        ] {
+            report.rows.push(Row {
+                dimensions: [
+                    ("session".into(), id.into()),
+                    ("model".into(), "synthetic-model".into()),
+                ]
+                .into(),
+                counts: Counts {
+                    input: 10,
+                    output: 5,
+                    total: 15,
+                    ..Default::default()
+                },
+            });
+        }
+        for width in [40, 80, 140] {
+            let view = view(&cli, &report, &Style::new(&cli, false), width, false);
+            assert_eq!(view.session_rows.len(), 2);
+            assert_eq!(
+                view.session_rows[0].session,
+                "session-alpha-with-a-long-stable-identifier"
+            );
+            assert_eq!(view.session_rows[0].end, view.session_rows[1].start);
+            assert_eq!(view.session_rows[1].end, view.body.len());
+            assert!(view.session_rows.iter().all(|row| row.start < row.end));
+        }
+        assert!(view(&cli, &report, &Style::new(&cli, false), 80, true)
+            .session_rows
+            .is_empty());
+        for row in &mut report.rows {
+            row.dimensions.remove("session");
+        }
+        assert!(view(&cli, &report, &Style::new(&cli, false), 80, false)
+            .session_rows
+            .is_empty());
+    }
+
     #[test]
     fn monitor_line_uses_rolling_deltas_instead_of_since_ready_totals() {
         let cli = Cli::parse_from(["codex-usage", "monitor", "--color", "never"]);

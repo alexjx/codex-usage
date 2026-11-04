@@ -5,7 +5,7 @@ use codex_usage::{
     cancel,
     cli::{Cli, Command, Format, SourceCommand},
     config::{self, Config},
-    export, history,
+    conversation_ui, export, history,
     model::{Scan, Source},
     monitor::Tracker,
     pricing::Pricer,
@@ -48,6 +48,12 @@ fn main() {
     }
     let path = config::config_path(cli.config.as_deref()).unwrap_or_else(|e| fail(e, 2));
     let cli = history::resolve(cli, &path).unwrap_or_else(|e| fail(e, 2));
+    if cli.conversation && !cli.conversation() {
+        fail(
+            anyhow::anyhow!("--conversation requires session SESSION_ID"),
+            2,
+        );
+    }
     let mut config = Config::load(&path).unwrap_or_else(|e| fail(e, 2));
     if matches!(cli.command, Some(Command::Sources { .. })) {
         if let Err(error) = source_command(&cli, &mut config, &path) {
@@ -89,6 +95,14 @@ fn main() {
     if !cli.monitor() && format == Format::Jsonl {
         fail(
             anyhow::anyhow!("JSONL is for monitor; use --format json for a report"),
+            2,
+        );
+    }
+    if cli.conversation() && format == Format::Csv {
+        fail(
+            anyhow::anyhow!(
+                "conversation supports --format table or json; CSV is for usage reports"
+            ),
             2,
         );
     }
@@ -321,12 +335,29 @@ fn run(
         return Ok(());
     }
     strict(cli, &report, cli.monitor())?;
+    if cli.conversation() {
+        let Some(Command::Session { id }) = &cli.command else {
+            unreachable!()
+        };
+        let conversation = ui::load_conversation(cli, sources, id, &stopped, false)?;
+        return if format == Format::Json {
+            export::conversation_json(&conversation, &report, io::stdout())
+        } else if ui::interactive() && cli.pager != codex_usage::cli::Pager::Never {
+            conversation_ui::run(cli, conversation, &report, sources, stopped, true)?;
+            Ok(())
+        } else {
+            let mut out = io::stdout().lock();
+            write!(out, "{}", conversation_ui::plain(&conversation, tz))?;
+            out.flush()?;
+            Ok(())
+        };
+    }
     if !cli.monitor() {
         return match format {
             Format::Json => export::json(&report, io::stdout(), false),
             Format::Csv => export::csv(&report, io::stdout()),
             _ => {
-                ui::run(cli, report, stopped, || unreachable!())?;
+                ui::run(cli, report, sources, stopped, || unreachable!())?;
                 Ok(())
             }
         };
@@ -345,7 +376,7 @@ fn run(
         Ok(next)
     };
     if format == Format::Table && ui::interactive() {
-        ui::run(cli, report, stopped, refresh)?;
+        ui::run(cli, report, sources, stopped, refresh)?;
         return Ok(());
     }
     let mut next_refresh = Instant::now() + cli.interval();

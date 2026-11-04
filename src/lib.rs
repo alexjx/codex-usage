@@ -2,6 +2,8 @@ pub mod cancel;
 pub mod chart;
 pub mod cli;
 pub mod config;
+pub mod conversation;
+pub mod conversation_ui;
 pub mod export;
 pub mod history;
 pub mod model;
