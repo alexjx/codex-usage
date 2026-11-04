@@ -487,6 +487,62 @@ fn custom_model_cost_is_exact_and_unknown_cost_never_becomes_zero() {
 }
 
 #[test]
+fn reports_and_monitor_filter_old_files_with_a_two_day_modification_buffer() {
+    let f = Fixture::new();
+    let now = Utc::now();
+    let resumed = f.write(
+        "rollout-2026-01-01-resumed",
+        vec![
+            metadata("resumed"),
+            context("t", "alpha"),
+            usage("resumed", "t", "r", &now.to_rfc3339(), 20, 0, 5),
+        ],
+    );
+    // Even a retained modification time from yesterday is inside the buffer.
+    fs::File::options()
+        .write(true)
+        .open(resumed)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified((now - chrono::Duration::days(1)).into()))
+        .unwrap();
+    let archive = f.root.join("sessions/old.jsonl.zst");
+    fs::write(&archive, b"must not be decompressed for a recent report").unwrap();
+    fs::File::options()
+        .write(true)
+        .open(archive)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified((now - chrono::Duration::days(4)).into()))
+        .unwrap();
+    for args in [
+        vec!["models", "--today", "--format", "json"],
+        vec!["daily", "--last", "1", "--format", "json"],
+        vec!["monitor", "--frames", "1", "--format", "jsonl"],
+    ] {
+        let output = f
+            .command()
+            .args(args)
+            .arg("--root")
+            .arg(&f.root)
+            .args(["--timezone", "UTC", "--no-cost", "--strict"])
+            .output()
+            .unwrap();
+        success(&output);
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["totals"]["total"], 25);
+        assert_eq!(report["coverage"]["files"], 1);
+    }
+    // All-time reports still inspect the archive and expose its error.
+    let all = f
+        .command()
+        .args(["models", "--all", "--no-cost", "--strict"])
+        .arg("--root")
+        .arg(&f.root)
+        .output()
+        .unwrap();
+    assert!(!all.status.success());
+}
+
+#[test]
 fn monitor_reads_real_appends_and_defers_partial_records_without_counting_history_as_speed() {
     let f = Fixture::new();
     let file = f.write(

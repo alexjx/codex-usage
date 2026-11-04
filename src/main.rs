@@ -243,7 +243,8 @@ fn scan_report(
     pricer: Option<&Pricer>,
 ) -> Result<(Scan, Report, u128)> {
     let started = Instant::now();
-    let scan = reader.scan(sources)?;
+    let period = report::Period::make(cli, tz, Utc::now())?;
+    let scan = reader.scan_since(sources, period.start)?;
     let report = report::build(cli, tz, &scan, pricer, Utc::now())?;
     Ok((scan, report, started.elapsed().as_millis()))
 }

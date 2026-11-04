@@ -80,11 +80,18 @@ impl Reader {
     }
 
     pub fn scan(&mut self, sources: &[Source]) -> Result<Scan> {
+        self.scan_since(sources, None)
+    }
+
+    /// Skip files last modified more than two days before the requested period.
+    /// Resumed sessions and files with unavailable modification times are included.
+    pub fn scan_since(&mut self, sources: &[Source], since: Option<DateTime<Utc>>) -> Result<Scan> {
+        let since = since.and_then(|start| start.checked_sub_signed(chrono::Duration::days(2)));
         self.service_reconciliation(sources);
         let mut scan = Scan::default();
         let mut candidates = Vec::new();
         for source in sources {
-            match self.read_source(source) {
+            match self.read_source(source, since) {
                 Ok(snapshot) => {
                     let now = Utc::now();
                     candidates.extend(snapshot.candidates.iter().cloned());
@@ -185,16 +192,28 @@ impl Reader {
         }
     }
 
-    fn read_source(&mut self, source: &Source) -> Result<SourceSnapshot> {
+    fn read_source(
+        &mut self,
+        source: &Source,
+        since: Option<DateTime<Utc>>,
+    ) -> Result<SourceSnapshot> {
         let paths = discover(&source.root)?;
         let mut snapshot = SourceSnapshot::default();
         let mut present = BTreeSet::new();
         for path in paths {
             let key = (source.name.clone(), path.clone());
             present.insert(key.clone());
-            let loaded = (|| -> Result<()> {
+            let loaded = (|| -> Result<bool> {
                 let metadata = fs::metadata(&path)
                     .with_context(|| format!("Cannot inspect {}", path.display()))?;
+                if since.is_some_and(|start| {
+                    metadata
+                        .modified()
+                        .ok()
+                        .is_some_and(|modified| DateTime::<Utc>::from(modified) < start)
+                }) {
+                    return Ok(false);
+                }
                 let old = self.files.get(&key);
                 let changed = old.is_none_or(|cached| {
                     cached.len != metadata.len()
@@ -206,8 +225,12 @@ impl Reader {
                     self.files.insert(key.clone(), parsed);
                     self.background_errors.remove(&key);
                 }
-                Ok(())
+                Ok(true)
             })();
+            if matches!(loaded, Ok(false)) {
+                present.remove(&key);
+                continue;
+            }
             if let Err(error) = loaded {
                 snapshot.coverage.uncertain += 1;
                 note(&mut snapshot.coverage, error.to_string());
@@ -1094,6 +1117,112 @@ mod tests {
         for value in values {
             writeln!(file, "{value}").unwrap();
         }
+    }
+    fn modified_at(path: &Path, timestamp: DateTime<Utc>) {
+        File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(SystemTime::from(timestamp)))
+            .unwrap();
+    }
+
+    #[test]
+    fn early_filter_skips_old_archives_but_keeps_resumed_sessions_and_counter_baselines() {
+        let dir = TempDir::new().unwrap();
+        let start: DateTime<Utc> = "2026-11-01T10:00:10Z".parse().unwrap();
+        let old = dir.path().join("old.jsonl");
+        write(
+            &old,
+            &[metadata("old"), direct("old", "old", "t", 10, 1, 10, 1)],
+        );
+        modified_at(
+            &old,
+            start - chrono::Duration::days(2) - chrono::Duration::seconds(1),
+        );
+        let archive = dir.path().join("old-archive.jsonl.zst");
+        fs::write(&archive, b"invalid archive must never be opened").unwrap();
+        modified_at(
+            &archive,
+            start - chrono::Duration::days(2) - chrono::Duration::seconds(1),
+        );
+        let resumed = dir.path().join("rollout-2026-01-01-resumed.jsonl");
+        write(
+            &resumed,
+            &[
+                metadata("resumed"),
+                turn("t", "test"),
+                legacy(100, 10, 2),
+                legacy(150, 20, 11),
+            ],
+        );
+        // Exact boundary is eligible, independent of the session's creation date.
+        modified_at(&resumed, start - chrono::Duration::days(2));
+        let sources = [source(dir.path(), "local")];
+        let mut filtered = Reader::new();
+        let scan = filtered.scan_since(&sources, Some(start)).unwrap();
+        assert_eq!(scan.coverage.files, 1);
+        assert_eq!(scan.coverage.uncertain, 0);
+        assert_eq!(filtered.files.len(), 1);
+        let current: Vec<_> = scan
+            .events
+            .iter()
+            .filter(|e| e.timestamp >= start)
+            .collect();
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].usage.total(), 60);
+        let full = Reader::new().scan(&sources).unwrap();
+        let expected: Vec<_> = full
+            .events
+            .iter()
+            .filter(|e| e.timestamp >= start)
+            .collect();
+        assert_eq!(
+            serde_json::to_value(current).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+        // --all still reads both eligible plain logs.
+        assert_eq!(filtered.scan(&sources).unwrap().coverage.files, 2);
+    }
+
+    #[test]
+    fn early_filter_rechecks_old_files_and_expires_cached_files_at_midnight() {
+        let dir = TempDir::new().unwrap();
+        let start: DateTime<Utc> = "2026-11-01T00:00:00Z".parse().unwrap();
+        let path = dir.path().join("resumed.jsonl");
+        write(&path, &[metadata("s"), direct("r", "s", "t", 10, 1, 10, 1)]);
+        modified_at(&path, start - chrono::Duration::days(2));
+        let sources = [source(dir.path(), "local")];
+        let mut reader = Reader::new();
+        assert_eq!(
+            reader
+                .scan_since(&sources, Some(start))
+                .unwrap()
+                .events
+                .len(),
+            1
+        );
+        let tomorrow = start + chrono::Duration::days(1);
+        assert!(reader
+            .scan_since(&sources, Some(tomorrow))
+            .unwrap()
+            .events
+            .is_empty());
+        assert!(reader.files.is_empty());
+        let mut event = direct("next", "s", "t", 20, 2, 30, 3);
+        event["timestamp"] = json!(tomorrow.to_rfc3339());
+        let mut file = File::options().append(true).open(&path).unwrap();
+        writeln!(file, "{event}").unwrap();
+        drop(file);
+        modified_at(&path, tomorrow);
+        let scan = reader.scan_since(&sources, Some(tomorrow)).unwrap();
+        assert_eq!(
+            scan.events
+                .iter()
+                .filter(|e| e.timestamp >= tomorrow)
+                .count(),
+            1
+        );
     }
     #[test]
     fn current_model_changes_and_legacy_mirrors_count_once() {
