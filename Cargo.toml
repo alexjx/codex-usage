@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 description = "Local Codex usage reports and live monitoring across Windows and WSL"
 license = "MIT"
+repository = "https://github.com/alexjx/codex-usage"
+readme = "README.md"
 default-run = "codex-usage"
 
 [dependencies]

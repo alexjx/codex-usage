@@ -6,9 +6,11 @@ Reads local session logs. No API key or Codex login is required.
 
 ## Install
 
-With Rust and native C/C++ build tools installed, run from this repository:
+With Rust and native C/C++ build tools installed:
 
 ```sh
+git clone https://github.com/alexjx/codex-usage.git
+cd codex-usage
 cargo install --path . --locked
 ```
 
@@ -232,3 +234,7 @@ cargo test --all-targets --locked
 ```
 
 Tests use temporary synthetic session logs; one optional local-log smoke test is ignored by default. Linux and native Windows test suites have been run; native Windows console appearance has not been separately checked.
+
+## License
+
+[MIT](LICENSE).
