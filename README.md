@@ -85,16 +85,23 @@ codex-usage models --root /path/to/.codex --today
 | `sessions` | Each session's model/mode breakdown |
 | `session SESSION_ID` | One session's usage |
 
-Explicit report commands default to **this calendar month**. Bare `codex-usage` repeats your last successful report, including its filters and display options. On the first run, it opens the model report for this month.
+Bare `codex-usage` repeats your last successful usage command and its options. With no saved command, it runs **daily for this calendar month**.
+
+Repeating the same command reuses its saved options. Only options you explicitly supply replace their remembered values. Switching to a different command starts with defaults and replaces the remembered command; there is just one saved command, not a separate history for each command.
 
 ```sh
-codex-usage daily --last 7
-codex-usage                         # repeat that report
-codex-usage --last 1                # same report and filters, for today
-codex-usage models                  # fresh model report for this month
+codex-usage daily --last 7 --mode fast
+codex-usage daily                   # same daily report, last 7 days, Fast mode
+codex-usage daily --last 1          # keep Fast mode, change the period to today
+codex-usage                         # repeat the same daily report
+codex-usage models                  # switch: model report with default options
+codex-usage daily                   # switch again: daily defaults, not the old 7-day settings
+codex-usage daily --reset           # reset this command's options to defaults
 ```
 
-Relative periods are recalculated each run. Monitor and configuration commands do not replace the remembered report.
+`--reset` clears remembered options before applying the options supplied on that run. Without a subcommand, it keeps the remembered command (or `daily` if none exists). For a report, `codex-usage --reset --last 7` keeps that command but resets other filters and display settings. Output format is remembered too: use `--format table` to override a previous JSON/CSV export.
+
+Relative periods are recalculated each run. Monitor is also remembered, including its interval, frame limit, and filters; bare `codex-usage` repeats it after a successful monitor run. Source-management, pricing, and doctor commands do not replace the remembered usage command. Failed or cancelled loading does not save options.
 
 ### Dates and filters
 
@@ -207,7 +214,7 @@ Exports contain exact counts and decimal cost values without terminal colors. JS
 
 ## Configuration and troubleshooting
 
-On Linux/WSL, configuration normally lives at `~/.config/codex-usage/config.toml` (subject to XDG settings). Use `--config PATH` or `CODEX_USAGE_CONFIG` for another location on any platform. Last-report preferences are saved separately beside that file as `<config filename>.last-report.json`.
+On Linux/WSL, configuration normally lives at `~/.config/codex-usage/config.toml` (subject to XDG settings). Use `--config PATH` or `CODEX_USAGE_CONFIG` for another location on any platform. The last successful usage command and its options are saved separately beside that file as `<config filename>.last-report.json`. Each configuration profile has its own saved command. The file stores options, not session data. Existing saved report settings are reused.
 
 ```sh
 codex-usage sources

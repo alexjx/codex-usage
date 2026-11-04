@@ -1,4 +1,4 @@
-//! Last successful usage-report preferences, isolated by configuration profile.
+//! Last successful usage command and its options, isolated by config profile.
 use crate::{
     cli::{Cli, Command},
     config::normalize_path,
@@ -28,7 +28,7 @@ pub fn state_path(config_path: &Path) -> PathBuf {
     config_path.with_file_name(name)
 }
 
-fn is_report(cli: &Cli) -> bool {
+fn is_usage(cli: &Cli) -> bool {
     matches!(
         cli.command,
         None | Some(
@@ -37,13 +37,25 @@ fn is_report(cli: &Cli) -> bool {
                 | Command::Monthly
                 | Command::Sessions
                 | Command::Session { .. }
+                | Command::Monitor { .. }
         )
     )
 }
 
 fn validate_report(cli: &Cli) -> Result<()> {
-    if !is_report(cli) {
-        bail!("Remembered command is not a usage report");
+    if !is_usage(cli) {
+        bail!("Remembered command is not a usage command");
+    }
+    if cli.has_monitor_range() {
+        bail!("Remembered monitor has historical date options");
+    }
+    if let Some(Command::Monitor { interval, frames }) = &cli.command {
+        if *interval < std::time::Duration::from_secs(1)
+            || *interval > std::time::Duration::from_secs(3600)
+            || *frames == Some(0)
+        {
+            bail!("Remembered monitor has an invalid interval or frame limit");
+        }
     }
     if !cli.sources.is_empty() && !cli.roots.is_empty() {
         bail!("Remembered report selects both named sources and ad hoc roots");
@@ -78,28 +90,81 @@ fn state_error(path: &Path, error: impl std::fmt::Display) -> anyhow::Error {
     )
 }
 
-/// Bare invocations reuse preferences; any explicit subcommand starts fresh.
-/// `config_path` is the current invocation's already resolved configuration path.
-pub fn resolve(cli: Cli, config_path: &Path) -> Result<Cli> {
-    if cli.command.is_some() {
-        return Ok(cli);
-    }
-    let path = state_path(config_path);
-    let input = match fs::read(&path) {
+fn load(path: &Path) -> Result<Option<Cli>> {
+    let input = match fs::read(path) {
         Ok(input) => input,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(cli),
-        Err(error) => return Err(state_error(&path, error)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(state_error(path, error)),
     };
     let saved: SavedReport =
-        serde_json::from_slice(&input).map_err(|error| state_error(&path, error))?;
+        serde_json::from_slice(&input).map_err(|error| state_error(path, error))?;
     if saved.schema_version != SCHEMA_VERSION {
         return Err(state_error(
-            &path,
+            path,
             format!("unsupported schema version {}", saved.schema_version),
         ));
     }
-    validate_report(&saved.report).map_err(|error| state_error(&path, error))?;
-    let mut report = saved.report;
+    validate_report(&saved.report).map_err(|error| state_error(path, error))?;
+    Ok(Some(saved.report))
+}
+
+fn defaults(mut cli: Cli) -> Cli {
+    cli.command.get_or_insert(Command::Daily);
+    cli
+}
+
+/// Reuse options for the same usage command; switching commands starts fresh.
+/// Bare invocations choose the saved command, or Daily if history is absent.
+pub fn resolve(mut cli: Cli, config_path: &Path) -> Result<Cli> {
+    if !is_usage(&cli) {
+        return Ok(cli);
+    }
+    let saved = match load(&state_path(config_path)) {
+        Ok(saved) => saved,
+        // An explicit command or reset can recover from unusable preferences.
+        Err(_) if cli.command.is_some() || cli.reset => None,
+        Err(error) => return Err(error),
+    };
+    let Some(mut report) = saved else {
+        return Ok(defaults(cli));
+    };
+    let saved_command = report.command.clone().unwrap_or(Command::Daily);
+    let command = cli.command.clone().unwrap_or_else(|| saved_command.clone());
+    if cli.reset || std::mem::discriminant(&command) != std::mem::discriminant(&saved_command) {
+        cli.command = Some(if cli.reset && cli.command.is_none() {
+            match command {
+                Command::Monitor { .. } => Command::Monitor {
+                    interval: std::time::Duration::from_secs(2),
+                    frames: None,
+                },
+                command => command,
+            }
+        } else {
+            command
+        });
+        return Ok(cli);
+    }
+    report.command = Some(match (&command, &saved_command) {
+        (
+            Command::Monitor { interval, frames },
+            Command::Monitor {
+                interval: previous_interval,
+                frames: previous_frames,
+            },
+        ) => Command::Monitor {
+            interval: if cli.explicit.iter().any(|name| name == "interval") {
+                *interval
+            } else {
+                *previous_interval
+            },
+            frames: if cli.explicit.iter().any(|name| name == "frames") {
+                *frames
+            } else {
+                *previous_frames
+            },
+        },
+        _ => command,
+    });
     let supplied = |field: &str| cli.explicit.iter().any(|name| name == field);
 
     // A snapshot can never move a bare invocation to a different config profile.
@@ -175,14 +240,14 @@ impl Drop for Temporary {
     }
 }
 
-/// Call only after the report succeeds. Other commands leave the last report untouched.
+/// Save only successful usage commands; administration leaves history untouched.
 pub fn save(cli: &Cli, config_path: &Path) -> Result<()> {
-    if !is_report(cli) {
+    if !is_usage(cli) {
         return Ok(());
     }
     let mut report = cli.clone();
     if report.command.is_none() {
-        report.command = Some(Command::Models);
+        report.command = Some(Command::Daily);
     }
     report.explicit.clear();
     report.roots = report
@@ -247,7 +312,7 @@ pub fn save(cli: &Cli, config_path: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use crate::cli::{Color, Format, Mode, Pager, Sort, Theme};
-    use clap::{parser::ValueSource, CommandFactory, FromArgMatches};
+    use clap::{CommandFactory, FromArgMatches};
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -256,11 +321,7 @@ mod tests {
             .try_get_matches_from(std::iter::once("codex-usage").chain(args.iter().copied()))
             .unwrap();
         let mut cli = Cli::from_arg_matches(&matches).unwrap();
-        cli.explicit = matches
-            .ids()
-            .filter(|id| matches.value_source(id.as_str()) == Some(ValueSource::CommandLine))
-            .map(|id| id.to_string())
-            .collect();
+        cli.explicit = Cli::explicit_arguments(&matches);
         cli
     }
 
@@ -362,13 +423,12 @@ mod tests {
     }
 
     #[test]
-    fn explicit_subcommands_start_fresh_and_nonreports_never_replace_history() {
+    fn switching_commands_starts_fresh_and_administration_never_replaces_history() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("config.toml");
         save(&cli(&["daily", "--last", "7", "--no-cost"]), &path).unwrap();
         let original = fs::read(state_path(&path)).unwrap();
         for args in [
-            vec!["monitor"],
             vec!["sources"],
             vec!["sources", "enable", "wsl"],
             vec!["pricing"],
@@ -385,6 +445,49 @@ mod tests {
     }
 
     #[test]
+    fn monitor_overrides_and_bare_reset_do_not_reuse_parser_defaults_as_explicit_values() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        save(
+            &cli(&[
+                "monitor",
+                "--interval",
+                "5s",
+                "--frames",
+                "3",
+                "--format",
+                "jsonl",
+                "--wide",
+            ]),
+            &path,
+        )
+        .unwrap();
+        for args in [vec![], vec!["monitor"]] {
+            let replay = resolve(cli(&args), &path).unwrap();
+            assert_eq!(replay.interval(), std::time::Duration::from_secs(5));
+            assert_eq!(replay.frames(), Some(3));
+            assert!(replay.wide);
+        }
+        let overridden = resolve(
+            cli(&["monitor", "--interval", "2s", "--frames", "1"]),
+            &path,
+        )
+        .unwrap();
+        assert_eq!(overridden.interval(), std::time::Duration::from_secs(2));
+        assert_eq!(overridden.frames(), Some(1));
+        let reset = resolve(cli(&["--reset"]), &path).unwrap();
+        assert!(reset.monitor());
+        assert_eq!(reset.interval(), std::time::Duration::from_secs(2));
+        assert_eq!(reset.frames(), None);
+        assert_eq!(reset.format, None);
+        assert!(!reset.wide);
+        save(&reset, &path).unwrap();
+        let encoded = fs::read_to_string(state_path(&path)).unwrap();
+        assert!(!encoded.contains("\"reset\""));
+        assert!(!resolve(cli(&[]), &path).unwrap().reset);
+    }
+
+    #[test]
     fn profiles_are_isolated_and_current_config_is_never_replaced_by_snapshot() {
         let dir = tempdir().unwrap();
         let first = dir.path().join("work.toml");
@@ -396,7 +499,7 @@ mod tests {
         let unset = resolve(cli(&[]), &first).unwrap();
         assert!(unset.config.is_none());
         let isolated = resolve(cli(&[]), &second).unwrap();
-        assert!(isolated.command.is_none());
+        assert!(matches!(isolated.command, Some(Command::Daily)));
         assert_eq!(
             state_path(&first),
             dir.path().join("work.toml.last-report.json")
@@ -422,24 +525,24 @@ mod tests {
             .contains("unsupported schema version"));
         let state = SavedReport {
             schema_version: 1,
-            report: cli(&["monitor"]),
+            report: cli(&["pricing"]),
         };
         fs::write(state_path(&path), serde_json::to_vec(&state).unwrap()).unwrap();
         assert!(resolve(cli(&[]), &path)
             .unwrap_err()
             .to_string()
-            .contains("not a usage report"));
+            .contains("not a usage command"));
     }
 
     #[test]
-    fn save_normalizes_paths_replaces_atomically_and_initial_default_is_models() {
+    fn save_normalizes_paths_replaces_atomically_and_initial_default_is_daily() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("nested/config.toml");
         let mut report = cli(&["--root", "relative-root", "--pricing-file", "rates.toml"]);
         report.explicit = vec!["roots".into(), "pricing_file".into()];
         save(&report, &path).unwrap();
         let replay = resolve(cli(&[]), &path).unwrap();
-        assert!(matches!(replay.command, Some(Command::Models)));
+        assert!(matches!(replay.command, Some(Command::Daily)));
         assert_eq!(
             replay.roots,
             [normalize_path(Path::new("relative-root")).unwrap()]

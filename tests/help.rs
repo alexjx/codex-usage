@@ -70,10 +70,12 @@ fn every_help_path_has_examples_and_action_specific_options() {
     }
     let root = help(&[]);
     for description in [
-        "last successful report",
+        "last successful command",
         "this month",
         "including today",
         "Ctrl+C",
+        "first run uses daily",
+        "--reset",
     ] {
         assert!(root.contains(description), "{root}");
     }
@@ -102,7 +104,14 @@ fn every_help_path_has_examples_and_action_specific_options() {
         vec!["pricing"],
     ] {
         let text = help(&path);
-        for flag in ["--model", "--today", "--group-by", "--pager", "--no-cost"] {
+        for flag in [
+            "--model",
+            "--today",
+            "--group-by",
+            "--pager",
+            "--no-cost",
+            "--reset",
+        ] {
             assert!(
                 !text.lines().any(|line| line.trim_start().starts_with(flag)),
                 "{path:?}: {text}"
@@ -136,4 +145,34 @@ fn built_in_help_command_resolves_nested_action_help() {
             "{text}"
         );
     }
+}
+
+#[test]
+fn explicit_arguments_include_monitor_overrides_but_not_defaults() {
+    let matches = Cli::command()
+        .try_get_matches_from(["codex-usage", "monitor"])
+        .unwrap();
+    let explicit = Cli::explicit_arguments(&matches);
+    assert!(!explicit.iter().any(|id| id == "interval" || id == "frames"));
+    let matches = Cli::command()
+        .try_get_matches_from([
+            "codex-usage",
+            "--reset",
+            "monitor",
+            "--interval",
+            "5s",
+            "--frames",
+            "3",
+            "--model",
+            "test",
+        ])
+        .unwrap();
+    let explicit = Cli::explicit_arguments(&matches);
+    for field in ["reset", "interval", "frames", "models"] {
+        assert!(
+            explicit.iter().any(|id| id == field),
+            "missing {field}: {explicit:?}"
+        );
+    }
+    assert!(!explicit.iter().any(|id| id == "format" || id == "color"));
 }

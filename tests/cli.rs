@@ -189,7 +189,15 @@ fn separate_source_configuration_persists_and_selects_only_requested_roots() {
     let report: Value = serde_json::from_slice(&selected.stdout).unwrap();
     assert_eq!(report["totals"]["total"], 240);
     success(&f.run(&["sources", "enable", "windows"]));
-    let combined = f.run(&["models", "--all", "--no-cost", "--format", "json"]);
+    // Clear the remembered --source windows selection to use enabled sources.
+    let combined = f.run(&[
+        "models",
+        "--reset",
+        "--all",
+        "--no-cost",
+        "--format",
+        "json",
+    ]);
     success(&combined);
     assert_eq!(
         serde_json::from_slice::<Value>(&combined.stdout).unwrap()["totals"]["total"],
@@ -1333,6 +1341,7 @@ fn default_model_groups_separate_fast_regular_and_unknown_and_mode_filter_is_exa
         .command()
         .args([
             "models",
+            "--reset",
             "--all",
             "--no-cost",
             "--color",

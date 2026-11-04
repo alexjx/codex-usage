@@ -75,7 +75,7 @@ impl Mode {
 #[command(
     version,
     about = "Local Codex usage reports and live monitoring",
-    after_help = "Defaults:\n  No command repeats your last successful report, including its filters.\n  Explicit report commands start with this month. Monitor shows today only.\n  Costs estimate API model tokens in USD, not subscription charges.\n\nExamples:\n  codex-usage daily --last 7\n  codex-usage models --today --mode fast\n  codex-usage monitor --source wsl --source windows\n  codex-usage sources\n\nPress Ctrl+C to cancel loading; use q or Ctrl+C to leave the live viewer."
+    after_help = "Defaults:\n  With no subcommand, repeat your last successful command and its options; first run uses daily.\n  Repeating the same command reuses options unless explicitly overridden.\n  Switching report commands resets the period to this month. Monitor shows today only.\n  --reset restores default options for the selected command.\n  Costs estimate API model tokens in USD, not subscription charges.\n\nExamples:\n  codex-usage daily --last 7\n  codex-usage models --today --mode fast\n  codex-usage monitor --source wsl --source windows\n  codex-usage sources\n\nPress Ctrl+C to cancel loading; use q or Ctrl+C to leave the live viewer."
 )]
 pub struct Cli {
     #[arg(skip)]
@@ -86,6 +86,10 @@ pub struct Cli {
     /// Config file; otherwise CODEX_USAGE_CONFIG or the native app config directory.
     #[arg(long, global = true, value_name = "PATH")]
     pub config: Option<PathBuf>,
+    /// Reset remembered options for the selected command to their defaults.
+    #[arg(long, global = true)]
+    #[serde(skip)]
+    pub reset: bool,
     /// Select named source; repeat to combine Windows and WSL.
     #[arg(
         long = "source",
@@ -171,27 +175,27 @@ pub struct Cli {
 pub enum Command {
     /// Summarize usage by model and recorded service mode.
     #[command(
-        after_help = "Examples:\n  codex-usage models --today\n  codex-usage models --last 7 --mode fast\n  codex-usage models --all --format json\n\nDefault period: this month. Use --group-by model to combine service modes."
+        after_help = "Examples:\n  codex-usage models --today\n  codex-usage models --last 7 --mode fast\n  codex-usage models --all --format json\n\nOn a command switch, the period defaults to this month. Repeating this command reuses saved options; --reset restores defaults. Use --group-by model to combine service modes."
     )]
     Models,
     /// Report daily usage, with model and mode rows under each date.
     #[command(
-        after_help = "Examples:\n  codex-usage daily --last 7\n  codex-usage daily --since 2026-11-01 --until 2026-11-04\n  codex-usage daily --all --format csv\n\nDefault period: this month. --last N includes today; date bounds are inclusive."
+        after_help = "Examples:\n  codex-usage daily --last 7\n  codex-usage daily --since 2026-11-01 --until 2026-11-04\n  codex-usage daily --all --format csv\n\nOn a command switch, the period defaults to this month. Repeating this command reuses saved options; --reset restores defaults. --last N includes today; date bounds are inclusive."
     )]
     Daily,
     /// Report monthly usage by model and recorded service mode.
     #[command(
-        after_help = "Examples:\n  codex-usage monthly --all\n  codex-usage monthly --since 2026-01-01\n\nDefault period: this month. Use --all or --since to include earlier months."
+        after_help = "Examples:\n  codex-usage monthly --all\n  codex-usage monthly --since 2026-01-01\n\nOn a command switch, the period defaults to this month. Repeating this command reuses saved options; --reset restores defaults. Use --all or --since to include earlier months."
     )]
     Monthly,
     /// Break down each session by model and recorded service mode.
     #[command(
-        after_help = "Examples:\n  codex-usage sessions --last 7\n  codex-usage sessions --all --project my-project\n\nDefault period: this month. A session can have several model/mode rows."
+        after_help = "Examples:\n  codex-usage sessions --last 7\n  codex-usage sessions --all --project my-project\n\nOn a command switch, the period defaults to this month. Repeating this command reuses saved options; --reset restores defaults. A session can have several model/mode rows."
     )]
     Sessions,
     /// Report usage for one session ID.
     #[command(
-        after_help = "Examples:\n  codex-usage session SESSION_ID --all\n  codex-usage session SESSION_ID --last 7\n\nDefault period: this month. Use --all for the session's complete retained history."
+        after_help = "Examples:\n  codex-usage session SESSION_ID --all\n  codex-usage session SESSION_ID --last 7\n\nOn a command switch, the period defaults to this month. Repeating this command reuses saved options; --reset restores defaults. Use --all for the session's complete retained history."
     )]
     Session {
         /// Session ID shown by the sessions report.
@@ -199,7 +203,7 @@ pub enum Command {
     },
     /// Live summary of today's usage in the selected timezone.
     #[command(
-        after_help = "Examples:\n  codex-usage monitor\n  codex-usage monitor --source wsl --source windows\n  codex-usage monitor --interval 5s\n  codex-usage monitor --format jsonl --frames 5 > live.jsonl\n\nToday's estimate starts at local midnight; its range ends at the latest snapshot.\nThe title shows the timezone. FILTERED marks active model/mode/session/project filters.\nThe activity row follows --interval (default 2s), showing changes since the previous snapshot.\nn/a means unavailable cost; * marks incomplete estimates.\nFullscreen: summary, 30s rolling output chart (up to 60 chart points), model table, pinned total/controls.\nThe chart opens with recent logged history, then updates each refresh.\nc toggles the chart; it hides automatically when space is limited.\nTerminal output updates in place; redirected output defaults to JSONL.\nq/Ctrl+C quits; Ctrl+C also cancels loading. Totals and chart reset at local midnight.\nCurrent speed uses actual elapsed time; the parentheses show the 60s per-session average."
+        after_help = "Examples:\n  codex-usage monitor\n  codex-usage monitor --source wsl --source windows\n  codex-usage monitor --interval 5s\n  codex-usage monitor --format jsonl --frames 5 > live.jsonl\n\nRepeating monitor reuses saved options, including --interval and --frames.\n--reset restores defaults; switching from another command starts fresh.\nToday's estimate starts at local midnight; its range ends at the latest snapshot.\nThe title shows the timezone. FILTERED marks active model/mode/session/project filters.\nThe activity row follows --interval (default 2s), showing changes since the previous snapshot.\nn/a means unavailable cost; * marks incomplete estimates.\nFullscreen: summary, 30s rolling output chart (up to 60 chart points), model table, pinned total/controls.\nThe chart opens with recent logged history, then updates each refresh.\nc toggles the chart; it hides automatically when space is limited.\nTerminal output updates in place; redirected output defaults to JSONL.\nq/Ctrl+C quits; Ctrl+C also cancels loading. Totals and chart reset at local midnight.\nCurrent speed uses actual elapsed time; the parentheses show the 60s per-session average."
     )]
     Monitor {
         /// Refresh cadence, e.g. 2s or 1000ms (1s to 3600s).
@@ -341,17 +345,27 @@ impl Cli {
             });
         let matches = command.get_matches_mut();
         let mut cli = Self::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
-        cli.explicit = matches
+        cli.explicit = Self::explicit_arguments(&matches);
+        if cli.has_monitor_range() {
+            clap::Error::raw(clap::error::ErrorKind::ArgumentConflict,"monitor summarizes today only; use a report command such as daily for --last, --all, --since, or --until").exit();
+        }
+        cli
+    }
+    /// Include explicitly supplied subcommand options, not their parser defaults.
+    pub fn explicit_arguments(matches: &clap::ArgMatches) -> Vec<String> {
+        let mut explicit: Vec<_> = matches
             .ids()
             .filter(|id| {
                 matches.value_source(id.as_str()) == Some(clap::parser::ValueSource::CommandLine)
             })
             .map(|id| id.to_string())
             .collect();
-        if cli.has_monitor_range() {
-            clap::Error::raw(clap::error::ErrorKind::ArgumentConflict,"monitor summarizes today only; use a report command such as daily for --last, --all, --since, or --until").exit();
+        if let Some((_, subcommand)) = matches.subcommand() {
+            explicit.extend(Self::explicit_arguments(subcommand));
         }
-        cli
+        explicit.sort_unstable();
+        explicit.dedup();
+        explicit
     }
     pub fn has_monitor_range(&self) -> bool {
         self.monitor()

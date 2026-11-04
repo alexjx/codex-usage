@@ -1,4 +1,4 @@
-//! Last-report preferences and calendar ranges, verified through the real binary.
+//! Last-command preferences and calendar ranges, verified through the real binary.
 //! Every command uses isolated temporary configuration and synthetic logs.
 use chrono::{Datelike, Days, NaiveDate, Utc};
 use serde_json::{json, Value};
@@ -74,6 +74,15 @@ impl Fixture {
             )
         })
     }
+    fn snapshots(&self, args: &[&str]) -> Vec<Value> {
+        let output = self.run(args);
+        success(&output);
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
     fn root(&self) -> &str {
         self.root.to_str().unwrap()
     }
@@ -123,7 +132,7 @@ fn assert_models(report: &Value, model: &str) {
 }
 
 #[test]
-fn first_bare_invocation_starts_with_this_months_model_report() {
+fn first_bare_invocation_starts_with_this_months_daily_report() {
     let f = Fixture::new();
     let report = f.report(&[
         "--root",
@@ -134,7 +143,7 @@ fn first_bare_invocation_starts_with_this_months_model_report() {
         "UTC",
         "--no-cost",
     ]);
-    assert_eq!(report["kind"], "Models");
+    assert_eq!(report["kind"], "Daily");
     assert_eq!(
         report["period"]["start"],
         midnight(f.today.with_day(1).unwrap())
@@ -184,7 +193,48 @@ fn bare_invocation_repeats_full_report_and_explicit_bare_flags_replace_fields() 
 }
 
 #[test]
-fn explicit_commands_start_fresh_with_current_month_and_become_new_default() {
+fn same_explicit_command_reuses_options_and_only_explicit_fields_change() {
+    let f = Fixture::new();
+    let first = f.save_daily();
+    let stored: Value = serde_json::from_slice(&fs::read(f.preference()).unwrap()).unwrap();
+    assert_eq!(
+        stored["schema_version"], 1,
+        "existing version-one profiles remain usable"
+    );
+    let repeated = f.report(&["daily"]);
+    for field in ["kind", "period", "rows", "totals", "pricing"] {
+        assert_eq!(
+            repeated[field], first[field],
+            "changed remembered field {field}"
+        );
+    }
+    let changed = f.report(&["daily", "--last", "1", "--model", "beta"]);
+    assert_eq!(changed["period"]["start"], midnight(f.today));
+    assert_models(&changed, "beta");
+    assert_eq!(changed["totals"]["pricing_status"], "disabled");
+    let stored: Value = serde_json::from_slice(&fs::read(f.preference()).unwrap()).unwrap();
+    assert_eq!(stored["report"]["roots"], json!([f.root()]));
+    assert_eq!(stored["report"]["timezone"], "UTC");
+    assert_eq!(stored["report"]["format"], "Json");
+    assert_eq!(stored["report"]["sort"], "Model");
+    assert_eq!(stored["report"]["exact"], true);
+    assert_eq!(stored["report"]["wide"], true);
+    assert_eq!(stored["report"]["last"], 1);
+    assert_eq!(f.report(&[])["rows"], changed["rows"]);
+    let output = f.run(&["daily", "--format", "table"]);
+    success(&output);
+    let table = String::from_utf8(output.stdout).unwrap();
+    assert!(table.contains("Daily") && table.contains("beta") && !table.contains("alpha"));
+    let output = f.run(&["daily"]);
+    success(&output);
+    assert!(
+        !output.stdout.starts_with(b"{"),
+        "explicit table override must be remembered"
+    );
+}
+
+#[test]
+fn switching_commands_resets_options_and_keeps_only_the_new_command() {
     let f = Fixture::new();
     f.save_daily();
     let models = f.report(&[
@@ -222,6 +272,128 @@ fn explicit_commands_start_fresh_with_current_month_and_become_new_default() {
         daily["period"]["start"],
         midnight(f.today.with_day(1).unwrap())
     );
+    assert!(daily["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|row| row["dimensions"]["model"] == "beta"));
+    assert_eq!(f.report(&[])["kind"], "Daily");
+}
+
+#[test]
+fn reset_clears_inherited_options_but_retains_explicit_or_last_command() {
+    let f = Fixture::new();
+    success(&f.run(&[
+        "sources",
+        "set",
+        "local",
+        "--kind",
+        "linux",
+        "--root",
+        f.root(),
+    ]));
+    for args in [vec!["daily", "--reset"], vec!["--reset"]] {
+        f.save_daily();
+        let output = f.run(&args);
+        success(&output);
+        let table = String::from_utf8(output.stdout).unwrap();
+        assert!(table.contains("Daily") && table.contains("beta"), "{table}");
+        assert!(
+            !table.starts_with('{'),
+            "reset must clear inherited JSON output"
+        );
+        let stored: Value = serde_json::from_slice(&fs::read(f.preference()).unwrap()).unwrap();
+        let report = &stored["report"];
+        assert_eq!(report["command"], "Daily");
+        assert_eq!(report["models"], json!([]));
+        assert_eq!(report["roots"], json!([]));
+        assert!(
+            report["last"].is_null() && report["format"].is_null() && report["timezone"].is_null()
+        );
+        assert_eq!(report["no_cost"], false);
+        assert_eq!(report["exact"], false);
+        assert_eq!(report["wide"], false);
+        assert!(
+            report.get("reset").is_none(),
+            "reset is an invocation-only instruction"
+        );
+        let repeated = f.run(&[]);
+        success(&repeated);
+        assert!(String::from_utf8(repeated.stdout)
+            .unwrap()
+            .contains("Daily"));
+    }
+}
+
+#[test]
+fn monitor_replays_command_options_and_switching_to_reports_starts_fresh() {
+    let f = Fixture::new();
+    f.save_daily();
+    let first = f.snapshots(&[
+        "monitor",
+        "--root",
+        f.root(),
+        "--interval",
+        "1s",
+        "--frames",
+        "2",
+        "--format",
+        "jsonl",
+        "--timezone",
+        "UTC",
+        "--no-cost",
+    ]);
+    assert_eq!(first.len(), 2);
+    assert_eq!(first[0]["kind"], "Monitor");
+    assert_eq!(first[0]["monitor"]["window_seconds"], 1.0);
+    assert!(
+        first[0]["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["dimensions"]["model"] == "beta"),
+        "switching must clear Daily's alpha filter"
+    );
+    let fewer = f.snapshots(&["monitor", "--frames", "1"]);
+    assert_eq!(fewer.len(), 1);
+    assert_eq!(fewer[0]["monitor"]["window_seconds"], 1.0);
+    let repeated = f.snapshots(&[]);
+    assert_eq!(repeated.len(), 1);
+    assert_eq!(repeated[0]["kind"], "Monitor");
+    assert_eq!(repeated[0]["monitor"]["window_seconds"], 1.0);
+    let changed = f.snapshots(&["monitor", "--interval", "1500ms"]);
+    assert_eq!(changed.len(), 1);
+    assert_eq!(changed[0]["monitor"]["window_seconds"], 1.5);
+    assert_eq!(f.snapshots(&[])[0]["monitor"]["window_seconds"], 1.5);
+    let reset = f.snapshots(&[
+        "monitor",
+        "--reset",
+        "--root",
+        f.root(),
+        "--frames",
+        "1",
+        "--timezone",
+        "UTC",
+        "--no-cost",
+    ]);
+    assert_eq!(reset.len(), 1);
+    assert_eq!(reset[0]["monitor"]["window_seconds"], 2.0);
+    let report = f.report(&[
+        "daily",
+        "--root",
+        f.root(),
+        "--format",
+        "json",
+        "--timezone",
+        "UTC",
+        "--no-cost",
+    ]);
+    assert_eq!(report["kind"], "Daily");
+    assert_eq!(
+        report["period"]["start"],
+        midnight(f.today.with_day(1).unwrap())
+    );
+    assert!(report.get("monitor").is_none_or(Value::is_null));
     assert_eq!(f.report(&[])["kind"], "Daily");
 }
 
@@ -263,16 +435,6 @@ fn failed_reports_and_nonreport_commands_do_not_replace_last_report() {
         ],
         vec!["sources", "disable", "local"],
         vec!["sources", "enable", "local"],
-        vec![
-            "monitor",
-            "--root",
-            f.root(),
-            "--frames",
-            "1",
-            "--format",
-            "jsonl",
-            "--no-cost",
-        ],
         vec![
             "doctor",
             "--root",
