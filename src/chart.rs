@@ -34,26 +34,44 @@ pub fn speed_history(
     let plot_width = width.saturating_sub(axis_width + 2);
     let count = info.output_speed_history.len().min(plot_width);
     let samples = &info.output_speed_history[info.output_speed_history.len() - count..];
-    let peak = samples
+    let (peak, average, valid) = samples
         .iter()
         .flatten()
         .copied()
         .filter(|v| v.is_finite() && *v >= 0.0)
-        .fold(0.0_f64, f64::max);
+        .fold((0.0_f64, 0.0_f64, 0usize), |(peak, mean, count), rate| {
+            // Online mean avoids overflowing when large valid values are summed.
+            (
+                peak.max(rate),
+                mean + (rate - mean) / (count + 1) as f64,
+                count + 1,
+            )
+        });
     let scale = peak.max(1.0);
     let separator = if ascii { " / " } else { " · " };
     let title = format!(
         "Output tok/s{separator}{}s avg",
         info.output_speed_window_seconds
     );
-    let peak_label = format!("peak {}", label(peak));
-    let gap = width.saturating_sub(title.width() + peak_label.width());
-    let heading = if gap >= 2 {
+    let statistics = if valid == 0 {
+        format!("avg n/a{separator}peak n/a")
+    } else {
+        format!("avg {}{separator}peak {}", label(average), label(peak))
+    };
+    let title = if title.width() + statistics.width() + 2 <= width {
+        title.as_str()
+    } else if "Output tok/s".len() + statistics.width() + 2 <= width {
+        "Output tok/s"
+    } else {
+        "tok/s"
+    };
+    let gap = width.saturating_sub(title.width() + statistics.width());
+    let heading = if gap >= 1 {
         format!(
             "{}{}{}",
-            style.paint("meta", &title),
+            style.paint("meta", title),
             " ".repeat(gap),
-            style.paint("accent", peak_label)
+            style.paint("accent", statistics)
         )
     } else {
         style.paint("meta", title)
@@ -143,12 +161,13 @@ mod tests {
         let (info, style) = fixture(vec![Some(0.0), Some(5.0), Some(10.0), None]);
         let lines = speed_history(&info, &style, 33, 4, false);
         assert_eq!(lines.len(), 6);
-        assert!(lines[0].contains("30s avg") && lines[0].contains("peak 10"));
+        assert!(lines[0].contains("avg 5.0") && lines[0].contains("peak 10"));
         assert!(lines[4].ends_with("······████████████??????"), "{lines:?}");
         assert!(lines[5].contains("4 points") && lines[5].ends_with("latest"));
         let (empty, style) = fixture(Vec::new());
         let output = speed_history(&empty, &style, 60, 4, false).join("\n");
         assert!(output.contains("Waiting for samples") && output.contains("0 points"));
+        assert!(output.contains("avg n/a") && output.contains("peak n/a"));
         assert!(!output.contains('█'));
     }
 
@@ -161,7 +180,7 @@ mod tests {
                 for ascii in [false, true] {
                     let lines = speed_history(&info, &style, width, rows, ascii);
                     assert!(lines.iter().all(|line| line.width() <= width), "{lines:?}");
-                    assert!(lines[0].contains("Output tok/s"));
+                    assert!(lines[0].contains("tok/s"));
                     assert_eq!(lines[1].chars().nth(9), Some(if ascii { '#' } else { '█' }));
                     assert_eq!(lines[rows].width(), width, "history must fill the plot");
                     if ascii {
@@ -176,6 +195,8 @@ mod tests {
             .last()
             .unwrap()
             .contains("23 points"));
+        assert!(speed_history(&info, &style, 32, 4, false)[0].contains("avg 957"));
+        assert!(speed_history(&info, &style, 140, 4, false)[0].contains("avg 983"));
     }
 
     #[test]
@@ -190,5 +211,12 @@ mod tests {
         assert!(lines.iter().all(|line| line.width() <= 60));
         assert!(lines[4].ends_with("????????????▁▁▁▁▁▁██████"), "{lines:?}");
         assert!(!lines.join("\n").contains("NaN"));
+        assert!(lines[0].contains("avg 9.0e307"), "{lines:?}");
+        let (large, style) = fixture(vec![Some(f64::MAX); 60]);
+        let heading = speed_history(&large, &style, 32, 4, false).remove(0);
+        assert!(
+            heading.contains("avg 1.8e308") && !heading.contains("inf"),
+            "{heading}"
+        );
     }
 }

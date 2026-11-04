@@ -179,7 +179,7 @@ Monitor always summarizes **today**, in the selected timezone. The screen places
 | `(… tok/s)` | Mean output speed per active session over a **60-second** sliding window |
 | Chart: `30s avg` | Combined output across sessions over a **30-second** sliding window, sampled each refresh |
 
-The chart opens with up to **60 points** reconstructed from today's already-loaded records—about two minutes at the default 2s interval. Historical points use logged timestamps; live points use observed arrivals. Historical tokens carry into chart smoothing without becoming new-activity deltas. Dots show zero; `?` marks unavailable data. Midnight resets totals and chart history.
+The chart opens with up to **60 points** reconstructed from today's already-loaded records—about two minutes at the default 2s interval. Historical points use logged timestamps; live points use observed arrivals. Historical tokens carry into chart smoothing without becoming new-activity deltas. The chart header shows the average and peak of the displayed points; zeros count toward the average and unavailable gaps do not. Dots show zero; `?` marks unavailable data. Midnight resets totals and chart history.
 
 Logs can arrive in batches, so speeds describe observed throughput rather than exact streaming generation speed. Near startup, the per-session average uses elapsed monitoring time until its window fills. The chart uses the available part of today near midnight. Recovered backlog and corrections can change token/cost deltas but are excluded from fresh-output speed. A complete source outage creates a chart gap and restarts smoothing on recovery.
 
