@@ -205,30 +205,51 @@ pub fn view(cli: &Cli, report: &Report, style: &Style, width: usize, help: bool)
     let mut identities = Vec::new();
     let mut sections = Vec::new();
     let sep = if cli.ascii { " / " } else { " · " };
+    let filtered = cli.monitor()
+        && (!cli.models.is_empty()
+            || !cli.sessions.is_empty()
+            || !cli.projects.is_empty()
+            || cli.mode.is_some());
+    let incomplete = cli.monitor()
+        && (report.coverage.incomplete() || report.sources.iter().any(|source| !source.readable));
+    let cost_unavailable = incomplete && report.totals.events == 0;
+    let cost_assumed = cli.monitor() && report.totals.assumed_events > 0;
+    let summary_cost = if cost_unavailable {
+        None
+    } else {
+        report.totals.cost_usd
+    };
     text(
         &mut h,
         style,
         "accent",
         &format!(
-            "Codex Usage / {}{}{sep}{}{sep}{}",
+            "Codex Usage / {}{}{}{sep}{}{sep}{}",
             report.kind,
             if cli.monitor() { " LIVE" } else { "" },
+            if filtered { " FILTERED" } else { "" },
             report.period.label,
             report.period.timezone
         ),
         width,
     );
     // Style source status independently while keeping paths out of the primary view.
-    let status = report
+    let mut status = report
         .sources
         .iter()
         .map(|s| format!("{} {}", s.name, if s.readable { "ready" } else { "stale" }))
         .collect::<Vec<_>>()
         .join(sep);
+    if incomplete {
+        if !status.is_empty() {
+            status.push_str(sep);
+        }
+        status.push_str("partial data");
+    }
     text(
         &mut h,
         style,
-        if report.sources.iter().all(|s| s.readable) {
+        if !incomplete && report.sources.iter().all(|s| s.readable) {
             "ok"
         } else {
             "warn"
@@ -236,11 +257,39 @@ pub fn view(cli: &Cli, report: &Report, style: &Style, width: usize, help: bool)
         &status,
         width,
     );
-    let mut summary = format!("{} tokens", number(report.totals.total, cli.exact));
+    let mut summary = String::new();
+    if cli.monitor() {
+        let range = report
+            .period
+            .timezone
+            .parse::<chrono_tz::Tz>()
+            .ok()
+            .and_then(|tz| {
+                report.period.start.map(|start| {
+                    format!(
+                        "Today {}{}{}",
+                        start.with_timezone(&tz).format("%H:%M:%S"),
+                        if cli.ascii { "-" } else { "–" },
+                        report.generated_at.with_timezone(&tz).format("%H:%M:%S")
+                    )
+                })
+            })
+            .unwrap_or_else(|| "Today".into());
+        summary.push_str(&format!("{range}{sep}"));
+    }
+    summary.push_str(&format!(
+        "{} tokens",
+        number(report.totals.total, cli.exact)
+    ));
     if !cli.no_cost {
         summary.push_str(&format!(
-            "{sep}{} est.{}",
-            money(report.totals.cost_usd),
+            "{sep}{} est.{}{}",
+            money(summary_cost),
+            if summary_cost.is_some() && (incomplete || cost_assumed) {
+                "*"
+            } else {
+                ""
+            },
             if report.totals.unpriced_tokens > 0 && report.totals.priced_tokens > 0 {
                 " subtotal"
             } else {
@@ -250,10 +299,20 @@ pub fn view(cli: &Cli, report: &Report, style: &Style, width: usize, help: bool)
     }
     text(&mut h, style, "cost", &summary, width);
     if let Some(m) = &report.monitor {
-        let mut delta = format!("{:+} tokens", m.since_ready_tokens);
+        let mut delta = format!("{}s: {:+} tokens", m.window_seconds, m.window_tokens);
         if !cli.no_cost {
-            if let Some(cost) = m.since_ready_cost_usd {
-                delta.push_str(&format!(" / {:+.4} USD", cost));
+            if let Some(cost) = m.window_cost_usd {
+                delta.push_str(&format!(
+                    " / {:+.4} USD{}",
+                    cost,
+                    if m.window_cost_partial || incomplete {
+                        "*"
+                    } else {
+                        ""
+                    }
+                ));
+            } else {
+                delta.push_str(" / n/a USD");
             }
         }
         let speed = if m.output_tokens_per_second > 0.0 && m.output_tokens_per_second < 10.0 {
@@ -333,12 +392,29 @@ pub fn view(cli: &Cli, report: &Report, style: &Style, width: usize, help: bool)
     if help {
         text(&mut h, style, "meta", "Help", width);
         let mut details=vec!["Arrows/j/k Scroll | PgUp/PgDn Page | Home/End | q Quit | ? Back".into(),
-            "Summary covers the full selection. Cached is part of input; reasoning is part of output. * marks partial coverage.".into(),
-            "Speed: newly observed output tokens over the last 5s; delayed backlog and corrections are excluded.".into(),
+            "Summary covers the full selection. Cached is part of input; reasoning is part of output. * marks incomplete coverage or assumed estimates; n/a means unavailable.".into(),
+            "Speed: newly observed output tokens since the previous snapshot divided by actual elapsed seconds; delayed backlog and corrections are excluded.".into(),
+            "Token/cost deltas: changes since the previous snapshot, including corrections and recovered records. The prefix follows --interval (default 2s). Cost uses the known priced subtotal. Idle refreshes show zero; today's summary stays cumulative. Slow collection can extend the actual sample time, available as sample_seconds in JSONL.".into(),
             "Speed in parentheses: mean output rate per active session over 30s (shorter since startup). Idle sessions drop out. Logs arrive in batches; this is observed throughput, not streaming generation speed. Individual rates are available in JSONL.".into(),
             format!("Unpriced: {} tokens",number(report.totals.unpriced_tokens,cli.exact)),
             format!("Data warnings: {} / Pending: {}",report.coverage.malformed+report.coverage.conflicts+report.coverage.uncertain,report.coverage.pending),
             format!("Pricing assumptions: {}",report.totals.assumed_events)];
+        if cli.monitor() {
+            details.push("Monitor range: today's local midnight through the displayed snapshot time, in the title's timezone. Cost includes today's loaded history. Stale sources or partial data can omit usage.".into());
+        }
+        if filtered {
+            details.push(format!(
+                "Filters: models={:?}; sessions={:?}; projects={:?}; mode={:?}",
+                cli.models, cli.sessions, cli.projects, cli.mode
+            ));
+        }
+        if report
+            .monitor
+            .as_ref()
+            .is_some_and(|m| m.window_cost_partial)
+        {
+            details.push("This refresh includes unpriced usage changes. Its cost is unavailable or a marked known subtotal.".into());
+        }
         details.extend(report.totals.assumptions.iter().cloned());
         details.extend(report.totals.pricing_reasons.iter().cloned());
         details.extend(report.coverage.messages.iter().cloned());
@@ -447,10 +523,32 @@ pub fn view(cli: &Cli, report: &Report, style: &Style, width: usize, help: bool)
             }
         }
         if report.rows.is_empty() {
-            text(&mut b, style, "meta", "No usage in this period.", width);
+            text(
+                &mut b,
+                style,
+                "meta",
+                if incomplete {
+                    "Usage data incomplete."
+                } else {
+                    "No usage in this period."
+                },
+                width,
+            );
         }
         total_footer.push(String::new());
         let mut totals = values(&report.totals, cli, detailed);
+        if !cli.no_cost && cli.monitor() {
+            if let Some(cost) = totals.last_mut() {
+                if cost_unavailable {
+                    *cost = "n/a".into();
+                } else if summary_cost.is_some()
+                    && (incomplete || cost_assumed)
+                    && !cost.ends_with('*')
+                {
+                    cost.push('*');
+                }
+            }
+        }
         // A grand total spans all modes; leave that categorical cell empty.
         totals[0].clear();
         if stacked {
@@ -523,6 +621,207 @@ mod regression_tests {
         report::{self, Row},
     };
     use clap::Parser;
+    #[test]
+    fn monitor_line_uses_rolling_deltas_instead_of_since_ready_totals() {
+        let cli = Cli::parse_from(["codex-usage", "monitor", "--color", "never"]);
+        let mut report = report::build(
+            &cli,
+            chrono_tz::UTC,
+            &Scan::default(),
+            None,
+            chrono::Utc::now(),
+        )
+        .unwrap();
+        report.monitor = Some(report::MonitorInfo {
+            sequence: 1,
+            final_snapshot: false,
+            since_ready_tokens: 1543980,
+            since_ready_cost_usd: Some(Decimal::new(4369, 4)),
+            window_tokens: 100,
+            window_cost_usd: Some(Decimal::new(1, 2)),
+            window_seconds: 2.0,
+            sample_seconds: 2.0,
+            window_cost_partial: false,
+            output_tokens_per_second: 270.0,
+            average_session_output_tokens_per_second: 33.0,
+            session_output_tokens_per_second: Default::default(),
+            session_speed_window_seconds: 30,
+            scan_millis: 0,
+        });
+        let output = linear(&cli, &report, 140, false).join("\n");
+        assert!(
+            output.contains("+100 tokens / +0.0100 USD / 270 out tok/s (33.0 tok/s)"),
+            "{output}"
+        );
+        assert!(!output.contains("1543980") && !output.contains("+0.4369"));
+    }
+
+    #[test]
+    fn monitor_range_shows_local_midnight_and_snapshot_time_including_rollover() {
+        for (zone, now, date, range) in [
+            (
+                "Asia/Shanghai",
+                "2026-11-03T18:34:56Z",
+                "2026-11-04",
+                "Today 00:00:00–02:34:56",
+            ),
+            (
+                "Asia/Shanghai",
+                "2026-11-04T15:59:59Z",
+                "2026-11-04",
+                "Today 00:00:00–23:59:59",
+            ),
+            (
+                "Asia/Shanghai",
+                "2026-11-04T16:00:01Z",
+                "2026-11-05",
+                "Today 00:00:00–00:00:01",
+            ),
+            (
+                "America/New_York",
+                "2026-11-01T06:30:00Z",
+                "2026-11-01",
+                "Today 00:00:00–01:30:00",
+            ),
+        ] {
+            let cli = Cli::parse_from([
+                "codex-usage",
+                "monitor",
+                "--timezone",
+                zone,
+                "--color",
+                "never",
+            ]);
+            let report = report::build(
+                &cli,
+                zone.parse().unwrap(),
+                &Scan::default(),
+                None,
+                now.parse().unwrap(),
+            )
+            .unwrap();
+            let output = linear(&cli, &report, 140, false).join("\n");
+            assert!(
+                output.contains(range) && output.contains(date) && output.contains(zone),
+                "{output}"
+            );
+            assert!(output.contains("n/a est."));
+        }
+    }
+
+    #[test]
+    fn monitor_marks_data_gaps_and_does_not_present_unknown_cost_as_free() {
+        for readable in [true, false] {
+            let cli = Cli::parse_from(["codex-usage", "monitor", "--color", "never"]);
+            let mut scan = Scan::default();
+            scan.sources.push(crate::model::SourceStatus {
+                name: "local".into(),
+                root: "/unused".into(),
+                readable,
+                last_success: None,
+                error: None,
+            });
+            scan.coverage.uncertain = usize::from(readable);
+            let mut report =
+                report::build(&cli, chrono_tz::UTC, &scan, None, chrono::Utc::now()).unwrap();
+            report.totals.cost_usd = Some(Decimal::ZERO);
+            let mut info = crate::monitor::Tracker::new(&scan, &report, true).info(0);
+            info.window_cost_usd = None;
+            info.window_cost_partial = true;
+            report.monitor = Some(info);
+            let output = linear(&cli, &report, 140, false).join("\n");
+            assert!(
+                output.contains("partial data")
+                    && output.contains("n/a est.")
+                    && output.contains("n/a USD"),
+                "{output}"
+            );
+            assert!(!output.contains("+0.0000 USD") && !output.contains("$0.0000"));
+            assert!(output.contains("Usage data incomplete."));
+        }
+    }
+
+    #[test]
+    fn monitor_partial_cost_and_filtered_scope_stay_compact_and_wrap() {
+        let cli = Cli::parse_from([
+            "codex-usage",
+            "monitor",
+            "--session",
+            "s",
+            "--project",
+            "project",
+            "--mode",
+            "fast",
+            "--color",
+            "never",
+        ]);
+        let mut report = report::build(
+            &cli,
+            chrono_tz::UTC,
+            &Scan::default(),
+            None,
+            chrono::Utc::now(),
+        )
+        .unwrap();
+        let mut info = crate::monitor::Tracker::new(&Scan::default(), &report, true).info(0);
+        info.window_cost_usd = Some(Decimal::new(2, 2));
+        info.window_cost_partial = true;
+        info.average_session_output_tokens_per_second = 33.0;
+        report.monitor = Some(info);
+        let output = linear(&cli, &report, 140, false).join("\n");
+        assert!(
+            output.contains("LIVE FILTERED")
+                && output.contains("2s: +0 tokens / +0.0200 USD*")
+                && output.contains("(33.0 tok/s)"),
+            "{output}"
+        );
+        let help = view(&cli, &report, &Style::new(&cli, false), 140, true)
+            .body
+            .join("\n");
+        assert!(
+            help.contains("Filters:")
+                && help.contains("project")
+                && help.contains("unpriced usage")
+        );
+        for width in [24, 40, 80, 120] {
+            let v = view(&cli, &report, &Style::new(&cli, false), width, false);
+            assert!(v
+                .header
+                .iter()
+                .chain(&v.body)
+                .chain(&v.footer)
+                .all(|line| line.width() <= width));
+        }
+    }
+
+    #[test]
+    fn no_cost_monitor_keeps_range_without_cost_fields_and_uses_ascii_separator() {
+        let cli = Cli::parse_from([
+            "codex-usage",
+            "monitor",
+            "--no-cost",
+            "--ascii",
+            "--color",
+            "never",
+        ]);
+        let mut report = report::build(
+            &cli,
+            chrono_tz::UTC,
+            &Scan::default(),
+            None,
+            "2026-11-04T12:34:56Z".parse().unwrap(),
+        )
+        .unwrap();
+        report.monitor =
+            Some(crate::monitor::Tracker::new(&Scan::default(), &report, false).info(0));
+        let output = linear(&cli, &report, 140, false).join("\n");
+        assert!(
+            output.contains("Today 00:00:00-12:34:56") && output.contains("2s:"),
+            "{output}"
+        );
+        assert!(!output.contains("USD") && !output.contains("est."));
+    }
+
     #[test]
     fn diagnostic_counts_are_only_in_on_demand_help() {
         let cli = Cli::parse_from(["codex-usage", "--color", "never"]);

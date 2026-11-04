@@ -539,6 +539,56 @@ mod tests {
         assert!(p.estimate(&e).cost.is_none());
     }
     #[test]
+    fn exact_short_long_and_fast_costs_keep_cache_and_reasoning_as_subsets() {
+        let p = Pricer::load_current(None).unwrap();
+        let mut e = event();
+        // Official rates: short Standard 2/0.1/10, long 4/0.2/15;
+        // Fast doubles these. Each case has 60k cached input and 20k output.
+        for (input, service_tier, expected) in [
+            (272_000, "standard", "0.63"),
+            (272_001, "standard", "1.160004"),
+            (272_000, "priority", "1.26"),
+            (272_001, "fast", "2.320008"),
+        ] {
+            e.usage.input = input;
+            e.tier = Some(service_tier.into());
+            for reasoning in [0, 12_000, 20_000] {
+                e.usage.reasoning = Some(reasoning);
+                assert_eq!(p.estimate(&e).cost.unwrap().to_string(), expected);
+            }
+        }
+        e = event();
+        e.usage.cached = Some(e.usage.input);
+        // All input at the cache-read rate, with output charged exactly once.
+        assert_eq!(p.estimate(&e).cost.unwrap().to_string(), "0.21");
+        e.usage.cached = None;
+        let assumed = p.estimate(&e);
+        assert_eq!(assumed.cost.unwrap().to_string(), "0.4");
+        assert_eq!(assumed.status, "assumed");
+        assert!(assumed
+            .assumptions
+            .iter()
+            .any(|a| a.contains("zero cached input")));
+    }
+
+    #[test]
+    fn write_retention_and_missing_cache_rates_do_not_produce_silent_discounts() {
+        let p = custom("[[rates]]\nmodel='gpt-6.1-sol'\ninput='2'\ncached='0.1'\noutput='10'\ncache_write='2.5'\ncache_write_12h='5'\ncache_write_mode='subset'\n");
+        let mut e = event();
+        e.usage.cache_write = Some(10_000);
+        e.cache_retention = Some("12h".into());
+        // 30k ordinary*2 + 60k cached*0.1 + 10k writes*5 + 20k output*10.
+        assert_eq!(p.estimate(&e).cost.unwrap().to_string(), "0.316");
+        e.cache_retention = Some("unsupported".into());
+        assert!(p.estimate(&e).cost.is_none());
+        let p = Pricer::load_current(None).unwrap();
+        e = event();
+        e.model = "gpt-5.5-pro".into();
+        assert!(p.estimate(&e).cost.is_none());
+        e.usage.cached = Some(0);
+        assert_eq!(p.estimate(&e).cost.unwrap().to_string(), "6.6");
+    }
+    #[test]
     fn missing_tier_is_marked_and_past_rates_are_not_invented() {
         let mut e = event();
         e.tier = None;

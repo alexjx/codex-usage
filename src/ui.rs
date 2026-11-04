@@ -26,6 +26,12 @@ pub fn interactive() -> bool {
         && std::env::var("TERM").unwrap_or_default() != "dumb"
 }
 struct Screen;
+struct StopCollector(Arc<AtomicBool>);
+impl Drop for StopCollector {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
 impl Screen {
     fn enter() -> io::Result<Self> {
         terminal::enable_raw_mode()?;
@@ -98,6 +104,8 @@ where
     std::thread::scope(|scope| -> Result<Report> {
         let (work_tx, work_rx) = std::sync::mpsc::channel::<()>();
         let (results_tx, results_rx) = std::sync::mpsc::channel::<Result<Report>>();
+        // Drop after the screen guard, before the scoped collector is joined.
+        let _stop_collector = StopCollector(Arc::clone(&stopped));
         if cli.monitor() {
             scope.spawn(move || {
                 while work_rx.recv().is_ok() {
@@ -119,11 +127,17 @@ where
         let mut reanchor = false;
         let mut pending = false;
         loop {
+            if stopped.load(Ordering::Relaxed) {
+                break;
+            }
             if let Ok(result) = results_rx.try_recv() {
-                report = result?;
+                match result {
+                    Ok(next_report) => report = next_report,
+                    Err(error) if crate::cancel::is_cancelled(&error) => break,
+                    Err(error) => return Err(error),
+                }
                 pending = false;
                 reanchor = true;
-                next = Instant::now() + cli.interval();
             }
             let (width, height) = size();
             let v = render::view(cli, &report, &style, width, help);
@@ -261,6 +275,7 @@ where
                     break;
                 }
                 work_tx.send(())?;
+                next = Instant::now() + cli.interval();
                 pending = true;
             }
         }

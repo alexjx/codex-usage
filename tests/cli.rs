@@ -487,7 +487,262 @@ fn custom_model_cost_is_exact_and_unknown_cost_never_becomes_zero() {
 }
 
 #[test]
-fn reports_and_monitor_filter_old_files_with_a_two_day_modification_buffer() {
+fn retimestamped_copies_use_the_earliest_recorded_day_with_a_diagnostic() {
+    let f = Fixture::new();
+    let windows = f._dir.path().join("windows");
+    f.write(
+        "later-copy",
+        vec![
+            metadata("s"),
+            context("t", "gpt-6.1-sol"),
+            usage("s", "t", "r", "2026-11-04T00:01:00Z", 10, 0, 2),
+        ],
+    );
+    write_log(
+        &windows,
+        "earlier-copy",
+        vec![
+            metadata("s"),
+            context("t", "gpt-6.1-sol"),
+            usage("s", "t", "r", "2026-11-01T00:01:00Z", 10, 0, 2),
+        ],
+    );
+    let output = f
+        .command()
+        .args(["daily", "--all", "--timezone", "UTC", "--format", "json"])
+        .arg("--root")
+        .arg(&f.root)
+        .arg("--root")
+        .arg(windows)
+        .output()
+        .unwrap();
+    success(&output);
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["totals"]["events"], 1);
+    assert_eq!(report["totals"]["total"], 12);
+    assert_eq!(report["totals"]["cost_usd"], "0.00004");
+    assert_eq!(report["rows"][0]["dimensions"]["day"], "2026-11-01");
+    assert!(report["coverage"]["uncertain"].as_u64().unwrap() > 0);
+}
+
+#[test]
+fn copied_request_mode_aliases_and_retention_metadata_preserve_exact_cost() {
+    let f = Fixture::new();
+    let windows = f._dir.path().join("windows");
+    let mut ctx = context("t", "write-model");
+    ctx["payload"]["service_tier"] = json!("priority");
+    let mut request = usage("s", "t", "r", "2026-11-01T00:01:00Z", 100000, 60000, 20000);
+    request["payload"]["usage"]["cache_write_input_tokens"] = json!(10000);
+    f.write("sparse", vec![metadata("s"), ctx.clone(), request.clone()]);
+    ctx["payload"]["service_tier"] = json!("fast");
+    request["payload"]["cache_retention"] = json!("12h");
+    write_log(&windows, "rich", vec![metadata("s"), ctx, request]);
+    let rates = f._dir.path().join("rates.toml");
+    fs::write(&rates, "[[rates]]\nmodel='write-model'\ntier='fast'\ninput='2'\ncached='0.1'\noutput='10'\ncache_write='2.5'\ncache_write_12h='5'\ncache_write_mode='subset'\n").unwrap();
+    let output = f
+        .command()
+        .args(["models", "--all", "--format", "json"])
+        .arg("--root")
+        .arg(&f.root)
+        .arg("--root")
+        .arg(windows)
+        .arg("--pricing-file")
+        .arg(rates)
+        .output()
+        .unwrap();
+    success(&output);
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["coverage"]["conflicts"], 0);
+    assert_eq!(report["totals"]["events"], 1);
+    assert_eq!(report["totals"]["total"], 120000);
+    // 30k ordinary*2 +60k cached*.1 +10k writes*5 +20k output*10 per million.
+    assert_eq!(report["totals"]["cost_usd"], "0.316");
+    assert_eq!(report["totals"]["modes"], json!(["fast"]));
+}
+
+#[test]
+fn copied_legacy_counters_excluding_compaction_do_not_add_usage_or_cost_twice() {
+    let f = Fixture::new();
+    let windows = f._dir.path().join("windows");
+    let mut modern = vec![metadata("s"), context("t", "gpt-6.1-sol")];
+    for (response, second, input, output, total_input, total_output) in [
+        ("r1", 1, 10, 1, 10, 1),
+        ("compaction", 2, 100, 10, 110, 11),
+        ("r2", 3, 20, 2, 130, 13),
+    ] {
+        let mut request = usage(
+            "s",
+            "t",
+            response,
+            &format!("2026-11-01T00:01:{second:02}Z"),
+            input,
+            0,
+            output,
+        );
+        request["payload"]["usage"]["reasoning_output_tokens"] = json!(0);
+        request["payload"]["thread_token_usage"] = json!({"input_tokens":total_input,
+            "cached_input_tokens":0,"output_tokens":total_output,"reasoning_output_tokens":0,
+            "total_tokens":total_input+total_output});
+        modern.push(request);
+    }
+    f.write("modern", modern);
+    write_log(
+        &windows,
+        "legacy",
+        vec![
+            metadata("s"),
+            context("t", "gpt-6.1-sol"),
+            legacy("2026-11-01T00:01:01Z", 10, 1),
+            legacy("2026-11-01T00:01:03Z", 30, 3),
+        ],
+    );
+    let output = f
+        .command()
+        .args(["models", "--all", "--format", "json"])
+        .arg("--root")
+        .arg(&f.root)
+        .arg("--root")
+        .arg(windows)
+        .output()
+        .unwrap();
+    success(&output);
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["totals"]["events"], 3);
+    assert_eq!(report["totals"]["total"], 143);
+    assert_eq!(report["totals"]["cost_usd"], "0.00039");
+}
+
+#[test]
+fn independent_accounting_ledger_reconciles_copies_mirrors_groupings_and_exact_costs() {
+    let f = Fixture::new();
+    let windows = f._dir.path().join("windows");
+    // Hand-calculated ledger at current API rates. Cached and reasoning are
+    // subsets, not extra tokens. Equal independent requests r2/r6 both count.
+    // Costs: .00148 + .00296 + .00074 + .455 + unpriced + .00296 = .46314.
+    let requests = [
+        ("s1", "r1", "gpt-6.1-sol", "standard", 1000, 800, 100),
+        ("s1", "r2", "gpt-6.1-sol", "priority", 1000, 800, 100),
+        ("s2", "r3", "gpt-6.1-terra", "standard", 1000, 800, 100),
+        ("s2", "r4", "gpt-6.1-sol", "standard", 300000, 200000, 1000),
+        ("s2", "r5", "unlisted-model", "standard", 500, 0, 50),
+        ("s1", "r6", "gpt-6.1-sol", "priority", 1000, 800, 100),
+    ];
+    for session in ["s1", "s2"] {
+        let mut records = vec![metadata(session)];
+        let mut cumulative = (0, 0, 0, 0);
+        for &(s, response, model, tier, input, cached, output) in &requests {
+            if s != session {
+                continue;
+            }
+            let mut ctx = context(response, model);
+            ctx["payload"]["service_tier"] = json!(tier);
+            records.push(ctx);
+            let mut request = usage(
+                s,
+                response,
+                response,
+                "2026-11-01T00:01:00Z",
+                input,
+                cached,
+                output,
+            );
+            cumulative.0 += input;
+            cumulative.1 += cached;
+            cumulative.2 += output;
+            cumulative.3 += output / 2;
+            let counters = json!({"input_tokens":cumulative.0,"cached_input_tokens":cumulative.1,
+                "cache_write_input_tokens":0,"output_tokens":cumulative.2,
+                "reasoning_output_tokens":cumulative.3,"total_tokens":cumulative.0+cumulative.2});
+            request["payload"]["thread_token_usage"] = counters.clone();
+            let mirror = json!({"type":"event_msg","timestamp":request["timestamp"],
+                "payload":{"type":"token_count","info":{"total_token_usage":counters,
+                    "last_token_usage":request["payload"]["usage"]}}});
+            records.push(request);
+            records.push(mirror);
+        }
+        let original = f.write(session, records.clone());
+        write_log(&windows, session, records);
+        fs::create_dir_all(f.root.join("archived_sessions")).unwrap();
+        fs::copy(
+            original,
+            f.root
+                .join("archived_sessions")
+                .join(format!("copy-{session}.jsonl")),
+        )
+        .unwrap();
+    }
+    for command in ["models", "daily", "monthly", "sessions"] {
+        let output = f
+            .command()
+            .args([command, "--all", "--format", "json"])
+            .arg("--root")
+            .arg(&f.root)
+            .arg("--root")
+            .arg(&windows)
+            .output()
+            .unwrap();
+        success(&output);
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let total = &report["totals"];
+        for (key, value) in [
+            ("input", 304500),
+            ("cached", 203200),
+            ("output", 1450),
+            ("reasoning", 725),
+            ("total", 305950),
+            ("events", 6),
+            ("sessions", 2),
+            ("priced_tokens", 305400),
+            ("unpriced_tokens", 550),
+        ] {
+            assert_eq!(total[key], value, "{command}: {key}");
+        }
+        assert_eq!(total["pricing_status"], "partial");
+        assert_eq!(total["cost_usd"], "0.46314");
+        let rows = report["rows"].as_array().unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|r| r["counts"]["total"].as_u64().unwrap())
+                .sum::<u64>(),
+            305950
+        );
+        let sum: Decimal = rows
+            .iter()
+            .filter_map(|r| r["counts"]["cost_usd"].as_str())
+            .map(|value| Decimal::from_str(value).unwrap())
+            .sum();
+        assert_eq!(sum, Decimal::from_str("0.46314").unwrap());
+        assert!(report["coverage"]["duplicates"].as_u64().unwrap() >= 12);
+    }
+    let output = f
+        .command()
+        .args(["daily", "--all", "--format", "csv"])
+        .arg("--root")
+        .arg(&f.root)
+        .arg("--root")
+        .arg(windows)
+        .output()
+        .unwrap();
+    success(&output);
+    let mut csv = csv::Reader::from_reader(output.stdout.as_slice());
+    let headers = csv.headers().unwrap().clone();
+    let total_column = headers.iter().position(|h| h == "total").unwrap();
+    let cost_column = headers.iter().position(|h| h == "cost_usd").unwrap();
+    let mut total = 0;
+    let mut cost = Decimal::ZERO;
+    for record in csv.records() {
+        let record = record.unwrap();
+        total += record[total_column].parse::<u64>().unwrap();
+        if !record[cost_column].is_empty() {
+            cost += Decimal::from_str(&record[cost_column]).unwrap();
+        }
+    }
+    assert_eq!(total, 305950);
+    assert_eq!(cost, Decimal::from_str("0.46314").unwrap());
+}
+
+#[test]
+fn reports_and_monitor_filter_old_files_before_parsing() {
     let f = Fixture::new();
     let now = Utc::now();
     let resumed = f.write(
@@ -498,12 +753,14 @@ fn reports_and_monitor_filter_old_files_with_a_two_day_modification_buffer() {
             usage("resumed", "t", "r", &now.to_rfc3339(), 20, 0, 5),
         ],
     );
-    // Even a retained modification time from yesterday is inside the buffer.
+    // Yesterday's noon is the exact boundary of monitor's extra12-hour buffer.
+    let cutoff =
+        now.date_naive().and_hms_opt(0, 0, 0).unwrap().and_utc() - chrono::Duration::hours(12);
     fs::File::options()
         .write(true)
         .open(resumed)
         .unwrap()
-        .set_times(fs::FileTimes::new().set_modified((now - chrono::Duration::days(1)).into()))
+        .set_times(fs::FileTimes::new().set_modified(cutoff.into()))
         .unwrap();
     let archive = f.root.join("sessions/old.jsonl.zst");
     fs::write(&archive, b"must not be decompressed for a recent report").unwrap();
@@ -540,6 +797,186 @@ fn reports_and_monitor_filter_old_files_with_a_two_day_modification_buffer() {
         .output()
         .unwrap();
     assert!(!all.status.success());
+}
+
+#[test]
+fn monitor_uses_twelve_hours_of_grace_while_reports_keep_two_days() {
+    use chrono::TimeZone;
+    let f = Fixture::new();
+    f.write(
+        "live",
+        vec![
+            metadata("s"),
+            context("t", "test"),
+            usage("s", "t", "r", &Utc::now().to_rfc3339(), 10, 0, 1),
+        ],
+    );
+    let archive = f.root.join("sessions/old.jsonl.zst");
+    fs::write(
+        &archive,
+        b"older than monitor cutoff but inside report grace",
+    )
+    .unwrap();
+    for name in ["UTC", "Asia/Shanghai", "America/New_York"] {
+        let tz: chrono_tz::Tz = name.parse().unwrap();
+        let today = Utc::now().with_timezone(&tz).date_naive();
+        let start = tz
+            .from_local_datetime(&today.and_hms_opt(0, 0, 0).unwrap())
+            .earliest()
+            .unwrap()
+            .with_timezone(&Utc);
+        let modified = start - chrono::Duration::hours(12) - chrono::Duration::seconds(1);
+        fs::File::options()
+            .write(true)
+            .open(&archive)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(modified.into()))
+            .unwrap();
+        let monitor = f
+            .command()
+            .args([
+                "monitor",
+                "--frames",
+                "1",
+                "--format",
+                "jsonl",
+                "--timezone",
+                name,
+                "--strict",
+                "--no-cost",
+            ])
+            .arg("--root")
+            .arg(&f.root)
+            .output()
+            .unwrap();
+        success(&monitor);
+        let data: Value = serde_json::from_slice(&monitor.stdout).unwrap();
+        assert_eq!(data["totals"]["total"], 11);
+        assert_eq!(data["coverage"]["uncertain"], 0);
+        let report = f
+            .command()
+            .args([
+                "daily",
+                "--today",
+                "--format",
+                "json",
+                "--timezone",
+                name,
+                "--strict",
+                "--no-cost",
+            ])
+            .arg("--root")
+            .arg(&f.root)
+            .output()
+            .unwrap();
+        assert!(
+            !report.status.success(),
+            "Report should inspect the archive within its48-hour grace"
+        );
+        assert!(String::from_utf8_lossy(&report.stderr).contains("incomplete local data"));
+    }
+}
+
+#[test]
+fn monitor_distinguishes_unpriced_window_changes_from_a_known_cost_subtotal() {
+    let f = Fixture::new();
+    let file = f.write(
+        "live-cost",
+        vec![
+            metadata("s"),
+            context("t0", "gpt-6.1-sol"),
+            usage("s", "t0", "old", &Utc::now().to_rfc3339(), 100, 20, 30),
+        ],
+    );
+    let mut child = f
+        .command()
+        .args([
+            "monitor",
+            "--timezone",
+            "UTC",
+            "--format",
+            "jsonl",
+            "--frames",
+            "3",
+            "--interval",
+            "1s",
+        ])
+        .arg("--root")
+        .arg(&f.root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    let baseline: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(baseline["monitor"]["window_cost_partial"], false);
+    let mut writer = OpenOptions::new().append(true).open(file).unwrap();
+    for record in [
+        context("t1", "unlisted-model"),
+        usage("s", "t1", "unknown", &Utc::now().to_rfc3339(), 20, 0, 5),
+    ] {
+        writeln!(writer, "{record}").unwrap();
+    }
+    writer.flush().unwrap();
+    line.clear();
+    reader.read_line(&mut line).unwrap();
+    let unknown: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(unknown["monitor"]["window_tokens"], 25);
+    assert!(unknown["monitor"]["window_cost_usd"].is_null());
+    assert_eq!(unknown["monitor"]["window_cost_partial"], true);
+    for record in [
+        context("t2", "gpt-6.1-sol"),
+        usage("s", "t2", "known", &Utc::now().to_rfc3339(), 10, 0, 2),
+    ] {
+        writeln!(writer, "{record}").unwrap();
+    }
+    writer.flush().unwrap();
+    line.clear();
+    reader.read_line(&mut line).unwrap();
+    let mixed: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(mixed["monitor"]["window_tokens"], 12);
+    assert_eq!(mixed["monitor"]["since_ready_tokens"], 37);
+    assert_eq!(
+        Decimal::from_str(mixed["monitor"]["window_cost_usd"].as_str().unwrap()).unwrap(),
+        Decimal::new(4, 5)
+    );
+    assert_eq!(mixed["monitor"]["window_cost_partial"], false);
+    assert_eq!(mixed["totals"]["unpriced_tokens"], 25);
+    assert_eq!(mixed["totals"]["cost_usd"], "0.000502");
+    success(&child.wait_with_output().unwrap());
+}
+
+#[test]
+fn monitor_activity_label_and_metadata_follow_the_configured_interval() {
+    let f = Fixture::new();
+    for (interval, seconds, label) in [
+        (None, 2.0, "2s:"),
+        (Some("5s"), 5.0, "5s:"),
+        (Some("1500ms"), 1.5, "1.5s:"),
+    ] {
+        for format in ["table", "jsonl"] {
+            let mut command = f.command();
+            command
+                .args(["monitor", "--frames", "1", "--no-cost", "--format", format])
+                .arg("--root")
+                .arg(&f.root);
+            if let Some(interval) = interval {
+                command.args(["--interval", interval]);
+            }
+            let output = command.output().unwrap();
+            success(&output);
+            if format == "table" {
+                let text = String::from_utf8(output.stdout).unwrap();
+                assert!(text.contains(&format!("{label} +0 tokens")), "{text}");
+            } else {
+                let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(report["monitor"]["window_seconds"], seconds);
+                assert_eq!(report["monitor"]["sample_seconds"], 0.0);
+            }
+        }
+    }
 }
 
 #[test]
@@ -630,6 +1067,10 @@ fn monitor_reads_real_appends_and_defers_partial_records_without_counting_histor
     let last = snapshots.last().unwrap();
     assert_eq!(last["totals"]["total"], 155);
     assert_eq!(last["monitor"]["since_ready_tokens"], 25);
+    assert_eq!(last["monitor"]["window_tokens"], 25);
+    assert_eq!(last["monitor"]["window_seconds"], 1.0);
+    assert!(last["monitor"]["sample_seconds"].as_f64().unwrap() > 0.0);
+    assert!(last["monitor"]["window_cost_usd"].is_null());
     let monitor = &last["monitor"];
     assert_eq!(monitor["session_speed_window_seconds"], 30);
     assert!(

@@ -1,5 +1,8 @@
 //! Read-only rollout discovery, incremental parsing, and usage reconciliation.
-use crate::model::{Coverage, Scan, Source, SourceStatus, Usage, UsageEvent};
+use crate::{
+    cancel,
+    model::{Coverage, Scan, Source, SourceStatus, Usage, UsageEvent},
+};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -8,6 +11,7 @@ use std::{
     fs::{self, File, Metadata},
     io::{BufRead, BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
+    sync::{atomic::AtomicBool, Arc},
     time::{Duration, Instant, SystemTime},
 };
 use walkdir::WalkDir;
@@ -22,6 +26,7 @@ struct Turn {
 #[derive(Clone)]
 struct Candidate {
     event: UsageEvent,
+    file: PathBuf,
     turn: Option<String>,
     snapshot: Option<String>,
     direct: bool,
@@ -67,6 +72,7 @@ type ReconcileJob = (
 );
 #[derive(Default)]
 pub struct Reader {
+    stopped: Arc<AtomicBool>,
     files: HashMap<(String, PathBuf), CachedFile>,
     sources: HashMap<String, (SourceSnapshot, DateTime<Utc>)>,
     reconcile_at: Option<Instant>,
@@ -79,6 +85,13 @@ impl Reader {
         Self::default()
     }
 
+    pub fn with_cancel(stopped: Arc<AtomicBool>) -> Self {
+        Self {
+            stopped,
+            ..Self::default()
+        }
+    }
+
     pub fn scan(&mut self, sources: &[Source]) -> Result<Scan> {
         self.scan_since(sources, None)
     }
@@ -87,14 +100,28 @@ impl Reader {
     /// Resumed sessions and files with unavailable modification times are included.
     pub fn scan_since(&mut self, sources: &[Source], since: Option<DateTime<Utc>>) -> Result<Scan> {
         let since = since.and_then(|start| start.checked_sub_signed(chrono::Duration::days(2)));
-        self.service_reconciliation(sources);
+        self.scan_modified_since(sources, since)
+    }
+
+    /// Read files at or after an exact modification-time cutoff, without extra grace.
+    pub fn scan_modified_since(
+        &mut self,
+        sources: &[Source],
+        since: Option<DateTime<Utc>>,
+    ) -> Result<Scan> {
+        cancel::check(&self.stopped)?;
+        self.service_reconciliation(sources, since)?;
         let mut scan = Scan::default();
         let mut candidates = Vec::new();
         for source in sources {
+            cancel::check(&self.stopped)?;
             match self.read_source(source, since) {
                 Ok(snapshot) => {
                     let now = Utc::now();
-                    candidates.extend(snapshot.candidates.iter().cloned());
+                    for candidate in &snapshot.candidates {
+                        cancel::check(&self.stopped)?;
+                        candidates.push(candidate.clone());
+                    }
                     add_coverage(&mut scan.coverage, &snapshot.coverage);
                     self.sources.insert(source.name.clone(), (snapshot, now));
                     scan.sources.push(SourceStatus {
@@ -106,9 +133,15 @@ impl Reader {
                     });
                 }
                 Err(error) => {
+                    if cancel::is_cancelled(&error) {
+                        return Err(error);
+                    }
                     let previous = self.sources.get(&source.name);
                     if let Some((snapshot, _)) = previous {
-                        candidates.extend(snapshot.candidates.iter().cloned());
+                        for candidate in &snapshot.candidates {
+                            cancel::check(&self.stopped)?;
+                            candidates.push(candidate.clone());
+                        }
                         add_coverage(&mut scan.coverage, &snapshot.coverage);
                     }
                     scan.sources.push(SourceStatus {
@@ -122,6 +155,7 @@ impl Reader {
             }
         }
         for ((name, _), message) in &self.background_errors {
+            cancel::check(&self.stopped)?;
             if sources.iter().any(|source| source.name == *name) {
                 scan.coverage.uncertain += 1;
                 note(&mut scan.coverage, message.clone());
@@ -130,12 +164,18 @@ impl Reader {
         if self.reconcile_at.is_none() && self.sweep.is_empty() && self.reconcile_job.is_none() {
             self.reconcile_at = Some(Instant::now() + Duration::from_secs(60));
         }
-        scan.events = reconcile(candidates, &mut scan.coverage);
+        scan.events = reconcile(candidates, &mut scan.coverage, &self.stopped)?;
         scan.sources.sort_by(|a, b| a.name.cmp(&b.name));
+        cancel::check(&self.stopped)?;
         Ok(scan)
     }
 
-    fn service_reconciliation(&mut self, selected: &[Source]) {
+    fn service_reconciliation(
+        &mut self,
+        selected: &[Source],
+        since: Option<DateTime<Utc>>,
+    ) -> Result<()> {
+        cancel::check(&self.stopped)?;
         if self
             .reconcile_job
             .as_ref()
@@ -155,6 +195,9 @@ impl Reader {
                     }
                 }
                 Ok(Err(error)) => {
+                    if cancel::is_cancelled(&error) {
+                        return Err(error);
+                    }
                     self.background_errors.insert(key, error.to_string());
                 }
                 Err(_) => {
@@ -176,20 +219,32 @@ impl Reader {
                 .cloned()
                 .collect();
             keys.sort();
+            cancel::check(&self.stopped)?;
             self.sweep.extend(keys);
             self.reconcile_at = None;
         }
+        // Recheck queued files as the monitor's date cutoff advances at midnight.
+        let files = &self.files;
+        self.sweep.retain(|key| {
+            selected.iter().any(|source| source.name == key.0)
+                && files
+                    .get(key)
+                    .is_some_and(|cached| eligible_modified(cached.modified, since))
+        });
         // One background file at a time. Large archives never block the terminal event loop.
         if self.reconcile_job.is_none() {
             if let Some(key) = self.sweep.pop_front() {
                 let path = key.1.clone();
+                let stopped = Arc::clone(&self.stopped);
                 let job = std::thread::spawn(move || {
+                    cancel::check(&stopped)?;
                     let metadata = fs::metadata(&path)?;
-                    parse_cached(&path, &metadata, None)
+                    parse_cached(&path, &metadata, None, &stopped)
                 });
                 self.reconcile_job = Some((key, job));
             }
         }
+        cancel::check(&self.stopped)
     }
 
     fn read_source(
@@ -197,21 +252,17 @@ impl Reader {
         source: &Source,
         since: Option<DateTime<Utc>>,
     ) -> Result<SourceSnapshot> {
-        let paths = discover(&source.root)?;
+        let paths = discover(&source.root, &self.stopped)?;
         let mut snapshot = SourceSnapshot::default();
         let mut present = BTreeSet::new();
         for path in paths {
+            cancel::check(&self.stopped)?;
             let key = (source.name.clone(), path.clone());
             present.insert(key.clone());
             let loaded = (|| -> Result<bool> {
                 let metadata = fs::metadata(&path)
                     .with_context(|| format!("Cannot inspect {}", path.display()))?;
-                if since.is_some_and(|start| {
-                    metadata
-                        .modified()
-                        .ok()
-                        .is_some_and(|modified| DateTime::<Utc>::from(modified) < start)
-                }) {
+                if !eligible_modified(metadata.modified().ok(), since) {
                     return Ok(false);
                 }
                 let old = self.files.get(&key);
@@ -221,7 +272,7 @@ impl Reader {
                         || cached.identity != identity(&metadata)
                 });
                 if changed {
-                    let parsed = parse_cached(&path, &metadata, old)?;
+                    let parsed = parse_cached(&path, &metadata, old, &self.stopped)?;
                     self.files.insert(key.clone(), parsed);
                     self.background_errors.remove(&key);
                 }
@@ -232,6 +283,9 @@ impl Reader {
                 continue;
             }
             if let Err(error) = loaded {
+                if cancel::is_cancelled(&error) {
+                    return Err(error);
+                }
                 snapshot.coverage.uncertain += 1;
                 note(&mut snapshot.coverage, error.to_string());
                 if !self.files.contains_key(&key) {
@@ -257,6 +311,7 @@ impl Reader {
                 );
             }
             for candidate in &cached.parser.events {
+                cancel::check(&self.stopped)?;
                 let mut candidate = candidate.clone();
                 if let Some(turn) = candidate
                     .turn
@@ -282,13 +337,31 @@ impl Reader {
         self.files.retain(|(name, path), _| {
             name != &source.name || present.contains(&(name.clone(), path.clone()))
         });
+        self.background_errors.retain(|(name, path), _| {
+            name != &source.name || present.contains(&(name.clone(), path.clone()))
+        });
+        cancel::check(&self.stopped)?;
         Ok(snapshot)
     }
 }
 
-fn parse_cached(path: &Path, metadata: &Metadata, old: Option<&CachedFile>) -> Result<CachedFile> {
+fn eligible_modified(modified: Option<SystemTime>, since: Option<DateTime<Utc>>) -> bool {
+    match (modified, since) {
+        (Some(modified), Some(since)) => DateTime::<Utc>::from(modified) >= since,
+        _ => true,
+    }
+}
+
+fn parse_cached(
+    path: &Path,
+    metadata: &Metadata,
+    old: Option<&CachedFile>,
+    stopped: &Arc<AtomicBool>,
+) -> Result<CachedFile> {
+    cancel::check(stopped)?;
     let identity = identity(metadata);
     let prefix = read_prefix(path, metadata.len().min(4096) as usize)?;
+    cancel::check(stopped)?;
     let compressed = path.extension().is_some_and(|v| v == "zst");
     let append = !compressed
         && old.is_some_and(|cached| {
@@ -301,11 +374,16 @@ fn parse_cached(path: &Path, metadata: &Metadata, old: Option<&CachedFile>) -> R
     } else {
         Parser::default()
     };
+    cancel::check(stopped)?;
     let file = File::open(path).with_context(|| format!("Cannot read {}", path.display()))?;
     if compressed {
-        let decoder = zstd::stream::read::Decoder::new(file)
+        let decoder = zstd::stream::read::Decoder::new(CancellableRead::new(file, stopped))
             .with_context(|| format!("Cannot decompress {}", path.display()))?;
-        if let Err(error) = parser.consume(BufReader::new(decoder), path) {
+        if let Err(error) = parser.consume(
+            BufReader::new(CancellableRead::new(decoder, stopped)),
+            path,
+            stopped,
+        ) {
             if error.kind() == std::io::ErrorKind::UnexpectedEof {
                 parser.coverage.pending += 1;
             } else {
@@ -318,9 +396,14 @@ fn parse_cached(path: &Path, metadata: &Metadata, old: Option<&CachedFile>) -> R
             file.seek(SeekFrom::Start(parser.offset))?;
         }
         parser
-            .consume(BufReader::new(file), path)
+            .consume(
+                BufReader::new(CancellableRead::new(file, stopped)),
+                path,
+                stopped,
+            )
             .with_context(|| format!("Cannot read {}", path.display()))?;
     }
+    cancel::check(stopped)?;
     Ok(CachedFile {
         len: metadata.len(),
         modified: metadata.modified().ok(),
@@ -330,7 +413,8 @@ fn parse_cached(path: &Path, metadata: &Metadata, old: Option<&CachedFile>) -> R
     })
 }
 
-fn discover(root: &Path) -> Result<Vec<PathBuf>> {
+fn discover(root: &Path, stopped: &AtomicBool) -> Result<Vec<PathBuf>> {
+    cancel::check(stopped)?;
     fs::read_dir(root).with_context(|| format!("Cannot read source {}", root.display()))?;
     let directories: Vec<_> = [root.join("sessions"), root.join("archived_sessions")]
         .into_iter()
@@ -344,6 +428,7 @@ fn discover(root: &Path) -> Result<Vec<PathBuf>> {
     let mut selected: BTreeMap<PathBuf, (usize, PathBuf)> = BTreeMap::new();
     for (directory_index, directory) in directories.iter().enumerate() {
         for entry in WalkDir::new(directory).follow_links(false) {
+            cancel::check(stopped)?;
             let entry =
                 entry.with_context(|| format!("Cannot enumerate {}", directory.display()))?;
             if !entry.file_type().is_file() {
@@ -371,7 +456,32 @@ fn discover(root: &Path) -> Result<Vec<PathBuf>> {
             }
         }
     }
+    cancel::check(stopped)?;
     Ok(selected.into_values().map(|(_, path)| path).collect())
+}
+
+/// Check cancellation between buffered chunks, including giant newline-free records.
+/// Interrupted errors would be retried by read_until, so use a typed Other error.
+struct CancellableRead<'a, R> {
+    inner: R,
+    stopped: &'a AtomicBool,
+}
+impl<'a, R> CancellableRead<'a, R> {
+    fn new(inner: R, stopped: &'a AtomicBool) -> Self {
+        Self { inner, stopped }
+    }
+}
+impl<R: Read> Read for CancellableRead<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.stopped.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(std::io::Error::other(cancel::Cancelled));
+        }
+        let read = self.inner.read(buf)?;
+        if self.stopped.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(std::io::Error::other(cancel::Cancelled));
+        }
+        Ok(read)
+    }
 }
 #[cfg(unix)]
 fn identity(metadata: &Metadata) -> String {
@@ -415,10 +525,21 @@ fn timestamp(value: &Value) -> Option<DateTime<Utc>> {
 }
 
 impl Parser {
-    fn consume(&mut self, mut reader: impl BufRead, path: &Path) -> std::io::Result<()> {
+    fn consume(
+        &mut self,
+        mut reader: impl BufRead,
+        path: &Path,
+        stopped: &AtomicBool,
+    ) -> std::io::Result<()> {
         loop {
+            if stopped.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(std::io::Error::other(cancel::Cancelled));
+            }
             let mut line = std::mem::take(&mut self.pending);
             let read = reader.read_until(b'\n', &mut line)?;
+            if stopped.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(std::io::Error::other(cancel::Cancelled));
+            }
             self.offset += read as u64;
             if read == 0 {
                 self.pending = line;
@@ -697,6 +818,7 @@ impl Parser {
             .insert(session, (event.usage.clone(), time, false));
         self.events.push(Candidate {
             event,
+            file: path.to_path_buf(),
             turn,
             snapshot,
             direct: true,
@@ -809,6 +931,7 @@ impl Parser {
         }
         self.events.push(Candidate {
             event,
+            file: path.to_path_buf(),
             turn: if mixed_model {
                 None
             } else {
@@ -966,7 +1089,21 @@ fn same_event(a: &UsageEvent, b: &UsageEvent) -> bool {
         && a.session == b.session
         && (a.model == "unknown" || b.model == "unknown" || a.model == b.model)
         && (a.provider == "unknown" || b.provider == "unknown" || a.provider == b.provider)
-        && (a.tier.is_none() || b.tier.is_none() || a.tier == b.tier)
+        && (a.tier.is_none()
+            || b.tier.is_none()
+            || a.tier == b.tier
+            || (a.mode() != "unknown" && a.mode() == b.mode()))
+        && compatible(a.context_tokens, b.context_tokens)
+        && (a.cache_retention.is_none()
+            || b.cache_retention.is_none()
+            || a.cache_retention.as_deref().map(retention)
+                == b.cache_retention.as_deref().map(retention))
+}
+fn retention(value: &str) -> &str {
+    match value {
+        "30min" => "30m",
+        value => value,
+    }
 }
 fn compatible(a: Option<u64>, b: Option<u64>) -> bool {
     a.is_none() || b.is_none() || a == b
@@ -991,8 +1128,34 @@ fn merge_event(existing: &mut UsageEvent, other: &UsageEvent) {
     if existing.usage.reasoning.is_none() {
         existing.usage.reasoning = other.usage.reasoning;
     }
+    if existing.context_tokens.is_none() {
+        existing.context_tokens = other.context_tokens;
+    }
+    if existing.cache_retention.is_none() {
+        existing.cache_retention.clone_from(&other.cache_retention);
+    }
+    if existing.project.is_none() {
+        existing.project.clone_from(&other.project);
+    }
 }
-fn reconcile(mut candidates: Vec<Candidate>, coverage: &mut Coverage) -> Vec<UsageEvent> {
+fn merge_mirror(existing: &mut UsageEvent, mirror: &UsageEvent, coverage: &mut Coverage) {
+    if same_event(existing, mirror) {
+        merge_event(existing, mirror);
+        coverage.duplicates += 1;
+    } else {
+        coverage.uncertain += 1;
+        note(
+            coverage,
+            "Conflicting compatibility metadata excluded; identified per-response usage retained",
+        );
+    }
+}
+fn reconcile(
+    mut candidates: Vec<Candidate>,
+    coverage: &mut Coverage,
+    stopped: &AtomicBool,
+) -> Result<Vec<UsageEvent>> {
+    cancel::check(stopped)?;
     // Prefer an identified response over its equivalent legacy snapshot from another copy.
     candidates.sort_by(|a, b| {
         b.direct
@@ -1000,35 +1163,90 @@ fn reconcile(mut candidates: Vec<Candidate>, coverage: &mut Coverage) -> Vec<Usa
             .then_with(|| a.event.source.cmp(&b.event.source))
             .then_with(|| a.event.id.cmp(&b.event.id))
     });
+    cancel::check(stopped)?;
     let mut events: BTreeMap<String, UsageEvent> = BTreeMap::new();
-    let mut direct_snapshots: HashMap<String, Vec<String>> = HashMap::new();
+    let mut direct_snapshots = HashMap::<_, BTreeSet<(String, DateTime<Utc>)>>::new();
+    let mut direct_contexts = HashMap::<_, Vec<(String, PathBuf)>>::new();
     let mut conflicts = BTreeSet::new();
+    let mut inconsistent_timestamps = BTreeSet::new();
     for candidate in candidates {
+        cancel::check(stopped)?;
         let mut event = candidate.event;
+        if candidate.direct {
+            if let Some(snapshot) = candidate.snapshot.as_ref() {
+                direct_snapshots
+                    .entry(snapshot.clone())
+                    .or_default()
+                    .insert((event.id.clone(), event.timestamp));
+            }
+            if let Some(turn) = candidate.turn.as_ref() {
+                direct_contexts
+                    .entry((event.session.clone(), turn.clone(), event.timestamp))
+                    .or_default()
+                    .push((event.id.clone(), candidate.file.clone()));
+            }
+        }
         if !candidate.direct {
             if let Some(ids) = candidate
                 .snapshot
                 .as_ref()
                 .and_then(|key| direct_snapshots.get(key))
             {
-                let matching: Vec<_> = ids
+                let endpoints: BTreeSet<_> = ids
+                    .iter()
+                    .filter(|(id, original_timestamp)| {
+                        events.contains_key(id)
+                            && (*original_timestamp - event.timestamp)
+                                .num_milliseconds()
+                                .unsigned_abs()
+                                <= 2000
+                    })
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                let matching: Vec<_> = endpoints
                     .iter()
                     .filter(|id| {
-                        events.get(*id).is_some_and(|other| {
-                            same_usage(other, &event)
-                                && (other.timestamp - event.timestamp)
-                                    .num_milliseconds()
-                                    .unsigned_abs()
-                                    <= 2000
-                        })
+                        events
+                            .get(*id)
+                            .is_some_and(|other| same_usage(other, &event))
                     })
-                    .cloned()
                     .collect();
                 if matching.len() == 1 {
-                    if let Some(other) = events.get_mut(&matching[0]) {
-                        merge_event(other, &event);
+                    if let Some(other) = events.get_mut(matching[0]) {
+                        merge_mirror(other, &event, coverage);
                     }
-                    coverage.duplicates += 1;
+                    continue;
+                } else if !endpoints.is_empty() {
+                    coverage.uncertain += 1;
+                    note(coverage, "Overlapping or ambiguous cumulative compatibility increment excluded; identified per-response usage retained");
+                    continue;
+                }
+            }
+            // Older compatibility streams can omit compaction from their cumulative
+            // series. Different cumulative totals must not charge the same copied
+            // request twice. Require the same exact timestamp, session, turn and
+            // usage in a different file; near-time coincidences are insufficient.
+            if let Some(turn) = candidate.turn.as_ref() {
+                let matching: BTreeSet<_> = direct_contexts
+                    .get(&(event.session.clone(), turn.clone(), event.timestamp))
+                    .into_iter()
+                    .flatten()
+                    .filter(|(id, file)| {
+                        *file != candidate.file
+                            && events
+                                .get(id)
+                                .is_some_and(|other| same_usage(other, &event))
+                    })
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                if matching.len() == 1 {
+                    if let Some(other) = events.get_mut(matching.first().unwrap()) {
+                        merge_mirror(other, &event, coverage);
+                    }
+                    continue;
+                } else if matching.len() > 1 {
+                    coverage.uncertain += 1;
+                    note(coverage, "Ambiguous copied compatibility record excluded: multiple direct responses match its session, turn, timestamp and usage");
                     continue;
                 }
             }
@@ -1038,6 +1256,13 @@ fn reconcile(mut candidates: Vec<Candidate>, coverage: &mut Coverage) -> Vec<Usa
         }
         if let Some(existing) = events.get_mut(&event.id) {
             if same_event(existing, &event) {
+                if existing.timestamp != event.timestamp {
+                    if inconsistent_timestamps.insert(event.id.clone()) {
+                        coverage.uncertain += 1;
+                        note(coverage, "Identified request copies have different timestamps; earliest recorded timestamp used for date attribution");
+                    }
+                    existing.timestamp = existing.timestamp.min(event.timestamp);
+                }
                 merge_event(existing, &event);
                 coverage.duplicates += 1;
             } else {
@@ -1050,14 +1275,6 @@ fn reconcile(mut candidates: Vec<Candidate>, coverage: &mut Coverage) -> Vec<Usa
                 events.remove(&event.id);
             }
         } else {
-            if candidate.direct {
-                if let Some(snapshot) = candidate.snapshot {
-                    direct_snapshots
-                        .entry(snapshot)
-                        .or_default()
-                        .push(event.id.clone());
-                }
-            }
             if event.origins.is_empty() {
                 event.origins.insert(event.source.clone());
             }
@@ -1065,8 +1282,10 @@ fn reconcile(mut candidates: Vec<Candidate>, coverage: &mut Coverage) -> Vec<Usa
         }
     }
     let mut events: Vec<_> = events.into_values().collect();
+    cancel::check(stopped)?;
     events.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then_with(|| a.id.cmp(&b.id)));
-    events
+    cancel::check(stopped)?;
+    Ok(events)
 }
 
 #[cfg(test)]
@@ -1125,6 +1344,133 @@ mod tests {
             .unwrap()
             .set_times(fs::FileTimes::new().set_modified(SystemTime::from(timestamp)))
             .unwrap();
+    }
+
+    struct StopDuringRead<R> {
+        inner: R,
+        stopped: Arc<AtomicBool>,
+        reads: usize,
+        bytes: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl<R: Read> Read for StopDuringRead<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let count = self.inner.read(buf)?;
+            self.bytes
+                .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+            self.reads += 1;
+            if self.reads == 2 {
+                self.stopped
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            Ok(count)
+        }
+    }
+
+    #[test]
+    fn cancellation_interrupts_plain_and_compressed_giant_lines_between_chunks() {
+        use std::io::Cursor;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let data = vec![b'x'; 1024 * 1024];
+        for compressed in [false, true] {
+            let stopped = Arc::new(AtomicBool::new(false));
+            let bytes = Arc::new(AtomicUsize::new(0));
+            let input: Box<dyn Read> = if compressed {
+                let encoded = zstd::stream::encode_all(data.as_slice(), 1).unwrap();
+                Box::new(zstd::stream::read::Decoder::new(Cursor::new(encoded)).unwrap())
+            } else {
+                Box::new(Cursor::new(data.clone()))
+            };
+            let trigger = StopDuringRead {
+                inner: input,
+                stopped: Arc::clone(&stopped),
+                reads: 0,
+                bytes: Arc::clone(&bytes),
+            };
+            let mut parser = Parser::default();
+            let error = parser
+                .consume(
+                    BufReader::new(CancellableRead::new(trigger, &stopped)),
+                    Path::new("fixture.jsonl"),
+                    &stopped,
+                )
+                .unwrap_err();
+            assert!(cancel::is_cancelled(&error.into()));
+            assert!(
+                bytes.load(Ordering::Relaxed) <= 16 * 1024,
+                "did not stop between chunks"
+            );
+            assert!(parser.events.is_empty());
+            assert_eq!(parser.coverage.malformed, 0);
+            assert_eq!(parser.coverage.pending, 0);
+        }
+    }
+
+    #[test]
+    fn cancellation_is_propagated_before_discovery_and_reconciliation_and_can_retry() {
+        use std::sync::atomic::Ordering;
+        let stopped = Arc::new(AtomicBool::new(true));
+        // Cancellation wins over a missing source: it must not become a stale-source snapshot.
+        assert!(cancel::is_cancelled(
+            &discover(Path::new("/missing-source"), &stopped).unwrap_err()
+        ));
+        assert!(cancel::is_cancelled(
+            &reconcile(Vec::new(), &mut Coverage::default(), &stopped).unwrap_err()
+        ));
+        let dir = TempDir::new().unwrap();
+        write(
+            &dir.path().join("usage.jsonl"),
+            &[metadata("s"), direct("r", "s", "t", 10, 1, 10, 1)],
+        );
+        let sources = [source(dir.path(), "local")];
+        let mut reader = Reader::with_cancel(Arc::clone(&stopped));
+        assert!(cancel::is_cancelled(&reader.scan(&sources).unwrap_err()));
+        assert!(reader.files.is_empty());
+        assert!(reader.sources.is_empty());
+        stopped.store(false, Ordering::Relaxed);
+        let complete = reader.scan(&sources).unwrap();
+        assert_eq!(complete.events.len(), 1);
+        assert_eq!(complete.events[0].usage.total(), 11);
+        stopped.store(true, Ordering::Relaxed);
+        assert!(cancel::is_cancelled(&reader.scan(&sources).unwrap_err()));
+        assert_eq!(reader.sources["local"].0.candidates.len(), 1);
+        assert!(reader.background_errors.is_empty());
+    }
+
+    #[test]
+    fn exact_monitor_cutoff_keeps_boundary_and_rechecks_resumed_old_files() {
+        let dir = TempDir::new().unwrap();
+        let cutoff: DateTime<Utc> = "2026-10-31T12:00:00Z".parse().unwrap();
+        let boundary = dir.path().join("rollout-2026-01-01-boundary.jsonl");
+        write(
+            &boundary,
+            &[metadata("s"), direct("r1", "s", "t", 10, 1, 10, 1)],
+        );
+        modified_at(&boundary, cutoff);
+        let old = dir.path().join("old.jsonl.zst");
+        fs::write(&old, b"invalid old archive must never be opened").unwrap();
+        modified_at(&old, cutoff - chrono::Duration::seconds(1));
+        let sources = [source(dir.path(), "local")];
+        let mut reader = Reader::new();
+        let first = reader.scan_modified_since(&sources, Some(cutoff)).unwrap();
+        assert_eq!(first.events.len(), 1);
+        assert_eq!(first.coverage.files, 1);
+        assert_eq!(first.coverage.uncertain, 0);
+        let next = cutoff + chrono::Duration::days(1);
+        reader.reconcile_at = Some(Instant::now());
+        assert!(reader
+            .scan_modified_since(&sources, Some(next))
+            .unwrap()
+            .events
+            .is_empty());
+        assert!(reader.reconcile_job.is_none());
+        assert!(reader.files.is_empty());
+        let mut file = File::options().append(true).open(&boundary).unwrap();
+        writeln!(file, "{}", direct("r2", "s", "t", 20, 2, 30, 3)).unwrap();
+        drop(file);
+        modified_at(&boundary, next);
+        let resumed = reader.scan_modified_since(&sources, Some(next)).unwrap();
+        assert!(resumed.events.iter().any(|event| event.id == "response:r2"));
+        assert_eq!(resumed.coverage.uncertain, 0);
     }
 
     #[test]
@@ -1255,6 +1601,326 @@ mod tests {
         );
         assert!(!scan.coverage.incomplete(), "{:?}", scan.coverage);
     }
+
+    #[test]
+    fn cross_source_compatibility_mirrors_with_different_counter_bases_count_once() {
+        let modern = TempDir::new().unwrap();
+        let compatibility = TempDir::new().unwrap();
+        let first = direct("r1", "s", "t1", 10, 1, 10, 1);
+        let mut compaction = direct("compact", "s", "tc", 100, 10, 110, 11);
+        compaction["timestamp"] = json!("2026-11-01T10:00:03Z");
+        let mut second = direct("r2", "s", "t2", 20, 2, 130, 13);
+        second["timestamp"] = json!("2026-11-01T10:00:04Z");
+        write(
+            &modern.path().join("modern.jsonl"),
+            &[
+                metadata("s"),
+                turn("t1", "alpha"),
+                first,
+                turn("tc", "alpha"),
+                compaction,
+                turn("t2", "alpha"),
+                second,
+            ],
+        );
+        write(
+            &compatibility.path().join("legacy.jsonl"),
+            &[
+                metadata("s"),
+                turn("t1", "alpha"),
+                legacy(10, 1, 2),
+                turn("t2", "alpha"),
+                legacy(30, 3, 4),
+            ],
+        );
+        let scan = Reader::new()
+            .scan(&[
+                source(modern.path(), "wsl"),
+                source(compatibility.path(), "windows"),
+            ])
+            .unwrap();
+        assert_eq!(scan.events.len(), 3);
+        assert_eq!(
+            scan.events
+                .iter()
+                .map(|event| event.usage.total())
+                .sum::<u64>(),
+            143
+        );
+        // The same copied formats can live in separate files of one source.
+        let combined = TempDir::new().unwrap();
+        fs::copy(
+            modern.path().join("modern.jsonl"),
+            combined.path().join("modern.jsonl"),
+        )
+        .unwrap();
+        fs::copy(
+            compatibility.path().join("legacy.jsonl"),
+            combined.path().join("legacy.jsonl"),
+        )
+        .unwrap();
+        let scan = Reader::new()
+            .scan(&[source(combined.path(), "local")])
+            .unwrap();
+        assert_eq!(scan.events.len(), 3);
+        assert_eq!(
+            scan.events
+                .iter()
+                .map(|event| event.usage.total())
+                .sum::<u64>(),
+            143
+        );
+    }
+    #[test]
+    fn different_counter_bases_require_exact_context_and_exclude_ambiguous_mirrors() {
+        for variant in ["turn", "session", "timestamp", "missing-turn", "ambiguous"] {
+            let dir = TempDir::new().unwrap();
+            let mut values = vec![
+                metadata("s"),
+                turn("t", "alpha"),
+                direct("r1", "s", "t", 20, 2, 120, 12),
+            ];
+            if variant == "ambiguous" {
+                values.push(direct("r2", "s", "t", 20, 2, 140, 14));
+            }
+            write(&dir.path().join("modern.jsonl"), &values);
+            let mut values = vec![metadata(if variant == "session" { "other" } else { "s" })];
+            if variant != "missing-turn" {
+                values.push(turn(if variant == "turn" { "other" } else { "t" }, "alpha"));
+            }
+            let mut mirror = legacy(20, 2, 2);
+            if variant == "timestamp" {
+                mirror["timestamp"] = json!("2026-11-01T10:00:02.001Z");
+            }
+            values.push(mirror);
+            write(&dir.path().join("legacy.jsonl"), &values);
+            let scan = Reader::new().scan(&[source(dir.path(), "local")]).unwrap();
+            assert_eq!(scan.events.len(), 2, "{variant}");
+            assert_eq!(
+                scan.events
+                    .iter()
+                    .map(|event| event.usage.total())
+                    .sum::<u64>(),
+                44,
+                "{variant}"
+            );
+            assert_eq!(
+                scan.coverage.uncertain,
+                usize::from(variant == "ambiguous"),
+                "{variant}"
+            );
+        }
+    }
+
+    #[test]
+    fn copied_request_aliases_and_missing_cost_metadata_merge_but_conflicts_do_not() {
+        let dir = TempDir::new().unwrap();
+        let mut first = direct("r", "s", "t", 100, 10, 100, 10);
+        first["payload"]["service_tier"] = json!("fast");
+        let mut second = first.clone();
+        second["payload"]["service_tier"] = json!("priority");
+        second["payload"]["context_tokens"] = json!(300000);
+        second["payload"]["cache_retention"] = json!("12h");
+        let path = dir.path().join("a.jsonl");
+        write(&path, &[metadata("s"), first.clone()]);
+        write(
+            &dir.path().join("b.jsonl"),
+            &[metadata("s"), second.clone()],
+        );
+        let sources = [source(dir.path(), "local")];
+        let scan = Reader::new().scan(&sources).unwrap();
+        assert_eq!(scan.events.len(), 1);
+        assert_eq!(scan.events[0].context_tokens, Some(300000));
+        assert_eq!(scan.events[0].cache_retention.as_deref(), Some("12h"));
+        assert_eq!(scan.coverage.conflicts, 0);
+        first["payload"]["cache_retention"] = json!("30m");
+        write(&path, &[metadata("s"), first.clone()]);
+        let scan = Reader::new().scan(&sources).unwrap();
+        assert!(scan.events.is_empty());
+        assert_eq!(scan.coverage.conflicts, 1);
+        first["payload"]["cache_retention"] = json!("12h");
+        first["payload"]["context_tokens"] = json!(300001);
+        write(&path, &[metadata("s"), first.clone()]);
+        let scan = Reader::new().scan(&sources).unwrap();
+        assert!(scan.events.is_empty());
+        assert_eq!(scan.coverage.conflicts, 1);
+        // Unknown service tiers must not compare equal merely because both display Unknown.
+        first["payload"]["context_tokens"] = json!(300000);
+        first["payload"]["service_tier"] = json!("unknown-one");
+        second["payload"]["service_tier"] = json!("unknown-two");
+        write(&path, &[metadata("s"), first]);
+        write(&dir.path().join("b.jsonl"), &[metadata("s"), second]);
+        let scan = Reader::new().scan(&sources).unwrap();
+        assert!(scan.events.is_empty());
+        assert_eq!(scan.coverage.conflicts, 1);
+    }
+
+    #[test]
+    fn partial_legacy_aggregate_and_conflicting_mirror_do_not_add_duplicate_charges() {
+        let dir = TempDir::new().unwrap();
+        write(
+            &dir.path().join("modern.jsonl"),
+            &[
+                metadata("s"),
+                turn("t", "alpha"),
+                direct("r1", "s", "t", 100, 10, 100, 10),
+                direct("r2", "s", "t", 20, 2, 120, 12),
+            ],
+        );
+        let path = dir.path().join("legacy.jsonl");
+        write(
+            &path,
+            &[metadata("s"), turn("t", "alpha"), legacy(120, 12, 2)],
+        );
+        let sources = [source(dir.path(), "local")];
+        let scan = Reader::new().scan(&sources).unwrap();
+        assert_eq!(scan.events.len(), 2);
+        assert_eq!(
+            scan.events
+                .iter()
+                .map(|event| event.usage.total())
+                .sum::<u64>(),
+            132
+        );
+        assert_eq!(scan.coverage.uncertain, 1);
+        let mut legacy_record = legacy(100, 10, 2);
+        legacy_record["payload"]["info"]["service_tier"] = json!("priority");
+        let mut context = turn("t", "alpha");
+        context["payload"]["service_tier"] = json!("standard");
+        write(
+            &dir.path().join("modern.jsonl"),
+            &[
+                metadata("s"),
+                context,
+                direct("r1", "s", "t", 100, 10, 100, 10),
+            ],
+        );
+        write(&path, &[metadata("s"), turn("t", "alpha"), legacy_record]);
+        let scan = Reader::new().scan(&sources).unwrap();
+        assert_eq!(scan.events.len(), 1);
+        assert_eq!(scan.events[0].usage.total(), 110);
+        assert_eq!(scan.events[0].tier.as_deref(), Some("standard"));
+        assert_eq!(scan.coverage.uncertain, 1);
+    }
+
+    #[test]
+    fn copied_response_timestamp_disagreement_uses_earliest_date_with_warning() {
+        use clap::Parser as _;
+        let original = TempDir::new().unwrap();
+        let copied = TempDir::new().unwrap();
+        let old = direct("r", "s", "t", 10, 1, 10, 1);
+        let mut retimestamped = old.clone();
+        retimestamped["timestamp"] = json!("2026-11-04T10:00:02Z");
+        write(
+            &original.path().join("original.jsonl"),
+            &[metadata("s"), old],
+        );
+        write(
+            &copied.path().join("copy.jsonl"),
+            &[metadata("s"), retimestamped],
+        );
+        for (old_name, copied_name) in [("a", "b"), ("b", "a")] {
+            let scan = Reader::new()
+                .scan(&[
+                    source(original.path(), old_name),
+                    source(copied.path(), copied_name),
+                ])
+                .unwrap();
+            assert_eq!(scan.events.len(), 1);
+            assert_eq!(
+                scan.events[0].timestamp,
+                "2026-11-01T10:00:02Z".parse::<DateTime<Utc>>().unwrap()
+            );
+            assert_eq!(scan.coverage.uncertain, 1);
+            assert!(scan
+                .coverage
+                .messages
+                .iter()
+                .any(|message| message.contains("earliest recorded timestamp")));
+            let today = crate::cli::Cli::parse_from(["codex-usage", "models", "--today"]);
+            let all = crate::cli::Cli::parse_from(["codex-usage", "models", "--all"]);
+            let now = "2026-11-04T12:00:00Z".parse().unwrap();
+            assert_eq!(
+                crate::report::build(&today, chrono_tz::UTC, &scan, None, now)
+                    .unwrap()
+                    .totals
+                    .total,
+                0
+            );
+            assert_eq!(
+                crate::report::build(&all, chrono_tz::UTC, &scan, None, now)
+                    .unwrap()
+                    .totals
+                    .total,
+                11
+            );
+        }
+    }
+
+    #[test]
+    fn every_identified_copy_indexes_its_cumulative_endpoint_without_duplicate_ids() {
+        let dir = TempDir::new().unwrap();
+        write(
+            &dir.path().join("a-modern.jsonl"),
+            &[
+                metadata("s"),
+                turn("t", "alpha"),
+                direct("r1", "s", "t", 100, 10, 100, 10),
+                direct("r2", "s", "t", 20, 2, 120, 12),
+            ],
+        );
+        // Another copy has a different cumulative base and was retimestamped days later.
+        let mut later_copy = direct("r2", "s", "t", 20, 2, 220, 22);
+        later_copy["timestamp"] = json!("2026-11-04T10:00:02Z");
+        write(
+            &dir.path().join("b-copy.jsonl"),
+            &[metadata("s"), turn("t", "alpha"), later_copy],
+        );
+        let path = dir.path().join("c-legacy.jsonl");
+        let mut aggregate = legacy(220, 22, 2);
+        aggregate["timestamp"] = json!("2026-11-04T10:00:02Z");
+        write(&path, &[metadata("s"), turn("t", "alpha"), aggregate]);
+        let sources = [source(dir.path(), "local")];
+        let scan = Reader::new().scan(&sources).unwrap();
+        assert_eq!(scan.events.len(), 2);
+        assert_eq!(
+            scan.events
+                .iter()
+                .map(|event| event.usage.total())
+                .sum::<u64>(),
+            132
+        );
+        assert_eq!(scan.coverage.uncertain, 2);
+        // Repeated copies of one endpoint must still produce one unique response match.
+        write(
+            &dir.path().join("d-copy.jsonl"),
+            &[
+                metadata("s"),
+                turn("t", "alpha"),
+                direct("r2", "s", "t", 20, 2, 120, 12),
+            ],
+        );
+        write(
+            &path,
+            &[
+                metadata("s"),
+                turn("t", "alpha"),
+                legacy(100, 10, 2),
+                legacy(120, 12, 3),
+            ],
+        );
+        let scan = Reader::new().scan(&sources).unwrap();
+        assert_eq!(scan.events.len(), 2);
+        assert_eq!(
+            scan.events
+                .iter()
+                .map(|event| event.usage.total())
+                .sum::<u64>(),
+            132
+        );
+        assert_eq!(scan.coverage.uncertain, 1);
+    }
+
     #[test]
     fn legacy_counters_reset_without_charging_full_snapshot() {
         let dir = TempDir::new().unwrap();
@@ -1804,7 +2470,11 @@ mod tests {
             PathBuf::from(std::env::var_os("CODEX_USAGE_TEST_ROLLOUT").expect("set rollout path"));
         let mut parser = Parser::default();
         parser
-            .consume(BufReader::new(File::open(&path).unwrap()), &path)
+            .consume(
+                BufReader::new(File::open(&path).unwrap()),
+                &path,
+                &AtomicBool::new(false),
+            )
             .unwrap();
         assert_eq!(
             parser.coverage.malformed, 0,
@@ -1812,7 +2482,7 @@ mod tests {
             parser.coverage.messages
         );
         let mut coverage = Coverage::default();
-        let events = reconcile(parser.events, &mut coverage);
+        let events = reconcile(parser.events, &mut coverage, &AtomicBool::new(false)).unwrap();
         assert!(!events.is_empty());
         assert_eq!(coverage.conflicts, 0);
         eprintln!(

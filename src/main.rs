@@ -2,6 +2,7 @@ use anyhow::{bail, Result};
 use chrono::Utc;
 use chrono_tz::Tz;
 use codex_usage::{
+    cancel,
     cli::{Cli, Command, Format, SourceCommand},
     config::{self, Config},
     export, history,
@@ -24,6 +25,10 @@ use std::{
 };
 
 fn fail(error: anyhow::Error, code: i32) -> ! {
+    if cancel::is_cancelled(&error) {
+        eprintln!("Interrupted");
+        std::process::exit(130);
+    }
     if error.chain().any(|cause| {
         cause
             .downcast_ref::<io::Error>()
@@ -36,6 +41,11 @@ fn fail(error: anyhow::Error, code: i32) -> ! {
 }
 fn main() {
     let cli = Cli::parse_cli();
+    let stopped = Arc::new(AtomicBool::new(false));
+    let signal = Arc::clone(&stopped);
+    if let Err(error) = ctrlc::set_handler(move || signal.store(true, Ordering::Relaxed)) {
+        fail(error.into(), 1);
+    }
     let path = config::config_path(cli.config.as_deref()).unwrap_or_else(|e| fail(e, 2));
     let cli = history::resolve(cli, &path).unwrap_or_else(|e| fail(e, 2));
     let mut config = Config::load(&path).unwrap_or_else(|e| fail(e, 2));
@@ -87,11 +97,6 @@ fn main() {
     } else {
         Some(load_pricer(&cli).unwrap_or_else(|e| fail(e, 2)))
     };
-    let stopped = Arc::new(AtomicBool::new(false));
-    let signal = Arc::clone(&stopped);
-    if let Err(error) = ctrlc::set_handler(move || signal.store(true, Ordering::Relaxed)) {
-        fail(error.into(), 1);
-    }
     if let Err(error) = run(&cli, tz, &selected, pricer.as_ref(), format, stopped) {
         fail(error, 1);
     }
@@ -241,11 +246,20 @@ fn scan_report(
     sources: &[Source],
     reader: &mut Reader,
     pricer: Option<&Pricer>,
+    stopped: &AtomicBool,
 ) -> Result<(Scan, Report, u128)> {
+    cancel::check(stopped)?;
     let started = Instant::now();
     let period = report::Period::make(cli, tz, Utc::now())?;
-    let scan = reader.scan_since(sources, period.start)?;
-    let report = report::build(cli, tz, &scan, pricer, Utc::now())?;
+    let scan = if cli.monitor() {
+        let cutoff = period
+            .start
+            .and_then(|start| start.checked_sub_signed(chrono::Duration::hours(12)));
+        reader.scan_modified_since(sources, cutoff)?
+    } else {
+        reader.scan_since(sources, period.start)?
+    };
+    let report = report::build_cancellable(cli, tz, &scan, pricer, Utc::now(), stopped)?;
     Ok((scan, report, started.elapsed().as_millis()))
 }
 fn compact_pricing(report: &mut Report) {
@@ -261,13 +275,13 @@ fn run(
     format: Format,
     stopped: Arc<AtomicBool>,
 ) -> Result<()> {
-    let mut reader = Reader::new();
+    let mut reader = Reader::with_cancel(Arc::clone(&stopped));
     let loading = ui::interactive();
     if loading {
-        eprint!("Reading sessions…");
+        eprint!("Reading sessions… Ctrl+C to cancel");
         io::stderr().flush()?;
     }
-    let result = scan_report(cli, tz, sources, &mut reader, pricer);
+    let result = scan_report(cli, tz, sources, &mut reader, pricer, &stopped);
     if loading {
         eprint!("\r\x1b[2K");
         io::stderr().flush()?;
@@ -317,10 +331,12 @@ fn run(
             }
         };
     }
-    let mut tracker = Tracker::new(&scan, &report, !cli.no_cost);
+    let mut tracker = Tracker::with_interval(&scan, &report, !cli.no_cost, cli.interval());
     report.monitor = Some(tracker.info(millis));
+    let collector_stop = Arc::clone(&stopped);
     let mut refresh = || -> Result<Report> {
-        let (scan, mut next, millis) = scan_report(cli, tz, sources, &mut reader, pricer)?;
+        let (scan, mut next, millis) =
+            scan_report(cli, tz, sources, &mut reader, pricer, &collector_stop)?;
         compact_pricing(&mut next);
         strict(cli, &next, true)?;
         tracker.observe(cli, &scan, &mut next, millis);
@@ -331,6 +347,7 @@ fn run(
         ui::run(cli, report, stopped, refresh)?;
         return Ok(());
     }
+    let mut next_refresh = Instant::now() + cli.interval();
     loop {
         let final_frame = stopped.load(Ordering::Relaxed)
             || cli
@@ -351,7 +368,7 @@ fn run(
         if final_frame {
             break;
         }
-        let deadline = Instant::now() + cli.interval();
+        let deadline = next_refresh;
         while Instant::now() < deadline && !stopped.load(Ordering::Relaxed) {
             std::thread::sleep(
                 deadline
@@ -370,7 +387,18 @@ fn run(
             }
             break;
         }
-        report = refresh()?;
+        next_refresh = Instant::now() + cli.interval();
+        match refresh() {
+            Ok(next) => report = next,
+            Err(error) if cancel::is_cancelled(&error) => {
+                // Keep the last complete snapshot; the next loop emits its final marker.
+                if let Some(info) = &mut report.monitor {
+                    info.sequence += 1;
+                }
+                report.generated_at = Utc::now();
+            }
+            Err(error) => return Err(error),
+        }
     }
     Ok(())
 }

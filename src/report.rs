@@ -201,6 +201,11 @@ pub struct MonitorInfo {
     pub final_snapshot: bool,
     pub since_ready_tokens: i128,
     pub since_ready_cost_usd: Option<Decimal>,
+    pub window_tokens: i128,
+    pub window_cost_usd: Option<Decimal>,
+    pub window_cost_partial: bool,
+    pub window_seconds: f64,
+    pub sample_seconds: f64,
     pub output_tokens_per_second: f64,
     pub average_session_output_tokens_per_second: f64,
     pub session_output_tokens_per_second: BTreeMap<String, f64>,
@@ -246,12 +251,35 @@ pub fn build(
     pricer: Option<&Pricer>,
     now: DateTime<Utc>,
 ) -> Result<Report> {
+    build_cancellable(
+        cli,
+        tz,
+        scan,
+        pricer,
+        now,
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+}
+
+pub fn build_cancellable(
+    cli: &Cli,
+    tz: Tz,
+    scan: &Scan,
+    pricer: Option<&Pricer>,
+    now: DateTime<Utc>,
+    stopped: &std::sync::atomic::AtomicBool,
+) -> Result<Report> {
+    crate::cancel::check(stopped)?;
     let period = Period::make(cli, tz, now)?;
     let groups = cli.groups();
     let mut grouped: BTreeMap<Vec<String>, (Row, BTreeSet<String>)> = BTreeMap::new();
     let mut total = Counts::default();
     let mut sessions = BTreeSet::new();
-    for event in scan.events.iter().filter(|e| matches(cli, &period, e)) {
+    for event in &scan.events {
+        crate::cancel::check(stopped)?;
+        if !matches(cli, &period, event) {
+            continue;
+        }
         let dimensions: BTreeMap<String, String> = groups
             .iter()
             .map(|g| match g {
@@ -332,6 +360,7 @@ pub fn build(
             .cmp(&b.dimensions.get("day").or(b.dimensions.get("month")));
         time.then(cmp).then_with(|| a.identity().cmp(&b.identity()))
     });
+    crate::cancel::check(stopped)?;
     Ok(Report {
         schema_version: 1,
         generated_at: now,
