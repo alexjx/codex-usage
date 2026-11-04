@@ -395,7 +395,7 @@ pub fn view(cli: &Cli, report: &Report, style: &Style, width: usize, help: bool)
             "Summary covers the full selection. Cached is part of input; reasoning is part of output. * marks incomplete coverage or assumed estimates; n/a means unavailable.".into(),
             "Speed: newly observed output tokens since the previous snapshot divided by actual elapsed seconds; delayed backlog and corrections are excluded.".into(),
             "Token/cost deltas: changes since the previous snapshot, including corrections and recovered records. The prefix follows --interval (default 2s). Cost uses the known priced subtotal. Idle refreshes show zero; today's summary stays cumulative. Slow collection can extend the actual sample time, available as sample_seconds in JSONL.".into(),
-            "Speed in parentheses: mean output rate per active session over 30s (shorter since startup). Idle sessions drop out. Logs arrive in batches; this is observed throughput, not streaming generation speed. Individual rates are available in JSONL.".into(),
+            "Speed in parentheses: mean output rate per active session over 60s (shorter since startup). Idle sessions drop out. Logs arrive in batches; this is observed throughput, not streaming generation speed. Individual rates are available in JSONL.".into(),
             format!("Unpriced: {} tokens",number(report.totals.unpriced_tokens,cli.exact)),
             format!("Data warnings: {} / Pending: {}",report.coverage.malformed+report.coverage.conflicts+report.coverage.uncertain,report.coverage.pending),
             format!("Pricing assumptions: {}",report.totals.assumed_events)];
@@ -645,7 +645,7 @@ mod regression_tests {
             output_tokens_per_second: 270.0,
             average_session_output_tokens_per_second: 33.0,
             session_output_tokens_per_second: Default::default(),
-            session_speed_window_seconds: 30,
+            session_speed_window_seconds: 60,
             scan_millis: 0,
         });
         let output = linear(&cli, &report, 140, false).join("\n");

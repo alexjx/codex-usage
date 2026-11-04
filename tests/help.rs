@@ -82,7 +82,7 @@ fn every_help_path_has_examples_and_action_specific_options() {
         "1000ms",
         "initial baseline",
         "jsonl when redirected",
-        "30s per-session",
+        "60s per-session",
     ] {
         assert!(monitor.contains(description), "{monitor}");
     }

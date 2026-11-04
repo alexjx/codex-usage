@@ -1072,7 +1072,7 @@ fn monitor_reads_real_appends_and_defers_partial_records_without_counting_histor
     assert!(last["monitor"]["sample_seconds"].as_f64().unwrap() > 0.0);
     assert!(last["monitor"]["window_cost_usd"].is_null());
     let monitor = &last["monitor"];
-    assert_eq!(monitor["session_speed_window_seconds"], 30);
+    assert_eq!(monitor["session_speed_window_seconds"], 60);
     assert!(
         monitor["average_session_output_tokens_per_second"]
             .as_f64()

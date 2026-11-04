@@ -11,6 +11,7 @@ use std::{
 };
 
 const TIMESTAMP_JITTER_SECONDS: i64 = 5;
+const SESSION_SPEED_WINDOW_SECONDS: u64 = 60;
 
 #[derive(Default)]
 /// Rolling output samples used only for the independent per-session average.
@@ -24,7 +25,7 @@ impl Speed {
         }
     }
     pub fn rate(&mut self, now: Duration) -> f64 {
-        self.rate_over(now, Duration::from_secs(30))
+        self.rate_over(now, Duration::from_secs(SESSION_SPEED_WINDOW_SECONDS))
     }
     fn rate_over(&mut self, now: Duration, window: Duration) -> f64 {
         if now >= window {
@@ -152,7 +153,7 @@ impl Tracker {
             output_tokens_per_second: self.activity.output_per_second,
             average_session_output_tokens_per_second,
             session_output_tokens_per_second,
-            session_speed_window_seconds: 30,
+            session_speed_window_seconds: SESSION_SPEED_WINDOW_SECONDS,
             scan_millis,
         }
     }
@@ -544,14 +545,16 @@ mod interval_tests {
     }
 
     #[test]
-    fn session_average_keeps_its_independent_thirty_second_window() {
+    fn session_average_keeps_its_independent_sixty_second_window() {
         let mut s = Speed::default();
         assert_eq!(s.rate(Duration::ZERO), 0.0);
         s.record(Duration::from_secs(1), 600);
         assert_eq!(s.rate(Duration::from_secs(1)), 600.0);
         assert_eq!(s.rate(Duration::from_secs(2)), 300.0);
-        assert_eq!(s.rate(Duration::from_secs(31)), 0.0);
-        assert!(!s.rate(Duration::from_secs(31)).is_sign_negative());
+        assert!(s.rate(Duration::from_secs(31)) > 0.0);
+        assert_eq!(s.rate(Duration::from_secs(60)), 10.0);
+        assert_eq!(s.rate(Duration::from_secs(61)), 0.0);
+        assert!(!s.rate(Duration::from_secs(61)).is_sign_negative());
         let mut tracker = Tracker::new(&Scan::default(), &report("day1", 0, None), false);
         tracker
             .session_speeds
@@ -577,13 +580,19 @@ mod interval_tests {
         );
         assert_eq!(
             tracker
-                .info_at(0, Duration::from_secs(31))
+                .info_at(0, Duration::from_secs(60))
                 .average_session_output_tokens_per_second,
-            20.0
+            7.5
         );
         assert_eq!(
             tracker
-                .info_at(0, Duration::from_secs(40))
+                .info_at(0, Duration::from_secs(61))
+                .average_session_output_tokens_per_second,
+            10.0
+        );
+        assert_eq!(
+            tracker
+                .info_at(0, Duration::from_secs(70))
                 .average_session_output_tokens_per_second,
             0.0
         );

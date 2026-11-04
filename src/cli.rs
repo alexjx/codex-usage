@@ -199,7 +199,7 @@ pub enum Command {
     },
     /// Live summary of today's usage in the selected timezone.
     #[command(
-        after_help = "Examples:\n  codex-usage monitor\n  codex-usage monitor --source wsl --source windows\n  codex-usage monitor --interval 5s\n  codex-usage monitor --format jsonl --frames 5 > live.jsonl\n\nToday's estimate starts at local midnight; its range ends at the latest snapshot.\nThe title shows the timezone. FILTERED marks active model/mode/session/project filters.\nThe activity row follows --interval (default 2s), showing changes since the previous snapshot.\nn/a means unavailable cost; * marks incomplete estimates.\nTerminal output updates in place; redirected output defaults to JSONL.\nq/Ctrl+C quits; Ctrl+C also cancels loading. Totals reset at local midnight.\nCurrent speed uses actual elapsed time; the parentheses show the 30s per-session average."
+        after_help = "Examples:\n  codex-usage monitor\n  codex-usage monitor --source wsl --source windows\n  codex-usage monitor --interval 5s\n  codex-usage monitor --format jsonl --frames 5 > live.jsonl\n\nToday's estimate starts at local midnight; its range ends at the latest snapshot.\nThe title shows the timezone. FILTERED marks active model/mode/session/project filters.\nThe activity row follows --interval (default 2s), showing changes since the previous snapshot.\nn/a means unavailable cost; * marks incomplete estimates.\nTerminal output updates in place; redirected output defaults to JSONL.\nq/Ctrl+C quits; Ctrl+C also cancels loading. Totals reset at local midnight.\nCurrent speed uses actual elapsed time; the parentheses show the 60s per-session average."
     )]
     Monitor {
         /// Refresh cadence, e.g. 2s or 1000ms (1s to 3600s).
