@@ -193,6 +193,7 @@ fn date_label(key: &str, value: &str) -> String {
 }
 pub struct View {
     pub header: Vec<String>,
+    pub chart_anchor: usize,
     pub body: Vec<String>,
     pub footer: Vec<String>,
     pub identities: Vec<(String, usize)>,
@@ -315,11 +316,14 @@ pub fn view(cli: &Cli, report: &Report, style: &Style, width: usize, help: bool)
                 delta.push_str(" / n/a USD");
             }
         }
-        let speed = if m.output_tokens_per_second > 0.0 && m.output_tokens_per_second < 10.0 {
-            format!("{:.1}", m.output_tokens_per_second)
-        } else {
-            format!("{:.0}", m.output_tokens_per_second)
-        };
+        let speed =
+            if !report.sources.is_empty() && report.sources.iter().all(|source| !source.readable) {
+                "n/a".into()
+            } else if m.output_tokens_per_second > 0.0 && m.output_tokens_per_second < 10.0 {
+                format!("{:.1}", m.output_tokens_per_second)
+            } else {
+                format!("{:.0}", m.output_tokens_per_second)
+            };
         delta.push_str(&format!(" / {speed} out tok/s"));
         delta.push_str(&format!(
             " ({:.1} tok/s)",
@@ -327,6 +331,7 @@ pub fn view(cli: &Cli, report: &Report, style: &Style, width: usize, help: bool)
         ));
         text(&mut h, style, "accent", &delta, width);
     }
+    let chart_anchor = h.len();
     let labels = if help {
         vec!["Detail"]
     } else {
@@ -401,6 +406,7 @@ pub fn view(cli: &Cli, report: &Report, style: &Style, width: usize, help: bool)
             format!("Pricing assumptions: {}",report.totals.assumed_events)];
         if cli.monitor() {
             details.push("Monitor range: today's local midnight through the displayed snapshot time, in the title's timezone. Cost includes today's loaded history. Stale sources or partial data can omit usage.".into());
+            details.push("c toggles the output-speed chart. It shows up to 60 chart points, newest on the right; dots mark zero and ? marks unavailable data. The chart starts with recent logged history and continues with 30s rolling aggregate output (including idle time), sampled each refresh; the parenthesized rate averages per session. The chart hides when space is limited.".into());
         }
         if filtered {
             details.push(format!(
@@ -587,6 +593,7 @@ pub fn view(cli: &Cli, report: &Report, style: &Style, width: usize, help: bool)
     }
     View {
         header: h,
+        chart_anchor,
         body: b,
         footer: total_footer,
         identities,
@@ -643,6 +650,8 @@ mod regression_tests {
             sample_seconds: 2.0,
             window_cost_partial: false,
             output_tokens_per_second: 270.0,
+            output_speed_history: Vec::new(),
+            output_speed_window_seconds: 30,
             average_session_output_tokens_per_second: 33.0,
             session_output_tokens_per_second: Default::default(),
             session_speed_window_seconds: 60,

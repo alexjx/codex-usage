@@ -1,4 +1,5 @@
 pub mod cancel;
+pub mod chart;
 pub mod cli;
 pub mod config;
 pub mod export;

@@ -332,6 +332,7 @@ fn run(
         };
     }
     let mut tracker = Tracker::with_interval(&scan, &report, !cli.no_cost, cli.interval());
+    tracker.seed_chart(cli, &scan, &report);
     report.monitor = Some(tracker.info(millis));
     let collector_stop = Arc::clone(&stopped);
     let mut refresh = || -> Result<Report> {

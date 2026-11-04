@@ -207,6 +207,8 @@ pub struct MonitorInfo {
     pub window_seconds: f64,
     pub sample_seconds: f64,
     pub output_tokens_per_second: f64,
+    pub output_speed_history: Vec<Option<f64>>,
+    pub output_speed_window_seconds: u64,
     pub average_session_output_tokens_per_second: f64,
     pub session_output_tokens_per_second: BTreeMap<String, f64>,
     pub session_speed_window_seconds: u64,

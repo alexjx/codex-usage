@@ -12,9 +12,11 @@ use std::{
 
 const TIMESTAMP_JITTER_SECONDS: i64 = 5;
 const SESSION_SPEED_WINDOW_SECONDS: u64 = 60;
+const CHART_SPEED_WINDOW_SECONDS: u64 = 30;
+const SPEED_HISTORY_CAPACITY: usize = 60;
 
 #[derive(Default)]
-/// Rolling output samples used only for the independent per-session average.
+/// Time-weighted output rate over a rolling window, including idle time.
 pub struct Speed {
     samples: VecDeque<(Duration, u64)>,
 }
@@ -71,6 +73,10 @@ pub struct Tracker {
     last_sample: Duration,
     activity: Activity,
     session_speeds: BTreeMap<String, Speed>,
+    chart_speed: Speed,
+    chart_started: Duration,
+    chart_offset: Duration,
+    output_speed_history: VecDeque<Option<f64>>,
 }
 impl Tracker {
     pub fn new(scan: &Scan, report: &Report, pricing_enabled: bool) -> Self {
@@ -108,6 +114,53 @@ impl Tracker {
                 ..Default::default()
             },
             session_speeds: BTreeMap::new(),
+            chart_speed: Speed::default(),
+            chart_started: Duration::ZERO,
+            chart_offset: Duration::ZERO,
+            output_speed_history: VecDeque::new(),
+        }
+    }
+    /// Reconstruct the chart from reconciled records already loaded at startup.
+    /// Historical tokens remain in `seen`, so they cannot become fresh activity.
+    pub fn seed_chart(&mut self, cli: &Cli, scan: &Scan, report: &Report) {
+        let end = report.generated_at;
+        let window = Duration::from_secs(CHART_SPEED_WINDOW_SECONDS);
+        let span = self.interval * (SPEED_HISTORY_CAPACITY as u32 - 1);
+        let earliest = end - chrono::Duration::from_std(span + window).unwrap();
+        let origin = earliest.max(report.period.start.unwrap_or(earliest));
+        let elapsed = (end - origin).to_std().unwrap_or_default();
+        self.chart_offset = elapsed;
+        self.chart_started = Duration::ZERO;
+        self.chart_speed = Speed::default();
+        self.output_speed_history.clear();
+        let mut events: Vec<_> = scan
+            .events
+            .iter()
+            .filter(|e| {
+                e.timestamp >= origin
+                    && e.timestamp <= end
+                    && self.readable.contains(&e.source)
+                    && report::matches(cli, &report.period, e)
+            })
+            .collect();
+        events.sort_unstable_by_key(|e| e.timestamp);
+        let mut events = events.into_iter().peekable();
+        for index in (0..SPEED_HISTORY_CAPACITY as u32).rev() {
+            let Some(point) = elapsed.checked_sub(self.interval * index) else {
+                continue;
+            };
+            let timestamp = origin + chrono::Duration::from_std(point).unwrap();
+            while events.peek().is_some_and(|e| e.timestamp <= timestamp) {
+                let e = events.next().unwrap();
+                self.chart_speed
+                    .record((e.timestamp - origin).to_std().unwrap(), e.usage.output);
+            }
+            self.output_speed_history
+                .push_back(if self.has_sources && self.readable.is_empty() {
+                    None
+                } else {
+                    Some(self.chart_speed.rate_over(point, window))
+                });
         }
     }
     pub fn info(&mut self, scan_millis: u128) -> MonitorInfo {
@@ -151,6 +204,8 @@ impl Tracker {
             window_seconds: self.interval.as_secs_f64(),
             sample_seconds: self.activity.sample_seconds,
             output_tokens_per_second: self.activity.output_per_second,
+            output_speed_history: self.output_speed_history.iter().copied().collect(),
+            output_speed_window_seconds: CHART_SPEED_WINDOW_SECONDS,
             average_session_output_tokens_per_second,
             session_output_tokens_per_second,
             session_speed_window_seconds: SESSION_SPEED_WINDOW_SECONDS,
@@ -223,6 +278,9 @@ impl Tracker {
             self.delta = report.totals.total as i128;
             self.cost_delta = self.cost_delta.map(|_| current);
             self.session_speeds.clear();
+            self.output_speed_history.clear();
+            self.chart_speed = Speed::default();
+            self.chart_started = self.last_sample + self.chart_offset;
         } else {
             self.delta += report.totals.total as i128 - self.previous_total as i128;
             self.cost_delta = self.cost_delta.and_then(|delta| {
@@ -262,6 +320,23 @@ impl Tracker {
         self.previous_period = report.period.label.clone();
         self.last_observed = report.generated_at;
         self.readable = current_readable;
+        let chart_rate = if self.has_sources && self.readable.is_empty() {
+            // Do not average an outage as measured idle time or bridge it on recovery.
+            self.chart_speed = Speed::default();
+            self.chart_started = now + self.chart_offset;
+            None
+        } else {
+            let elapsed = (now + self.chart_offset).saturating_sub(self.chart_started);
+            self.chart_speed.record(elapsed, output);
+            Some(
+                self.chart_speed
+                    .rate_over(elapsed, Duration::from_secs(CHART_SPEED_WINDOW_SECONDS)),
+            )
+        };
+        self.output_speed_history.push_back(chart_rate);
+        while self.output_speed_history.len() > SPEED_HISTORY_CAPACITY {
+            self.output_speed_history.pop_front();
+        }
         self.sequence += 1;
         report.monitor = Some(self.info_at(scan_millis, now));
         if late > 0 {
@@ -341,6 +416,7 @@ mod interval_tests {
             assert_eq!(startup.sample_seconds, 0.0);
             assert_eq!(startup.window_tokens, 0);
             assert_eq!(startup.output_tokens_per_second, 0.0);
+            assert!(startup.output_speed_history.is_empty());
             let mut first = counts("day1", 100, 100, 0, Some(Decimal::new(1, 2)));
             first.generated_at =
                 baseline.generated_at + chrono::Duration::from_std(actual).unwrap();
@@ -378,7 +454,247 @@ mod interval_tests {
             assert!(info.average_session_output_tokens_per_second > 0.0);
             assert_eq!(info.since_ready_tokens, 140);
             assert_eq!(info.since_ready_cost_usd, Some(Decimal::new(14, 3)));
+            assert_eq!(
+                info.output_speed_history.len(),
+                3,
+                "history counts observations, not seconds: {value}"
+            );
+            assert_eq!(
+                info.output_speed_history[2],
+                Some(120.0 / (actual * 3).as_secs_f64())
+            );
         }
+    }
+
+    #[test]
+    fn historical_chart_uses_filtered_windows_and_continues_without_recounting() {
+        let cli = Cli::parse_from(["codex-usage", "monitor", "--model", "test"]);
+        let mut scan = scan(true);
+        let mut r = report("day1", 0, None);
+        r.generated_at = "2026-11-04T12:00:00Z".parse().unwrap();
+        r.period.start = Some("2026-11-04T00:00:00Z".parse().unwrap());
+        let base = r.generated_at;
+        for (second, output) in [
+            (-149, 6000),
+            (-148, 6000),
+            (-120, 120),
+            (-30, 300),
+            (-10, 60),
+            (1, 9000),
+        ] {
+            scan.events.push(event(
+                &second.to_string(),
+                output,
+                base + chrono::Duration::seconds(second),
+            ));
+        }
+        let mut excluded = event("other-model", 9000, base);
+        excluded.model = "other".into();
+        scan.events.push(excluded);
+        scan.events.reverse(); // Logs and sources need not arrive in timestamp order.
+        let mut tracker = Tracker::new(&scan, &r, false);
+        tracker.seed_chart(&cli, &scan, &r);
+        let info = tracker.info_at(0, Duration::ZERO);
+        assert_eq!(info.output_speed_history.len(), 60);
+        assert_eq!(info.output_speed_history.first(), Some(&Some(4.0)));
+        assert_eq!(info.output_speed_history.last(), Some(&Some(2.0)));
+        assert_eq!(info.window_tokens, 0);
+        assert_eq!(info.output_tokens_per_second, 0.0);
+        assert_eq!(info.average_session_output_tokens_per_second, 0.0);
+        for (second, expected) in [(2, 3.0), (20, 1.0), (32, 0.0)] {
+            r.generated_at = base + chrono::Duration::seconds(second);
+            if second == 2 {
+                scan.events.push(event("live", 30, r.generated_at));
+                r.totals.total = 40;
+            }
+            tracker.observe_at(&cli, &scan, &mut r, 0, Duration::from_secs(second as u64));
+            let info = r.monitor.as_ref().unwrap();
+            assert_eq!(info.output_speed_history.len(), 60);
+            assert_eq!(info.output_speed_history.last(), Some(&Some(expected)));
+            assert_eq!(info.since_ready_tokens, 40);
+            if second == 2 {
+                assert_eq!(info.output_tokens_per_second, 15.0);
+            }
+        }
+        r.period.label = "day2".into();
+        r.generated_at = base + chrono::Duration::seconds(34);
+        scan.events.push(event("new-day", 20, r.generated_at));
+        tracker.observe_at(&cli, &scan, &mut r, 0, Duration::from_secs(34));
+        assert_eq!(
+            r.monitor.as_ref().unwrap().output_speed_history,
+            vec![Some(10.0)]
+        );
+    }
+
+    #[test]
+    fn historical_chart_stops_at_local_midnight_and_marks_unreadable_sources() {
+        let cli = cli("2s");
+        let mut scan = scan(true);
+        let mut r = report("day1", 0, None);
+        // Local midnight for Asia/Shanghai is the previous UTC date at16:00.
+        let midnight: chrono::DateTime<Utc> = "2026-11-03T16:00:00Z".parse().unwrap();
+        r.period.start = Some(midnight);
+        r.generated_at = midnight + chrono::Duration::seconds(5);
+        for (second, output) in [(-1, 9999), (0, 100), (3, 30)] {
+            scan.events.push(event(
+                &second.to_string(),
+                output,
+                midnight + chrono::Duration::seconds(second),
+            ));
+        }
+        let mut tracker = Tracker::new(&scan, &r, false);
+        tracker.seed_chart(&cli, &scan, &r);
+        assert_eq!(
+            tracker.info_at(0, Duration::ZERO).output_speed_history,
+            vec![Some(100.0), Some(130.0 / 3.0), Some(26.0)]
+        );
+        scan.sources[0].readable = false;
+        let mut tracker = Tracker::new(&scan, &r, false);
+        tracker.seed_chart(&cli, &scan, &r);
+        assert_eq!(
+            tracker.info_at(0, Duration::ZERO).output_speed_history,
+            vec![None; 3]
+        );
+        scan.sources[0].readable = true;
+        scan.events.clear();
+        let mut tracker = Tracker::new(&scan, &r, false);
+        tracker.seed_chart(&cli, &scan, &r);
+        assert_eq!(
+            tracker.info_at(0, Duration::ZERO).output_speed_history,
+            vec![Some(0.0); 3]
+        );
+    }
+
+    #[test]
+    fn chart_smooths_parallel_bursts_and_expires_at_thirty_seconds_independently_of_sessions() {
+        let mut scan = scan(true);
+        let mut r = report("day1", 0, None);
+        let base = r.generated_at;
+        let mut tracker = Tracker::new(&scan, &r, false);
+        for (second, outputs, expected) in [
+            (2, vec![120, 60], 90.0),
+            (4, vec![], 45.0),
+            (10, vec![120], 30.0),
+            (30, vec![], 10.0),
+            (31, vec![], 10.0),
+            (32, vec![], 4.0),
+            (39, vec![], 4.0),
+            (40, vec![], 0.0),
+        ] {
+            r.generated_at = base + chrono::Duration::seconds(second);
+            for (index, tokens) in outputs.iter().enumerate() {
+                let mut e = event(&format!("{second}-{index}"), *tokens, r.generated_at);
+                e.session = format!("session-{index}");
+                scan.events.push(e);
+            }
+            tracker.observe_at(
+                &cli("2s"),
+                &scan,
+                &mut r,
+                0,
+                Duration::from_secs(second as u64),
+            );
+            let info = r.monitor.as_ref().unwrap();
+            assert_eq!(
+                info.output_speed_history.last(),
+                Some(&Some(expected)),
+                "at {second}s"
+            );
+            if outputs.is_empty() {
+                assert_eq!(
+                    info.output_tokens_per_second, 0.0,
+                    "raw rate stays immediate"
+                );
+            }
+            if second == 2 {
+                assert_eq!(info.average_session_output_tokens_per_second, 45.0);
+            }
+            assert_eq!(info.output_speed_window_seconds, 30);
+            assert_eq!(info.session_speed_window_seconds, 60);
+            if second == 40 {
+                assert!(info.average_session_output_tokens_per_second > 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn speed_history_records_refreshes_idle_and_unavailable_gaps_but_not_info_calls() {
+        let mut scan = scan(true);
+        let mut r = report("day1", 0, None);
+        let base = r.generated_at;
+        let mut tracker = Tracker::new(&scan, &r, false);
+        assert!(tracker.info(0).output_speed_history.is_empty());
+        r.generated_at = base + chrono::Duration::seconds(2);
+        scan.events.push(event("fresh", 40, r.generated_at));
+        r.totals.total = 50;
+        tracker.observe_at(&cli("2s"), &scan, &mut r, 0, Duration::from_secs(2));
+        assert_eq!(
+            r.monitor.as_ref().unwrap().output_speed_history,
+            vec![Some(20.0)]
+        );
+        r.generated_at = base + chrono::Duration::seconds(4);
+        tracker.observe_at(&cli("2s"), &scan, &mut r, 0, Duration::from_secs(4));
+        assert_eq!(
+            r.monitor.as_ref().unwrap().output_speed_history,
+            vec![Some(20.0), Some(10.0)]
+        );
+        scan.sources[0].readable = false;
+        r.generated_at = base + chrono::Duration::seconds(6);
+        tracker.observe_at(&cli("2s"), &scan, &mut r, 0, Duration::from_secs(6));
+        assert_eq!(
+            r.monitor.as_ref().unwrap().output_speed_history,
+            vec![Some(20.0), Some(10.0), None]
+        );
+        scan.sources[0].readable = true;
+        r.generated_at = base + chrono::Duration::seconds(8);
+        scan.events.push(event("recovered", 30, r.generated_at));
+        r.totals.total += 40;
+        tracker.observe_at(&cli("2s"), &scan, &mut r, 0, Duration::from_secs(8));
+        let expected = vec![Some(20.0), Some(10.0), None, Some(0.0)];
+        assert_eq!(r.monitor.as_ref().unwrap().output_speed_history, expected);
+        // Reading metadata/finalizing an already completed frame must not invent points.
+        for second in [8, 9, 30] {
+            assert_eq!(
+                tracker
+                    .info_at(0, Duration::from_secs(second))
+                    .output_speed_history,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn speed_history_truncates_oldest_points_and_resets_before_new_day_point() {
+        let mut scan = scan(true);
+        let mut r = report("day1", 0, None);
+        let base = r.generated_at;
+        let mut tracker = Tracker::new(&scan, &r, false);
+        for second in 1..=65 {
+            r.generated_at = base + chrono::Duration::seconds(second);
+            scan.events
+                .push(event(&format!("r-{second}"), second as u64, r.generated_at));
+            r.totals.total += 10 + second as u64;
+            tracker.observe_at(
+                &cli("1s"),
+                &scan,
+                &mut r,
+                0,
+                Duration::from_secs(second as u64),
+            );
+        }
+        let history = &r.monitor.as_ref().unwrap().output_speed_history;
+        assert_eq!(history.len(), SPEED_HISTORY_CAPACITY);
+        assert_eq!(history.first(), Some(&Some(3.5)));
+        assert_eq!(history.last(), Some(&Some(50.5)));
+        let mut next_day = report("day2", 30, None);
+        next_day.generated_at = base + chrono::Duration::seconds(66);
+        scan.events
+            .push(event("new-day", 20, next_day.generated_at));
+        tracker.observe_at(&cli("1s"), &scan, &mut next_day, 0, Duration::from_secs(66));
+        assert_eq!(
+            next_day.monitor.as_ref().unwrap().output_speed_history,
+            vec![Some(20.0)]
+        );
     }
 
     #[test]

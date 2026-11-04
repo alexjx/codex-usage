@@ -57,12 +57,22 @@ fn text(lines: &mut Vec<String>, style: &Style, value: &str, width: usize) {
             .map(|s| style.paint("meta", s)),
     );
 }
-fn nav(style: &Style, width: usize, a: usize, b: usize, total: usize) -> Vec<String> {
+fn nav(
+    style: &Style,
+    width: usize,
+    a: usize,
+    b: usize,
+    total: usize,
+    chart_control: bool,
+) -> Vec<String> {
     let mut v = Vec::new();
     text(
         &mut v,
         style,
-        &format!("{a}-{b}/{total}  q Quit  ? Help"),
+        &format!(
+            "{a}-{b}/{total}{}  q Quit  ? Help",
+            if chart_control { "  c Chart" } else { "" }
+        ),
         width,
     );
     v
@@ -118,6 +128,7 @@ where
         let guard = Screen::enter()?;
         let mut offset = 0usize;
         let mut help = false;
+        let mut show_chart = cli.monitor();
         let mut saved_offset = 0;
         let mut previous: Vec<String> = Vec::new();
         let mut old_identities: Vec<(String, usize)> = Vec::new();
@@ -140,7 +151,7 @@ where
                 reanchor = true;
             }
             let (width, height) = size();
-            let v = render::view(cli, &report, &style, width, help);
+            let mut v = render::view(cli, &report, &style, width, help);
             // Preserve the top logical identity through reflow or report reordering.
             let anchor = old_identities
                 .iter()
@@ -156,14 +167,51 @@ where
             }
             old_width = width;
             reanchor = false;
-            let reserve_nav = nav(&style, width, v.body.len(), v.body.len(), v.body.len());
-            let footer_size = v.footer.len() + reserve_nav.len();
+            let mut reserve_nav = nav(
+                &style,
+                width,
+                v.body.len(),
+                v.body.len(),
+                v.body.len(),
+                cli.monitor(),
+            );
+            let mut footer_size = v.footer.len() + reserve_nav.len();
             let date_rows = v
                 .sections
                 .iter()
                 .map(|(label, _)| render::wrap(label, width).len())
                 .max()
                 .unwrap_or(0);
+            let room = height.saturating_sub(v.header.len() + footer_size + date_rows);
+            let chart_available = cli.monitor() && !help && width >= 32 && room >= 9;
+            if !chart_available && cli.monitor() {
+                reserve_nav = nav(
+                    &style,
+                    width,
+                    v.body.len(),
+                    v.body.len(),
+                    v.body.len(),
+                    false,
+                );
+                footer_size = v.footer.len() + reserve_nav.len();
+            }
+            if show_chart && chart_available {
+                if let Some(info) = &report.monitor {
+                    let chart = crate::chart::speed_history(
+                        info,
+                        &style,
+                        width,
+                        (room - 7).clamp(2, 4),
+                        cli.ascii,
+                    );
+                    if !chart.is_empty() {
+                        v.header.splice(
+                            v.chart_anchor..v.chart_anchor,
+                            std::iter::once(String::new()).chain(chart),
+                        );
+                    }
+                }
+            }
             let chrome = v.header.len() + footer_size + date_rows;
             let page = height.saturating_sub(chrome).max(1);
             offset = offset.min(v.body.len().saturating_sub(page));
@@ -198,6 +246,7 @@ where
                     offset + 1,
                     (offset + page).min(v.body.len()),
                     v.body.len(),
+                    chart_available,
                 );
                 while navigation.len() < reserve_nav.len() {
                     navigation.push(String::new());
@@ -244,6 +293,14 @@ where
                         KeyCode::Char('q') | KeyCode::Esc => break,
                         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             break
+                        }
+                        KeyCode::Char('c') if chart_available => {
+                            if offset.saturating_add(page) >= v.body.len() {
+                                offset = usize::MAX;
+                            }
+                            show_chart = !show_chart;
+                            previous.clear();
+                            reanchor = true;
                         }
                         KeyCode::Char('?') => {
                             help = !help;

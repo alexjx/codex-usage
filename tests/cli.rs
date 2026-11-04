@@ -970,10 +970,21 @@ fn monitor_activity_label_and_metadata_follow_the_configured_interval() {
             if format == "table" {
                 let text = String::from_utf8(output.stdout).unwrap();
                 assert!(text.contains(&format!("{label} +0 tokens")), "{text}");
+                assert!(
+                    !text.contains("Output tok/s"),
+                    "Linear snapshots should not contain a fullscreen chart"
+                );
             } else {
                 let report: Value = serde_json::from_slice(&output.stdout).unwrap();
                 assert_eq!(report["monitor"]["window_seconds"], seconds);
                 assert_eq!(report["monitor"]["sample_seconds"], 0.0);
+                assert_eq!(
+                    report["monitor"]["output_speed_history"]
+                        .as_array()
+                        .unwrap()
+                        .len(),
+                    60
+                );
             }
         }
     }
@@ -1023,6 +1034,13 @@ fn monitor_reads_real_appends_and_defers_partial_records_without_counting_histor
     assert_eq!(baseline["totals"]["total"], 130);
     assert_eq!(baseline["monitor"]["output_tokens_per_second"], 0.0);
     assert_eq!(
+        baseline["monitor"]["output_speed_history"]
+            .as_array()
+            .unwrap()
+            .len(),
+        60
+    );
+    assert_eq!(
         baseline["monitor"]["average_session_output_tokens_per_second"],
         0.0
     );
@@ -1071,6 +1089,12 @@ fn monitor_reads_real_appends_and_defers_partial_records_without_counting_histor
     assert_eq!(last["monitor"]["window_seconds"], 1.0);
     assert!(last["monitor"]["sample_seconds"].as_f64().unwrap() > 0.0);
     assert!(last["monitor"]["window_cost_usd"].is_null());
+    let history = last["monitor"]["output_speed_history"].as_array().unwrap();
+    assert_eq!(history.len(), 60);
+    // The chart includes the historical 30 output tokens plus the fresh 5;
+    // live activity still counts only the fresh record.
+    assert!((history.last().unwrap().as_f64().unwrap() - 35.0 / 30.0).abs() < 1e-9);
+    assert_eq!(last["monitor"]["output_speed_window_seconds"], 30);
     let monitor = &last["monitor"];
     assert_eq!(monitor["session_speed_window_seconds"], 60);
     assert!(
