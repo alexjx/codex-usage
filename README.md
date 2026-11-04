@@ -144,7 +144,7 @@ codex-usage monitor --interval 5s
 codex-usage monitor --session SESSION_ID
 ```
 
-Monitor always summarizes **today**, in the selected timezone. The screen places today's summary and live rates at the top, a speed chart below, then the model table. The full-selection total and controls stay at the bottom. The chart shrinks or hides on small terminals; scrolling does not pause updates.
+Monitor always summarizes **today**, in the selected timezone. The screen places today's summary and live rates at the top, a speed chart below, then the model table. The full-selection total and controls stay at the bottom. History bars expand across the available width, and chart height grows with terminal space. The chart shrinks or hides on small terminals; scrolling does not pause updates.
 
 | Indicator | What it measures |
 | --- | --- |

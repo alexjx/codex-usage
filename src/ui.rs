@@ -201,7 +201,7 @@ where
                         info,
                         &style,
                         width,
-                        (room - 7).clamp(2, 4),
+                        (room / 3).clamp(2, 18).min(room - 7),
                         cli.ascii,
                     );
                     if !chart.is_empty() {

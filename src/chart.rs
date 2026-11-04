@@ -17,8 +17,8 @@ fn label(rate: f64) -> String {
     }
 }
 
-/// Each column is one historical or live chart point, newest at the right; narrow charts
-/// retain the newest points rather than dropping spikes through downsampling.
+/// Spread historical/live points across the plot without inventing intermediate
+/// values. Narrow charts retain the newest points rather than dropping spikes.
 pub fn speed_history(
     info: &MonitorInfo,
     style: &Style,
@@ -62,8 +62,9 @@ pub fn speed_history(
     for row in 0..rows {
         let tick = label(scale * ((rows - row) as f64 / rows as f64));
         let mut line = style.paint("meta", format!("{tick:>axis_width$}  "));
-        line.push_str(&" ".repeat(plot_width - count));
-        for (index, sample) in samples.iter().enumerate() {
+        for column in 0..if count == 0 { 0 } else { plot_width } {
+            let index = column * count / plot_width;
+            let sample = samples[index];
             let rate = sample.filter(|v| v.is_finite() && *v >= 0.0);
             let glyph = if let Some(rate) = rate {
                 let units = ((rate / scale * rows as f64 * 8.0).round() as usize)
@@ -140,10 +141,10 @@ mod tests {
     #[test]
     fn bars_show_order_scale_zero_and_missing_data_without_fabricating_history() {
         let (info, style) = fixture(vec![Some(0.0), Some(5.0), Some(10.0), None]);
-        let lines = speed_history(&info, &style, 60, 4, false);
+        let lines = speed_history(&info, &style, 33, 4, false);
         assert_eq!(lines.len(), 6);
         assert!(lines[0].contains("30s avg") && lines[0].contains("peak 10"));
-        assert!(lines[4].ends_with("·██?"), "{lines:?}");
+        assert!(lines[4].ends_with("······████████████??????"), "{lines:?}");
         assert!(lines[5].contains("4 points") && lines[5].ends_with("latest"));
         let (empty, style) = fixture(Vec::new());
         let output = speed_history(&empty, &style, 60, 4, false).join("\n");
@@ -155,12 +156,14 @@ mod tests {
     fn narrow_charts_keep_recent_samples_and_fit_all_scales_and_ascii_modes() {
         let (mut info, style) = fixture(vec![Some(1000.0); 60]);
         info.output_speed_history[59] = Some(1.0);
-        for width in [32, 40, 80, 140] {
+        for width in [32, 40, 80, 140, 260] {
             for rows in [2, 4, 8] {
                 for ascii in [false, true] {
                     let lines = speed_history(&info, &style, width, rows, ascii);
                     assert!(lines.iter().all(|line| line.width() <= width), "{lines:?}");
                     assert!(lines[0].contains("Output tok/s"));
+                    assert_eq!(lines[1].chars().nth(9), Some(if ascii { '#' } else { '█' }));
+                    assert_eq!(lines[rows].width(), width, "history must fill the plot");
                     if ascii {
                         assert!(lines.iter().all(|line| line.is_ascii()));
                     }
@@ -183,9 +186,9 @@ mod tests {
             Some(f64::MIN_POSITIVE),
             Some(f64::MAX),
         ]);
-        let lines = speed_history(&info, &style, 60, 4, false);
+        let lines = speed_history(&info, &style, 33, 4, false);
         assert!(lines.iter().all(|line| line.width() <= 60));
-        assert!(lines[4].ends_with("??▁█"), "{lines:?}");
+        assert!(lines[4].ends_with("????????????▁▁▁▁▁▁██████"), "{lines:?}");
         assert!(!lines.join("\n").contains("NaN"));
     }
 }
