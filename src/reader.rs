@@ -11,7 +11,10 @@ use std::{
     fs::{self, File, Metadata},
     io::{BufRead, BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
-    sync::{atomic::AtomicBool, Arc},
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    },
     time::{Duration, Instant, SystemTime},
 };
 use walkdir::WalkDir;
@@ -259,31 +262,47 @@ impl Reader {
         since: Option<DateTime<Utc>>,
     ) -> Result<SourceSnapshot> {
         let paths = discover(&source.root, &self.stopped)?;
-        let mut snapshot = SourceSnapshot::default();
-        let mut present = BTreeSet::new();
+        // Inspect first, then parse only changed files in parallel. Unchanged monitor
+        // refreshes do not start workers, and each file retains its own ordered parser.
+        let mut inspected = Vec::with_capacity(paths.len());
+        let mut jobs = Vec::new();
         for path in paths {
             cancel::check(&self.stopped)?;
-            let key = (source.name.clone(), path.clone());
-            present.insert(key.clone());
+            let key = (source.name.clone(), path);
             let loaded = (|| -> Result<bool> {
-                let metadata = fs::metadata(&path)
-                    .with_context(|| format!("Cannot inspect {}", path.display()))?;
+                let metadata = fs::metadata(&key.1)
+                    .with_context(|| format!("Cannot inspect {}", key.1.display()))?;
                 if !eligible_modified(metadata.modified().ok(), since) {
                     return Ok(false);
                 }
                 let old = self.files.get(&key);
-                let changed = old.is_none_or(|cached| {
+                if old.is_none_or(|cached| {
                     cached.len != metadata.len()
                         || cached.modified != metadata.modified().ok()
                         || cached.identity != identity(&metadata)
-                });
-                if changed {
-                    let parsed = parse_cached(&path, &metadata, old, &self.stopped)?;
-                    self.files.insert(key.clone(), parsed);
-                    self.background_errors.remove(&key);
+                }) {
+                    jobs.push((inspected.len(), key.1.clone(), metadata, old));
                 }
                 Ok(true)
             })();
+            inspected.push((key, loaded));
+        }
+        let parsed = parse_files(&jobs, &self.stopped)?;
+        for (index, result) in parsed {
+            match result {
+                Ok(parsed) => {
+                    let key = &inspected[index].0;
+                    self.files.insert(key.clone(), parsed);
+                    self.background_errors.remove(key);
+                }
+                Err(error) => inspected[index].1 = Err(error),
+            }
+        }
+        let mut snapshot = SourceSnapshot::default();
+        let mut present = BTreeSet::new();
+        for (key, loaded) in inspected {
+            cancel::check(&self.stopped)?;
+            present.insert(key.clone());
             if matches!(loaded, Ok(false)) {
                 present.remove(&key);
                 continue;
@@ -355,6 +374,49 @@ impl Reader {
         cancel::check(&self.stopped)?;
         Ok(snapshot)
     }
+}
+
+type ParseJob<'a> = (usize, PathBuf, Metadata, Option<&'a CachedFile>);
+type ParsedFile = (usize, Result<CachedFile>);
+
+fn parse_files(jobs: &[ParseJob<'_>], stopped: &Arc<AtomicBool>) -> Result<Vec<ParsedFile>> {
+    // Bound both disk pressure and peak memory from large rollout records.
+    let workers = std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(8)
+        .min(jobs.len());
+    let parse = |(index, path, metadata, old): &ParseJob<'_>| {
+        (*index, parse_cached(path, metadata, *old, stopped))
+    };
+    if workers <= 1 {
+        return Ok(jobs.iter().map(parse).collect());
+    }
+    let next = AtomicUsize::new(0);
+    let results = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut results = Vec::new();
+                    while !stopped.load(Ordering::Relaxed) {
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(job) = jobs.get(index) else { break };
+                        results.push(parse(job));
+                    }
+                    results
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("Session loading worker failed"))
+            })
+            .collect::<Result<Vec<_>>>()
+    })?;
+    cancel::check(stopped)?;
+    Ok(results.into_iter().flatten().collect())
 }
 
 fn eligible_modified(modified: Option<SystemTime>, since: Option<DateTime<Utc>>) -> bool {
@@ -2384,6 +2446,84 @@ mod tests {
         assert_eq!(scan.events.len(), 1);
         assert!(scan.sources[0].readable);
         assert_eq!(scan.coverage.uncertain, 1);
+    }
+
+    #[test]
+    fn parallel_loading_matches_serial_for_mixed_files_and_incremental_updates() {
+        let dir = TempDir::new().unwrap();
+        for index in 0..24 {
+            let records = [
+                metadata(&format!("s{index}")),
+                turn("t", "alpha"),
+                direct(
+                    &format!("r{index}"),
+                    &format!("s{index}"),
+                    "t",
+                    10,
+                    1,
+                    10,
+                    1,
+                ),
+            ];
+            if index % 2 == 0 {
+                write(&dir.path().join(format!("{index:02}.jsonl")), &records);
+            } else {
+                let data = records.iter().map(|v| format!("{v}\n")).collect::<String>();
+                fs::write(
+                    dir.path().join(format!("{index:02}.jsonl.zst")),
+                    zstd::encode_all(data.as_bytes(), 1).unwrap(),
+                )
+                .unwrap();
+            }
+        }
+        fs::copy(dir.path().join("00.jsonl"), dir.path().join("copy.jsonl")).unwrap();
+        fs::write(dir.path().join("bad.jsonl.zst"), b"invalid archive").unwrap();
+        let sources = [source(dir.path(), "local")];
+        let mut parallel = Reader::new();
+        for updated in [false, true] {
+            if updated {
+                for index in (0..24).step_by(2) {
+                    let mut file = fs::OpenOptions::new()
+                        .append(true)
+                        .open(dir.path().join(format!("{index:02}.jsonl")))
+                        .unwrap();
+                    writeln!(
+                        file,
+                        "{}",
+                        direct(
+                            &format!("next{index}"),
+                            &format!("s{index}"),
+                            "t",
+                            20,
+                            2,
+                            30,
+                            3
+                        )
+                    )
+                    .unwrap();
+                    write!(file, "{{\"type\":").unwrap();
+                }
+                fs::remove_file(dir.path().join("01.jsonl.zst")).unwrap();
+            }
+            // Seed the reference cache one file at a time, bypassing the worker loader.
+            let mut serial = Reader::new();
+            for path in discover(dir.path(), &serial.stopped).unwrap() {
+                let metadata = fs::metadata(&path).unwrap();
+                if let Ok(parsed) = parse_cached(&path, &metadata, None, &serial.stopped) {
+                    serial.files.insert(("local".into(), path), parsed);
+                }
+            }
+            let expected = serial.scan(&sources).unwrap();
+            let actual = parallel.scan(&sources).unwrap();
+            assert_eq!(actual.events, expected.events);
+            assert_eq!(actual.events.len(), if updated { 35 } else { 24 });
+            assert_eq!(
+                serde_json::to_value(&actual.coverage).unwrap(),
+                serde_json::to_value(&expected.coverage).unwrap()
+            );
+            assert_eq!(actual.coverage.pending, if updated { 12 } else { 0 });
+            assert_eq!(actual.coverage.uncertain, 1);
+        }
     }
 
     #[test]
