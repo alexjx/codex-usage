@@ -95,6 +95,81 @@ pub fn money(n: Option<Decimal>) -> String {
         ),
     }
 }
+fn quota_lines(cli: &Cli, report: &Report, sep: &str) -> Vec<(bool, String)> {
+    let tz = report
+        .period
+        .timezone
+        .parse::<chrono_tz::Tz>()
+        .unwrap_or(chrono_tz::UTC);
+    let date = |time: chrono::DateTime<chrono::Utc>| {
+        time.with_timezone(&tz).format("%m-%d %H:%M").to_string()
+    };
+    // Share display headings only. Sources retain their own values and forecasts.
+    let mut groups = std::collections::BTreeMap::new();
+    for quota in &report.quotas {
+        groups
+            .entry((
+                quota.limit_id.as_str(),
+                quota.window_minutes,
+                quota.next_reset.timestamp().div_euclid(60),
+            ))
+            .or_insert_with(Vec::new)
+            .push(quota);
+    }
+    groups
+        .into_iter()
+        .map(|((limit, minutes, _), quotas)| {
+            let reset = date(quotas[0].next_reset);
+            let window = if minutes.is_multiple_of(1440) {
+                format!("{}d", minutes / 1440)
+            } else if minutes.is_multiple_of(60) {
+                format!("{}h", minutes / 60)
+            } else {
+                format!("{minutes}m")
+            };
+            let label = if limit == "codex" {
+                window
+            } else {
+                format!("{limit}/{window}")
+            };
+            let expired = quotas.iter().all(|q| q.next_reset <= report.generated_at);
+            let estimated = quotas.iter().any(|q| q.status != "current");
+            let mut line = if expired {
+                format!("Quota {label}{sep}reset unavailable")
+            } else {
+                format!(
+                    "Quota {label}{sep}reset {}{reset}",
+                    if estimated { "~" } else { "" }
+                )
+            };
+            let mut warning = expired;
+            for quota in &quotas {
+                // Status diagnostics belong in help/JSON, not the main screen.
+                if quota.status != "current" || quota.remaining_tokens.is_none() {
+                    continue;
+                }
+                let source = if quotas.iter().filter(|q| q.source == quota.source).count() > 1 {
+                    format!("{}/{}", quota.source, quota.bucket)
+                } else {
+                    quota.source.clone()
+                };
+                warning |= quota.used_percent >= 90.0;
+                let percentage = format!("{:.1}", quota.used_percent);
+                let percentage = percentage.strip_suffix(".0").unwrap_or(&percentage);
+                line.push_str(&format!("{sep}{source} {percentage}%"));
+                if let Some(tokens) = quota.remaining_tokens {
+                    line.push_str(&format!(" ~{} tok left", number(tokens, cli.exact)));
+                }
+                if let Some(time) = quota.exhausts_at {
+                    line.push_str(&format!(" (exhaust ~{})", date(time)));
+                } else if quota.forecast_status == "resets_first" {
+                    line.push_str(" (resets first)");
+                }
+            }
+            (warning, line)
+        })
+        .collect()
+}
 pub fn wrap(text: &str, width: usize) -> Vec<String> {
     let mut out = Vec::new();
     let mut line = String::new();
@@ -308,6 +383,23 @@ pub fn view(cli: &Cli, report: &Report, style: &Style, width: usize, help: bool)
     } else {
         report.totals.cost_usd
     };
+    let tz = report
+        .period
+        .timezone
+        .parse::<chrono_tz::Tz>()
+        .unwrap_or(chrono_tz::UTC);
+    let period_label = match (report.period.start, report.period.basis.as_str()) {
+        (Some(start), "last_reset_observed" | "last_reset_estimated") => format!(
+            "Since reset {}{}",
+            if report.period.basis == "last_reset_estimated" {
+                "~"
+            } else {
+                ""
+            },
+            start.with_timezone(&tz).format("%m-%d %H:%M")
+        ),
+        _ => report.period.label.clone(),
+    };
     text(
         &mut h,
         style,
@@ -317,7 +409,7 @@ pub fn view(cli: &Cli, report: &Report, style: &Style, width: usize, help: bool)
             report.kind,
             if cli.monitor() { " LIVE" } else { "" },
             if filtered { " FILTERED" } else { "" },
-            report.period.label,
+            period_label,
             report.period.timezone
         ),
         width,
@@ -387,6 +479,19 @@ pub fn view(cli: &Cli, report: &Report, style: &Style, width: usize, help: bool)
         ));
     }
     text(&mut h, style, "cost", &summary, width);
+    if report.period.basis.starts_with("last_7_days_") {
+        text(
+            &mut h,
+            style,
+            "meta",
+            &if report.period.basis == "last_7_days_conflicting_resets" {
+                format!("Last 7 days{sep}quota resets differ by source")
+            } else {
+                format!("Last 7 days{sep}quota reset unavailable")
+            },
+            width,
+        );
+    }
     if let Some(m) = &report.monitor {
         let mut delta = format!("{}s: {:+} tokens", m.window_seconds, m.window_tokens);
         if !cli.no_cost {
@@ -418,6 +523,15 @@ pub fn view(cli: &Cli, report: &Report, style: &Style, width: usize, help: bool)
             m.average_session_output_tokens_per_second
         ));
         text(&mut h, style, "accent", &delta, width);
+    }
+    for (warning, line) in quota_lines(cli, report, sep) {
+        text(
+            &mut h,
+            style,
+            if warning { "warn" } else { "meta" },
+            &line,
+            width,
+        );
     }
     let chart_anchor = h.len();
     let labels = if help {
@@ -507,6 +621,11 @@ pub fn view(cli: &Cli, report: &Report, style: &Style, width: usize, help: bool)
             format!("Unpriced: {} tokens",number(report.totals.unpriced_tokens,cli.exact)),
             format!("Data warnings: {} / Pending: {}",report.coverage.malformed+report.coverage.conflicts+report.coverage.uncertain,report.coverage.pending),
             format!("Pricing assumptions: {}",report.totals.assumed_events)];
+        details.push("Daily defaults to the most recent reset (including short-term quotas) found in already loaded logs. ~ marks an inferred reset; unavailable, expired, or conflicting reset data falls back to seven days. Explicit dates override this. File discovery is never expanded for quotas.".into());
+        for quota in &report.quotas {
+            details.push(format!("Quota {}/{}/{}: {}% used; reset {}; updated {}; forecast {} (input+output tokens).", quota.source, quota.limit_id, quota.bucket, quota.used_percent, quota.next_reset.with_timezone(&tz).to_rfc3339(), quota.observed_at.with_timezone(&tz).to_rfc3339(), quota.forecast_status));
+        }
+        details.push("Quota forecasts cover each source's locally observed workload, independently of report filters. ~ tokens left means estimated input+output tokens, not an entitlement. Forecasts use up to 60 minutes of quota changes, require at least 2 minutes and 2 percentage points, and stop after 5 minutes without an update or when data/mix is unreliable. Usage elsewhere may consume quota without appearing in these logs. Sources are kept separate because logs do not identify the account.".into());
         if matches!(cli.command, Some(crate::cli::Command::Sessions)) {
             details.push("Session rows: arrows or j/k select a row; Enter reads its retained conversation. Esc returns to the same report position. Source selection is preserved; conversation text includes older context outside the report period. Use --pager never for a linear usage report.".into());
         }
@@ -736,6 +855,75 @@ pub fn linear(cli: &Cli, report: &Report, width: usize, tty: bool) -> Vec<String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+
+    fn quota_report() -> (Cli, Report) {
+        let cli = Cli::parse_from(["codex-usage", "daily", "--no-cost", "--color", "never"]);
+        let now = "2026-11-05T00:40:33Z".parse().unwrap();
+        let next_reset: chrono::DateTime<chrono::Utc> = "2026-11-05T15:40:33Z".parse().unwrap();
+        let mut scan = crate::model::Scan::default();
+        for (source, age, used) in [("windows", 14, 92), ("wsl", 1, 93)] {
+            scan.quota_snapshots.extend(crate::quota::QuotaSnapshot::parse(
+                now - chrono::Duration::hours(age),
+                &serde_json::json!({"primary":{"used_percent":used,"window_minutes":10080,"resets_at":next_reset.timestamp()}}),
+                source,
+            ));
+        }
+        let report =
+            crate::report::build(&cli, chrono_tz::Asia::Shanghai, &scan, None, now).unwrap();
+        (cli, report)
+    }
+
+    #[test]
+    fn quota_display_keeps_reset_without_source_diagnostics() {
+        let (cli, report) = quota_report();
+        let lines = quota_lines(&cli, &report, " · ");
+        assert_eq!(lines, vec![(false, "Quota 7d · reset ~11-05 23:40".into())]);
+        let rendered = linear(&cli, &report, 100, false).join("\n");
+        assert!(rendered.contains("Since reset ~10-29 23:40 · Asia/Shanghai"));
+        assert!(!rendered.contains("23:40:33"));
+        assert!(!rendered.contains("stale") && !rendered.contains("forecast n/a"));
+        assert!(view(&cli, &report, &Style::new(&cli, false), 120, true)
+            .body
+            .join("\n")
+            .contains("2026-11-05T23:40:33+08:00"));
+        // Matching display times are not matching deadlines in a different year.
+        let mut old = report.clone();
+        old.quotas[0].next_reset -= chrono::Duration::days(365);
+        assert_eq!(quota_lines(&cli, &old, " · ").len(), 2);
+    }
+
+    #[test]
+    fn quota_forecasts_and_different_windows_keep_their_identity() {
+        let (cli, mut report) = quota_report();
+        report.quotas[0].status = "current".into();
+        report.quotas[0].remaining_tokens = Some(6600);
+        report.quotas[0].exhausts_at = Some(report.generated_at + chrono::Duration::minutes(30));
+        report.quotas[0].forecast_status = "estimated".into();
+        let line = &quota_lines(&cli, &report, " · ")[0].1;
+        assert!(line.contains("windows 92% ~6,600 tok left (exhaust ~11-05 09:10)"));
+        assert!(!line.contains("wsl") && !line.contains("stale"));
+        report.quotas[1].window_minutes = 300;
+        assert_eq!(quota_lines(&cli, &report, " / ").len(), 2);
+        assert!(quota_lines(&cli, &report, " / ")
+            .iter()
+            .all(|(_, line)| line.is_ascii()));
+        report.quotas[1].window_minutes = 10080;
+        report.quotas[1].source = "windows".into();
+        report.quotas[1].bucket = "secondary".into();
+        let line = &quota_lines(&cli, &report, " · ")[0].1;
+        assert!(line.contains("windows/primary 92%"));
+        assert!(!line.contains("secondary"));
+        report.quotas[0].status = "expired".into();
+        report.quotas[1].status = "expired".into();
+        for quota in &mut report.quotas {
+            quota.next_reset = report.generated_at - chrono::Duration::minutes(1);
+        }
+        assert_eq!(
+            quota_lines(&cli, &report, " · ")[0].1,
+            "Quota 7d · reset unavailable"
+        );
+    }
     #[test]
     fn tiny_price_is_visible() {
         assert_eq!(money(Some(Decimal::new(1, 8))), "<$0.0001");

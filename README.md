@@ -85,12 +85,12 @@ codex-usage models --root /path/to/.codex --today
 | `sessions` | Each session's model/mode breakdown |
 | `session SESSION_ID` | One session's usage |
 
-Bare `codex-usage` runs **daily for the last 7 days, including today**. Every invocation starts with fresh options; commands, filters, date ranges, and output formats are not remembered.
+Bare `codex-usage` and `daily` report **since the most recent quota reset**, including short-term quota windows. `~` marks an estimated reset. Without usable reset data—or when selected sources disagree—they fall back to the last 7 days, including today. Every invocation starts with fresh options; commands, filters, date ranges, and output formats are not remembered.
 
 ```sh
 codex-usage daily --last 7 --mode fast
-codex-usage daily                   # last 7 days, all modes
-codex-usage                         # daily for the last 7 days
+codex-usage daily                   # since the most recent quota reset
+codex-usage                         # same default daily period
 codex-usage models --today          # model report for today
 ```
 
@@ -111,6 +111,16 @@ The reader shows user and assistant messages, with a turn outline on wide termin
 Opening a model/mode row starts at a matching invocation, keeping nearby prompt context visible. Page keys use the actual visible page, and resizing preserves the position within a message. Conversations include all retained context for the selected session and sources, even when the usage report is date-filtered. Model focus guides navigation; the details panel retains the session usage estimate under the original report filters and period. Messages load only when opened; browsing does not change token/cost accounting or your command options.
 
 Use `--conversation` explicitly whenever you want the reader. Piped output and `--pager never` produce the full conversation, including tool results; JSON wraps `conversation` and the filtered `usage` report. CSV is for usage reports and is rejected for conversations. Missing or encrypted text is shown as unavailable; attachments are labeled rather than opened.
+
+### Quota status and forecasts
+
+Reports and monitor show compact quota status when available. Matching quota windows and reset times share one reset estimate. Source details appear only when a valid token forecast is available; stale-state and unavailable-forecast diagnostics stay out of the normal display. Exact reset/update timestamps and forecast diagnostics remain in `?` help and JSON/JSONL. Sources stay separate because logs do not identify the account; their quotas are never added together. Quota status covers the source, independently of model, session, project, and date filters.
+
+When recent observations are sufficient, `~6.6M tok left` estimates additional **input + output tokens** at the observed workload mix, and `exhaust ~` predicts when quota may run out at the recent consumption rate. These estimates use the latest recorded quota snapshot; they are not guaranteed token allowances. If the reset arrives first, the display says `resets first`.
+
+Forecasts use at most 60 minutes of loaded snapshots, require at least 2 minutes and 2 percentage points of quota consumption, and are unavailable for stale snapshots (over 5 minutes), large gaps, conflicting/partial data, or a changing workload. Usage outside the selected logs can affect quota percentages and make token estimates less accurate.
+
+Quota processing never expands file discovery: default daily keeps its seven-day initial date range with the existing two-day modification-time grace; monitor keeps today plus its existing 12-hour grace. Reset-relative daily periods use exact timestamps, not whole-day rounding. Old or expired quota snapshots do not trigger an older-history scan. JSON/JSONL include `quotas` and the period's `basis`; CSV remains usage rows only.
 
 ### Dates and filters
 

@@ -132,7 +132,7 @@ fn assert_models(report: &Value, model: &str) {
 }
 
 #[test]
-fn bare_command_always_defaults_to_daily_for_last_seven_days() {
+fn bare_command_falls_back_to_last_seven_days_without_quota() {
     let f = Fixture::new();
     let report = f.report(&[
         "--root",
@@ -144,6 +144,7 @@ fn bare_command_always_defaults_to_daily_for_last_seven_days() {
         "--no-cost",
     ]);
     assert_eq!(report["kind"], "Daily");
+    assert_eq!(report["period"]["basis"], "last_7_days_fallback");
     assert_eq!(
         report["period"]["start"],
         midnight(f.today.checked_sub_days(Days::new(6)).unwrap())

@@ -931,6 +931,7 @@ mod regression_tests {
             generated_at: Utc::now(),
             kind: "Monitor".into(),
             period: Period {
+                basis: "calendar".into(),
                 label: period.into(),
                 timezone: "UTC".into(),
                 start: None,
@@ -946,6 +947,7 @@ mod regression_tests {
             sources: Vec::new(),
             coverage: Coverage::default(),
             pricing: serde_json::json!({}),
+            quotas: Vec::new(),
             monitor: None,
         }
     }

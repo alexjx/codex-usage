@@ -260,6 +260,8 @@ fn scan_report(
 ) -> Result<(Scan, Report, u128)> {
     cancel::check(stopped)?;
     let started = Instant::now();
+    // Resolve quota-relative dates only after this bounded scan. Quota metadata
+    // must never widen daily's seven-day discovery or monitor's startup range.
     let period = report::Period::make(cli, tz, Utc::now())?;
     let scan = if cli.monitor() {
         let cutoff = period

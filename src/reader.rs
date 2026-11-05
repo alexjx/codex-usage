@@ -43,6 +43,7 @@ struct Parser {
     baselines: HashMap<String, Usage>,
     baseline_models: HashMap<String, String>,
     events: Vec<Candidate>,
+    quota_snapshots: Vec<crate::quota::QuotaSnapshot>,
     coverage: Coverage,
     offset: u64,
     pending: Vec<u8>,
@@ -64,6 +65,7 @@ struct CachedFile {
 #[derive(Clone, Default)]
 struct SourceSnapshot {
     candidates: Vec<Candidate>,
+    quota_snapshots: Vec<crate::quota::QuotaSnapshot>,
     coverage: Coverage,
 }
 type ReconcileJob = (
@@ -118,6 +120,8 @@ impl Reader {
             match self.read_source(source, since) {
                 Ok(snapshot) => {
                     let now = Utc::now();
+                    scan.quota_snapshots
+                        .extend(snapshot.quota_snapshots.clone());
                     for candidate in &snapshot.candidates {
                         cancel::check(&self.stopped)?;
                         candidates.push(candidate.clone());
@@ -138,6 +142,8 @@ impl Reader {
                     }
                     let previous = self.sources.get(&source.name);
                     if let Some((snapshot, _)) = previous {
+                        scan.quota_snapshots
+                            .extend(snapshot.quota_snapshots.clone());
                         for candidate in &snapshot.candidates {
                             cancel::check(&self.stopped)?;
                             candidates.push(candidate.clone());
@@ -294,6 +300,12 @@ impl Reader {
             }
             let cached = self.files.get(&key).expect("file was parsed");
             snapshot.coverage.files += 1;
+            for quota in &cached.parser.quota_snapshots {
+                cancel::check(&self.stopped)?;
+                let mut quota = quota.clone();
+                quota.source.clone_from(&source.name);
+                snapshot.quota_snapshots.push(quota);
+            }
             add_coverage(&mut snapshot.coverage, &cached.parser.coverage);
             if !cached.parser.pending.is_empty() {
                 snapshot.coverage.pending += 1;
@@ -681,7 +693,17 @@ impl Parser {
             }
             "token_usage_record" => self.direct(&value, path),
             "event_msg" if payload["type"] == "thread_settings_applied" => self.settings(payload),
-            "event_msg" if payload["type"] == "token_count" => self.legacy(&value, path),
+            "event_msg" if payload["type"] == "token_count" => {
+                if let Some(time) = timestamp(&value) {
+                    self.quota_snapshots
+                        .extend(crate::quota::QuotaSnapshot::parse(
+                            time,
+                            &payload["rate_limits"],
+                            "",
+                        ));
+                }
+                self.legacy(&value, path);
+            }
             _ => {}
         }
     }

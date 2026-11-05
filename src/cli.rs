@@ -75,7 +75,7 @@ impl Mode {
 #[command(
     version,
     about = "Local Codex usage reports and live monitoring",
-    after_help = "Defaults:\n  With no subcommand, run daily for the last 7 days, including today.\n  Every invocation uses fresh command options. Monitor shows today only.\n  Costs estimate API model tokens in USD, not subscription charges.\n\nExamples:\n  codex-usage daily --last 7\n  codex-usage models --today --mode fast\n  codex-usage monitor --source wsl --source windows\n  codex-usage sources\n\nPress Ctrl+C to cancel loading; use q or Ctrl+C to leave the live viewer."
+    after_help = "Defaults:\n  With no subcommand, run daily since the most recent quota reset in loaded logs.\n  Fall back to the last 7 days, including today, when reset data is unavailable.\n  Every invocation uses fresh command options. Monitor shows today only.\n  Costs estimate API model tokens in USD, not subscription charges.\n\nExamples:\n  codex-usage daily --last 7\n  codex-usage models --today --mode fast\n  codex-usage monitor --source wsl --source windows\n  codex-usage sources\n\nPress Ctrl+C to cancel loading; use q or Ctrl+C to leave the live viewer."
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -177,7 +177,7 @@ pub enum Command {
     Models,
     /// Report daily usage, with model and mode rows under each date.
     #[command(
-        after_help = "Examples:\n  codex-usage daily --last 7\n  codex-usage daily --since 2026-11-01 --until 2026-11-04\n  codex-usage daily --all --format csv\n\nDefault period: last 7 days including today. --last N includes today; date bounds are inclusive."
+        after_help = "Examples:\n  codex-usage daily --last 7\n  codex-usage daily --since 2026-11-01 --until 2026-11-04\n  codex-usage daily --all --format csv\n\nDefault period: since the most recent quota reset, including short-term quotas.\nUnavailable, expired, or conflicting reset data falls back to the last 7 days.\nNo extra history is loaded to find a reset. --last N includes today; date bounds are inclusive."
     )]
     Daily,
     /// Report monthly usage by model and recorded service mode.
@@ -200,7 +200,7 @@ pub enum Command {
     },
     /// Live summary of today's usage in the selected timezone.
     #[command(
-        after_help = "Examples:\n  codex-usage monitor\n  codex-usage monitor --source wsl --source windows\n  codex-usage monitor --interval 5s\n  codex-usage monitor --format jsonl --frames 5 > live.jsonl\n\nToday's estimate starts at local midnight; its range ends at the latest snapshot.\nThe title shows the timezone. FILTERED marks active model/mode/session/project filters.\nThe activity row follows --interval (default 2s), showing changes since the previous snapshot.\nn/a means unavailable cost; * marks incomplete estimates.\nFullscreen: summary, 30s rolling output chart (up to 60 chart points), model table, pinned total/controls.\nThe chart opens with recent logged history, then updates each refresh.\nc toggles the chart; it hides automatically when space is limited.\nTerminal output updates in place; redirected output defaults to JSONL.\nq/Ctrl+C quits; Ctrl+C also cancels loading. Totals and chart reset at local midnight.\nCurrent speed uses actual elapsed time; the parentheses show the 60s per-session average."
+        after_help = "Examples:\n  codex-usage monitor\n  codex-usage monitor --source wsl --source windows\n  codex-usage monitor --interval 5s\n  codex-usage monitor --format jsonl --frames 5 > live.jsonl\n\nToday's estimate starts at local midnight; its range ends at the latest snapshot.\nThe title shows the timezone. FILTERED marks active model/mode/session/project filters.\nThe activity row follows --interval (default 2s), showing changes since the previous snapshot.\nn/a means unavailable cost; * marks incomplete estimates.\nFullscreen: summary, 30s rolling output chart (up to 60 chart points), model table, pinned total/controls.\nThe chart opens with recent logged history, then updates each refresh.\nQuota status and approximate remaining total tokens/exhaustion appear when already-loaded logs support them.\nNo extra files are loaded for quota forecasts; unreliable forecasts are omitted.\nc toggles the chart; it hides automatically when space is limited.\nTerminal output updates in place; redirected output defaults to JSONL.\nq/Ctrl+C quits; Ctrl+C also cancels loading. Totals and chart reset at local midnight.\nCurrent speed uses actual elapsed time; the parentheses show the 60s per-session average."
     )]
     Monitor {
         /// Refresh cadence, e.g. 2s or 1000ms (1s to 3600s).
@@ -357,6 +357,14 @@ impl Cli {
     }
     pub fn monitor(&self) -> bool {
         matches!(self.command, Some(Command::Monitor { .. }))
+    }
+    pub fn default_daily_period(&self) -> bool {
+        matches!(self.command, None | Some(Command::Daily))
+            && !self.today
+            && !self.all
+            && self.since.is_none()
+            && self.until.is_none()
+            && self.last.is_none()
     }
     pub fn conversation(&self) -> bool {
         self.conversation && matches!(self.command, Some(Command::Session { .. }))

@@ -98,6 +98,8 @@ pub struct SourceStatus {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Scan {
     pub events: Vec<UsageEvent>,
+    #[serde(default)]
+    pub quota_snapshots: Vec<crate::quota::QuotaSnapshot>,
     pub coverage: Coverage,
     pub sources: Vec<SourceStatus>,
 }

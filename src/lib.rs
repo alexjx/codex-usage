@@ -8,6 +8,7 @@ pub mod export;
 pub mod model;
 pub mod monitor;
 pub mod pricing;
+pub mod quota;
 pub mod reader;
 pub mod render;
 pub mod report;

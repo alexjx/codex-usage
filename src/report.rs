@@ -16,6 +16,7 @@ pub struct Period {
     pub timezone: String,
     pub start: Option<DateTime<Utc>>,
     pub end: Option<DateTime<Utc>>,
+    pub basis: String,
 }
 impl Period {
     pub fn make(cli: &Cli, tz: Tz, now: DateTime<Utc>) -> Result<Self> {
@@ -29,10 +30,7 @@ impl Period {
             (None, None)
         } else if cli.since.is_some() || cli.until.is_some() {
             (cli.since, cli.until)
-        } else if let Some(days) = cli
-            .last
-            .or_else(|| matches!(cli.command, None | Some(Command::Daily)).then_some(7))
-        {
+        } else if let Some(days) = cli.last.or_else(|| cli.default_daily_period().then_some(7)) {
             (
                 Some(
                     today
@@ -61,6 +59,12 @@ impl Period {
                 })
         };
         Ok(Self {
+            basis: if cli.default_daily_period() {
+                "last_7_days_fallback"
+            } else {
+                "calendar"
+            }
+            .into(),
             label: match (start, end) {
                 (None, None) => "All time".into(),
                 (Some(a), Some(b)) if a == b => a.to_string(),
@@ -80,6 +84,68 @@ impl Period {
                 })
                 .transpose()?,
         })
+    }
+    /// Resolve the reporting period from already loaded quota metadata only.
+    /// Discovery continues to use `make` and never expands to hunt for a reset.
+    fn with_quota(
+        cli: &Cli,
+        tz: Tz,
+        now: DateTime<Utc>,
+        quotas: &[crate::quota::QuotaSummary],
+        sources: &[SourceStatus],
+    ) -> Result<Self> {
+        let mut period = Self::make(cli, tz, now)?;
+        if !cli.default_daily_period() {
+            return Ok(period);
+        }
+        // Select the most recent reset per source, including short-term windows.
+        // Never assume independent roots belong to the same account.
+        let mut resets = BTreeMap::new();
+        for q in quotas {
+            if q.limit_id != "codex" || q.status == "expired" {
+                continue;
+            }
+            let Some(reset) = q
+                .last_reset
+                .filter(|reset| *reset <= now && *reset >= now - chrono::Duration::days(7))
+            else {
+                continue;
+            };
+            let entry = resets.entry(q.source.as_str()).or_insert((reset, true));
+            if reset > entry.0 {
+                *entry = (reset, q.last_reset_basis == "observed");
+            } else if reset == entry.0 {
+                entry.1 &= q.last_reset_basis == "observed";
+            }
+        }
+        if resets.is_empty()
+            || sources
+                .iter()
+                .any(|source| !source.readable || !resets.contains_key(source.name.as_str()))
+        {
+            return Ok(period);
+        }
+        let earliest = resets.values().map(|(r, _)| *r).min().unwrap();
+        let latest = resets.values().map(|(r, _)| *r).max().unwrap();
+        if (latest - earliest).num_seconds() > 60 {
+            period.basis = "last_7_days_conflicting_resets".into();
+            return Ok(period);
+        }
+        // A small server timestamp jitter must not drop the first few seconds.
+        period.start = Some(earliest);
+        let observed = resets.values().all(|(_, observed)| *observed);
+        period.basis = if observed {
+            "last_reset_observed"
+        } else {
+            "last_reset_estimated"
+        }
+        .into();
+        period.label = format!(
+            "Since reset {}{}",
+            if observed { "" } else { "~" },
+            earliest.with_timezone(&tz).format("%Y-%m-%d %H:%M:%S")
+        );
+        Ok(period)
     }
     pub fn includes(&self, timestamp: DateTime<Utc>) -> bool {
         self.start.is_none_or(|t| timestamp >= t) && self.end.is_none_or(|t| timestamp < t)
@@ -230,6 +296,8 @@ pub struct Report {
     pub sources: Vec<SourceStatus>,
     pub coverage: Coverage,
     pub pricing: serde_json::Value,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub quotas: Vec<crate::quota::QuotaSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub monitor: Option<MonitorInfo>,
 }
@@ -277,7 +345,13 @@ pub fn build_cancellable(
     stopped: &std::sync::atomic::AtomicBool,
 ) -> Result<Report> {
     crate::cancel::check(stopped)?;
-    let period = Period::make(cli, tz, now)?;
+    let quotas = crate::quota::summarize(
+        &scan.quota_snapshots,
+        &scan.events,
+        now,
+        scan.coverage.incomplete() || scan.sources.iter().any(|source| !source.readable),
+    );
+    let period = Period::with_quota(cli, tz, now, &quotas, &scan.sources)?;
     let groups = cli.groups();
     let date_key = if groups.contains(&Group::Day) {
         Some("day")
@@ -412,6 +486,7 @@ pub fn build_cancellable(
             .map(Pricer::metadata)
             .unwrap_or(serde_json::json!({"enabled":false})),
         monitor: None,
+        quotas,
     })
 }
 
