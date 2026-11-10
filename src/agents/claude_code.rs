@@ -421,6 +421,10 @@ impl Parser {
             .filter(|model| !model.is_empty() && *model != "<synthetic>")
             .unwrap_or("unknown")
             .to_owned();
+        // Synthetic placeholders carry no billable usage or model attribution.
+        if model == "unknown" && usage.total() == 0 {
+            return;
+        }
         let event = UsageEvent {
             id: key.clone(),
             session: session.clone(),
@@ -763,6 +767,67 @@ mod tests {
                 "cache_creation_input_tokens":write,"output_tokens":output
             }}
         })
+    }
+
+    #[test]
+    fn zero_usage_unknown_models_are_ignored_but_real_usage_is_retained() {
+        let fixture = Fixture::new();
+        let mut records = Vec::new();
+        for (index, model) in [
+            Value::Null,
+            serde_json::json!(""),
+            serde_json::json!("<synthetic>"),
+            serde_json::json!("unknown"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut record = assistant(
+                &format!("placeholder-{index}"),
+                "session-1",
+                "2026-11-01T10:00:00Z",
+                0,
+                0,
+                0,
+                0,
+            );
+            record["message"]["model"] = model.clone();
+            records.push(record);
+            let mut used = assistant(
+                &format!("used-{index}"),
+                "session-1",
+                "2026-11-01T10:00:00Z",
+                0,
+                1,
+                0,
+                0,
+            );
+            used["message"]["model"] = model;
+            records.push(used);
+        }
+        records.push(assistant(
+            "known",
+            "session-1",
+            "2026-11-01T10:00:00Z",
+            0,
+            0,
+            0,
+            0,
+        ));
+        fixture.write("projects/p/session-1.jsonl", &records);
+        let events = fixture.events();
+        assert_eq!(events.len(), 5);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.model == "unknown")
+                .count(),
+            4
+        );
+        assert_eq!(
+            events.iter().map(|event| event.usage.total()).sum::<u64>(),
+            4
+        );
     }
 
     #[test]
