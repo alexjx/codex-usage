@@ -89,6 +89,7 @@ impl JsonlCursor {
 
 #[derive(Clone)]
 struct CachedFile {
+    file: DiscoveredFile,
     len: u64,
     modified: Option<SystemTime>,
     identity: String,
@@ -335,12 +336,12 @@ impl Reader {
                     .iter()
                     .find(|source| SourceKey::new(source) == key.0)
                     .cloned();
+                let file = self.files[&key].file.clone();
                 let stopped = Arc::clone(&self.stopped);
                 let job = std::thread::spawn(move || {
                     cancel::check(&stopped)?;
                     let metadata = fs::metadata(&path)?;
                     let source = source.context("Reconciliation source disappeared")?;
-                    let file = DiscoveredFile::codex(path.clone());
                     parse_cached(&path, &metadata, None, &source, &file, &stopped)
                 });
                 self.reconcile_job = Some((key, job));
@@ -568,6 +569,7 @@ fn parse_cached(
     }
     cancel::check(stopped)?;
     Ok(CachedFile {
+        file: file.clone(),
         len: metadata.len(),
         modified: metadata.modified().ok(),
         identity,
@@ -666,7 +668,7 @@ fn read_prefix(path: &Path, length: usize) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{CacheWriteBreakdown, UsageEvent};
+    use crate::model::{CacheWriteBreakdown, SessionKey, UsageEvent};
     use serde_json::{json, Value};
     use std::io::Write;
     use tempfile::TempDir;
@@ -1854,6 +1856,60 @@ mod tests {
             assert_eq!(actual.coverage.pending, if updated { 12 } else { 0 });
             assert_eq!(actual.coverage.uncertain, 1);
         }
+    }
+
+    #[test]
+    fn periodic_reconciliation_preserves_claude_main_and_subagent_usage() {
+        let dir = TempDir::new().unwrap();
+        let project = dir.path().join("projects/p");
+        let subagents = project.join("session/subagents");
+        fs::create_dir_all(&subagents).unwrap();
+        let record = |id: &str| {
+            json!({"type":"assistant","sessionId":"session",
+                "timestamp":"2026-11-01T10:00:00Z",
+                "message":{"id":id,"model":"claude-sonnet-4-5",
+                    "usage":{"input_tokens":10,"output_tokens":1,
+                        "cache_read_input_tokens":0,"cache_creation_input_tokens":0}}})
+        };
+        let main = project.join("session.jsonl");
+        let child = subagents.join("agent-child.jsonl");
+        write(&main, &[record("main")]);
+        write(&child, &[record("child")]);
+        let mut source = source(dir.path(), "claude");
+        source.agent = AgentKind::ClaudeCode;
+        let sources = [source];
+        let mut reader = Reader::new();
+        let baseline = reader.scan(&sources).unwrap();
+        assert_eq!(baseline.events.len(), 2);
+        assert!(baseline.events.iter().any(|event| event.session
+            == SessionKey::execution(AgentKind::ClaudeCode, "session", "child")));
+
+        reader.reconcile_at = Some(Instant::now() - Duration::from_secs(1));
+        reader.scan(&sources).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while reader.reconcile_job.is_some() || !reader.sweep.is_empty() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+            let scan = reader.scan(&sources).unwrap();
+            assert_eq!(scan.events, baseline.events);
+            assert_eq!(scan.coverage.uncertain, baseline.coverage.uncertain);
+        }
+
+        // Appends must continue from the correctly reconstructed parser state.
+        for path in [&main, &child] {
+            let mut file = File::options().append(true).open(path).unwrap();
+            writeln!(file, "{}", record(&path.display().to_string())).unwrap();
+        }
+        let updated = reader.scan(&sources).unwrap();
+        assert_eq!(updated.events.len(), 4);
+        assert_eq!(
+            updated
+                .events
+                .iter()
+                .map(|event| event.usage.total())
+                .sum::<u64>(),
+            44
+        );
     }
 
     #[test]
