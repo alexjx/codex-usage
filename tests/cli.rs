@@ -1020,7 +1020,11 @@ fn monitor_activity_label_and_metadata_follow_the_configured_interval() {
             success(&output);
             if format == "table" {
                 let text = String::from_utf8(output.stdout).unwrap();
-                assert!(text.contains(&format!("{label} +0 tokens")), "{text}");
+                assert!(
+                    text.contains(&format!("Interval ({}):", label.trim_end_matches(':')))
+                        && text.contains("  Codex   +0 tokens"),
+                    "{text}"
+                );
                 assert!(
                     !text.contains("Output tok/s"),
                     "Linear snapshots should not contain a fullscreen chart"
@@ -2019,7 +2023,7 @@ fn human_date_subtotals_follow_each_period_and_keep_wide_alignment_and_csv_rows(
         let text = String::from_utf8(output.stdout).unwrap();
         let subtotals: Vec<_> = text
             .lines()
-            .filter(|line| line.starts_with("Subtotal "))
+            .filter(|line| line.trim_start().starts_with("Subtotal "))
             .collect();
         assert_eq!(subtotals.len(), 2, "{command}: {text}");
         assert_eq!(
@@ -2036,7 +2040,7 @@ fn human_date_subtotals_follow_each_period_and_keep_wide_alignment_and_csv_rows(
             "{text}"
         );
         let positions: Vec<_> = text
-            .match_indices("\nSubtotal ")
+            .match_indices("Subtotal ")
             .map(|(index, _)| index)
             .collect();
         let second_heading = if command == "monthly" {
@@ -2097,7 +2101,7 @@ fn human_date_subtotals_follow_each_period_and_keep_wide_alignment_and_csv_rows(
     assert_eq!(
         no_cost
             .lines()
-            .filter(|line| line.starts_with("Subtotal "))
+            .filter(|line| line.trim_start().starts_with("Subtotal "))
             .count(),
         2,
         "{no_cost}"
@@ -2193,7 +2197,7 @@ fn stacked_date_subtotals_remain_complete_after_wrapped_long_model_rows() {
     let positions: Vec<_> = lines
         .iter()
         .enumerate()
-        .filter_map(|(i, line)| (*line == "Subtotal").then_some(i))
+        .filter_map(|(i, line)| (line.trim() == "Subtotal").then_some(i))
         .collect();
     assert_eq!(positions.len(), 2, "{text}");
     assert_eq!(lines[positions[0] + 1], "115 tokens", "{text}");

@@ -5,6 +5,31 @@ use crate::{
 use rust_decimal::{Decimal, RoundingStrategy};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+fn agent_name(agent: &str) -> &str {
+    match agent {
+        "codex" => "Codex",
+        "claude-code" => "Claude",
+        _ => agent,
+    }
+}
+fn row_label(row: &crate::report::Row, grouped: bool) -> String {
+    if !grouped {
+        return row.label();
+    }
+    let mut display = row.clone();
+    display.dimensions.remove("agent");
+    display.dimensions.remove("provider");
+    format!(
+        "{}{}",
+        if row.dimensions.contains_key("day") || row.dimensions.contains_key("month") {
+            "    "
+        } else {
+            "  "
+        },
+        display.label()
+    )
+}
+
 pub struct Style {
     color: bool,
     theme: Theme,
@@ -30,6 +55,16 @@ impl Style {
         }
         let code = match (self.theme, role) {
             (_, "bold") => "1",
+            (Theme::Dark, "date") => "1;38;2;230;237;247;48;2;44;55;73",
+            (Theme::Light, "date") => "1;38;2;30;45;65;48;2;228;234;242",
+            (Theme::Dark, "codex") => "1;38;2;125;190;245",
+            (Theme::Light, "codex") => "1;38;2;30;91;151",
+            (Theme::Dark, "claude") => "1;38;2;224;173;132",
+            (Theme::Light, "claude") => "1;38;2;148;79;37",
+            (_, "date") => "1;7",
+            (_, "codex") => "1;34",
+            (_, "claude") => "1;33",
+
             (Theme::Dark, "subtotal") => "38;2;146;183;191",
             (Theme::Dark, "subtotal_cost") => "38;2;172;159;206",
             (Theme::Dark, "total") => "1;38;2;103;212;232",
@@ -95,7 +130,16 @@ pub fn money(n: Option<Decimal>) -> String {
         ),
     }
 }
+fn includes_claude(report: &Report) -> bool {
+    report
+        .sources
+        .iter()
+        .any(|source| source.agent == crate::model::AgentKind::ClaudeCode)
+}
 fn quota_lines(cli: &Cli, report: &Report, sep: &str) -> Vec<(bool, String)> {
+    if includes_claude(report) {
+        return Vec::new();
+    }
     let tz = report
         .period
         .timezone
@@ -323,7 +367,7 @@ fn summary_lines(
         titles,
         widths,
     } = layout;
-    let (role, cost_role) = if label == "Subtotal" {
+    let (role, cost_role) = if label.trim() == "Subtotal" {
         ("subtotal", "subtotal_cost")
     } else {
         ("total", "total_cost")
@@ -492,56 +536,102 @@ pub fn view(cli: &Cli, report: &Report, style: &Style, width: usize, help: bool)
             &mut h,
             style,
             "meta",
-            &format!("Last 7 days{sep}{reason}"),
+            &if includes_claude(report) {
+                "Last 7 days".into()
+            } else {
+                format!("Last 7 days{sep}{reason}")
+            },
             width,
         );
     }
     if let Some(m) = &report.monitor {
-        let mut delta = format!("{}s: {:+} tokens", m.window_seconds, m.window_tokens);
-        if !cli.no_cost {
-            if let Some(cost) = m.window_cost_usd {
-                delta.push_str(&format!(
-                    " / {:+.4} USD{}",
-                    cost,
-                    if m.window_cost_partial || incomplete {
-                        "*"
-                    } else {
-                        ""
-                    }
-                ));
-            } else {
-                delta.push_str(" / n/a USD");
+        h.push(String::new());
+        text(
+            &mut h,
+            style,
+            "meta",
+            &format!("Interval ({}s):", m.window_seconds),
+            width,
+        );
+        if m.agent_activity.is_empty() {
+            let mut delta = format!("  {:+} tokens", m.window_tokens);
+            if !cli.no_cost {
+                delta.push_str(
+                    &m.window_cost_usd
+                        .map(|cost| {
+                            format!(
+                                " / {cost:+.4} USD{}",
+                                if m.window_cost_partial { "*" } else { "" }
+                            )
+                        })
+                        .unwrap_or(" / n/a USD".into()),
+                );
             }
+            delta.push_str(&format!(
+                " / {:.0} out tok/s ({:.1} tok/s)",
+                m.output_tokens_per_second, m.average_session_output_tokens_per_second
+            ));
+            text(&mut h, style, "accent", &delta, width);
         }
-        let speed =
-            if !report.sources.is_empty() && report.sources.iter().all(|source| !source.readable) {
-                "n/a".into()
-            } else if m.output_tokens_per_second > 0.0 && m.output_tokens_per_second < 10.0 {
-                format!("{:.1}", m.output_tokens_per_second)
+        let token_width = m
+            .agent_activity
+            .iter()
+            .map(|a| format!("{:+}", a.window_tokens).len())
+            .max()
+            .unwrap_or(1);
+        for agent in &m.agent_activity {
+            let agent_id = agent.agent.to_string();
+            let name = agent_name(&agent_id);
+            let unavailable = !report.sources.is_empty()
+                && report
+                    .sources
+                    .iter()
+                    .filter(|s| s.agent == agent.agent)
+                    .all(|s| !s.readable);
+            let mut metrics = vec![format!("{:+token_width$} tokens", agent.window_tokens)];
+            if !cli.no_cost {
+                metrics.push(
+                    agent
+                        .window_cost_usd
+                        .filter(|_| {
+                            !unavailable && !(m.window_cost_usd.is_none() && m.window_cost_partial)
+                        })
+                        .map(|cost| {
+                            format!(
+                                "{cost:+.4} USD{}",
+                                if agent.cost_partial { "*" } else { "" }
+                            )
+                        })
+                        .unwrap_or("n/a USD".into()),
+                );
+            }
+            metrics.push(if unavailable {
+                "n/a out tok/s (n/a tok/s)".into()
             } else {
-                format!("{:.0}", m.output_tokens_per_second)
-            };
-        delta.push_str(&format!(" / {speed} out tok/s"));
-        delta.push_str(&format!(
-            " ({:.1} tok/s)",
-            m.average_session_output_tokens_per_second
-        ));
-        text(&mut h, style, "accent", &delta, width);
-        if m.agent_activity.len() > 1 {
-            let agents = m
-                .agent_activity
-                .iter()
-                .map(|agent| {
+                format!(
+                    "{:.0} out tok/s ({:.1} tok/s)",
+                    agent.output_tokens_per_second, agent.average_session_output_tokens_per_second
+                )
+            });
+            let prefix = format!("  {name:<6}  ");
+            let available = width.saturating_sub(prefix.len()).max(1);
+            for (index, line) in wrap(&metrics.join(" / "), available).iter().enumerate() {
+                h.push(style.paint(
+                    if agent.agent == crate::model::AgentKind::Codex {
+                        "codex"
+                    } else {
+                        "claude"
+                    },
                     format!(
-                        "{} {} tok / {:.0} out tok/s",
-                        agent.agent,
-                        number(agent.since_ready_tokens.max(0) as u64, cli.exact),
-                        agent.output_tokens_per_second
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(sep);
-            text(&mut h, style, "meta", &agents, width);
+                        "{}{line}",
+                        if index == 0 {
+                            prefix.clone()
+                        } else {
+                            " ".repeat(prefix.len())
+                        }
+                    ),
+                ));
+            }
         }
     }
     for (warning, line) in quota_lines(cli, report, sep) {
@@ -554,7 +644,13 @@ pub fn view(cli: &Cli, report: &Report, style: &Style, width: usize, help: bool)
         );
     }
     let chart_anchor = h.len();
-    let labels = if help {
+    let agent_sections = report
+        .rows
+        .iter()
+        .all(|r| r.dimensions.contains_key("agent"));
+    let labels = if agent_sections && !help {
+        vec!["Model"]
+    } else if help {
         vec!["Detail"]
     } else {
         vec![if cli.groups().iter().all(|g| {
@@ -574,14 +670,14 @@ pub fn view(cli: &Cli, report: &Report, style: &Style, width: usize, help: bool)
     let id_width = report
         .rows
         .iter()
-        .map(|r| r.label().width())
+        .map(|r| row_label(r, agent_sections).width())
         .max()
         .unwrap_or(16)
         .max(labels[0].len());
     let id_width = if report.subtotals.is_empty() {
         id_width
     } else {
-        id_width.max("Subtotal".len())
+        id_width.max("  Subtotal".len())
     };
     let mut detailed = cli.wide || width >= id_width + if cli.no_cost { 40 } else { 53 };
     let columns = |detailed: bool| {
@@ -641,11 +737,18 @@ pub fn view(cli: &Cli, report: &Report, style: &Style, width: usize, help: bool)
             format!("Unpriced: {} tokens",number(report.totals.unpriced_tokens,cli.exact)),
             format!("Data warnings: {} / Pending: {}",report.coverage.malformed+report.coverage.conflicts+report.coverage.uncertain,report.coverage.pending),
             format!("Pricing assumptions: {}",report.totals.assumed_events)];
-        details.push("Daily defaults to the most recent reset (including short-term quotas) found in already loaded logs. ~ marks an inferred reset; unavailable, expired, or conflicting reset data falls back to seven days. Explicit dates override this. File discovery is never expanded for quotas.".into());
-        for quota in &report.quotas {
-            details.push(format!("Quota {}/{}/{}: {}% used; reset {}; updated {}; forecast {} (input+output tokens).", quota.source, quota.limit_id, quota.bucket, quota.used_percent, quota.next_reset.with_timezone(&tz).to_rfc3339(), quota.observed_at.with_timezone(&tz).to_rfc3339(), quota.forecast_status));
+        if includes_claude(report) {
+            details.push("Daily defaults to Last 7 days when Claude is selected. Explicit dates override this.".into());
+        } else {
+            details.push("Daily defaults to the most recent reset (including short-term quotas) found in already loaded logs. ~ marks an inferred reset; unavailable, expired, or conflicting reset data falls back to seven days. Explicit dates override this. File discovery is never expanded for quotas.".into());
+            for quota in &report.quotas {
+                details.push(format!("Quota {}/{}/{}: {}% used; reset {}; updated {}; forecast {} (input+output tokens).", quota.source, quota.limit_id, quota.bucket, quota.used_percent, quota.next_reset.with_timezone(&tz).to_rfc3339(), quota.observed_at.with_timezone(&tz).to_rfc3339(), quota.forecast_status));
+            }
         }
-        details.push("Quota forecasts cover each source's locally observed workload, independently of report filters. ~ tokens left means estimated input+output tokens, not an entitlement. Forecasts use up to 60 minutes of quota changes, require at least 2 minutes and 2 percentage points, and stop after 5 minutes without an update or when data/mix is unreliable. Usage elsewhere may consume quota without appearing in these logs. Sources are kept separate because logs do not identify the account.".into());
+
+        if !includes_claude(report) {
+            details.push("Quota forecasts cover each source's locally observed workload, independently of report filters. ~ tokens left means estimated input+output tokens, not an entitlement. Forecasts use up to 60 minutes of quota changes, require at least 2 minutes and 2 percentage points, and stop after 5 minutes without an update or when data/mix is unreliable. Usage elsewhere may consume quota without appearing in these logs. Sources are kept separate because logs do not identify the account.".into());
+        }
         if matches!(cli.command, Some(crate::cli::Command::Sessions)) {
             details.push("Session rows: arrows or j/k select a row; Enter reads its retained conversation. Esc returns to the same report position. Source selection is preserved; conversation text includes older context outside the report period. Use --pager never for a linear usage report.".into());
         }
@@ -721,7 +824,43 @@ pub fn view(cli: &Cli, report: &Report, style: &Style, width: usize, help: bool)
             })
             .collect();
         let mut previous_date = None;
-        for (row_index, row) in report.rows.iter().enumerate() {
+        let mut previous_agent = None;
+        let mut rows: Vec<_> = report.rows.iter().enumerate().collect();
+        let idle_rows: Vec<_> = report
+            .sources
+            .iter()
+            .map(|source| source.agent.to_string())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .filter(|agent| {
+                !report
+                    .rows
+                    .iter()
+                    .any(|row| row.dimensions.get("agent") == Some(agent))
+            })
+            .map(|agent| crate::report::Row {
+                dimensions: [("agent".into(), agent)].into(),
+                counts: Counts::default(),
+            })
+            .collect();
+        if agent_sections && cli.monitor() {
+            rows.extend(idle_rows.iter().map(|row| (usize::MAX, row)));
+        }
+        if agent_sections {
+            rows.sort_by_key(|(_, row)| {
+                (
+                    date_key
+                        .and_then(|key| row.dimensions.get(key))
+                        .cloned()
+                        .unwrap_or_default(),
+                    match row.dimensions.get("agent").map(String::as_str) {
+                        Some("codex") => 0,
+                        _ => 1,
+                    },
+                )
+            });
+        }
+        for (position, &(row_index, row)) in rows.iter().enumerate() {
             if let Some((key, date)) =
                 date_key.and_then(|key| row.dimensions.get(key).map(|date| (key, date)))
             {
@@ -732,12 +871,58 @@ pub fn view(cli: &Cli, report: &Report, style: &Style, width: usize, help: bool)
                     let label = date_label(key, date);
                     identities.push((format!("section:{date}"), b.len()));
                     sections.push((label.clone(), b.len()));
-                    text(&mut b, style, "accent", &label, width);
+                    text(&mut b, style, "date", &format!(" {label} "), width);
                     previous_date = Some(date);
+                    previous_agent = None;
                 }
             }
+
+            if agent_sections {
+                let agent = row.dimensions.get("agent").unwrap();
+                if previous_agent != Some(agent) {
+                    if !b.is_empty() && date_key.is_none() {
+                        b.push(String::new());
+                    }
+                    let label = if date_key.is_some() {
+                        format!("  {}", agent_name(agent))
+                    } else {
+                        agent_name(agent).to_owned()
+                    };
+                    identities.push((format!("agent:{agent}"), b.len()));
+                    sections.push((label.clone(), b.len()));
+                    text(
+                        &mut b,
+                        style,
+                        if agent == "codex" { "codex" } else { "claude" },
+                        &label,
+                        width,
+                    );
+                    previous_agent = Some(agent);
+                }
+            }
+            if row_index == usize::MAX {
+                let ready = report.sources.iter().any(|source| {
+                    source.agent.to_string() == row.dimensions["agent"] && source.readable
+                });
+                text(
+                    &mut b,
+                    style,
+                    "meta",
+                    if ready {
+                        if cli.monitor() {
+                            "  No usage today"
+                        } else {
+                            "  No usage in this period"
+                        }
+                    } else {
+                        "  Usage unavailable"
+                    },
+                    width,
+                );
+                continue;
+            }
             let row_start = b.len();
-            let id = row.label();
+            let id = row_label(row, agent_sections);
             identities.push((row.identity(), b.len()));
             if stacked {
                 text(&mut b, style, "bold", &id, width);
@@ -767,7 +952,9 @@ pub fn view(cli: &Cli, report: &Report, style: &Style, width: usize, help: bool)
                     ));
                 }
                 text(&mut b, style, "cost", &detail, width);
-                b.push(String::new());
+                if date_key.is_none() {
+                    b.push(String::new());
+                }
             } else {
                 let vs = values(&row.counts, cli, detailed);
                 let mut line = style.paint("bold", pad(&id, id_width, false));
@@ -777,6 +964,10 @@ pub fn view(cli: &Cli, report: &Report, style: &Style, width: usize, help: bool)
                         "accent"
                     } else if !cli.no_cost && i == vs.len() - 1 {
                         "cost"
+                    } else if titles[i] == "Cached" {
+                        "meta"
+                    } else if titles[i] == "Total" {
+                        "bold"
                     } else {
                         "body"
                     };
@@ -800,17 +991,16 @@ pub fn view(cli: &Cli, report: &Report, style: &Style, width: usize, help: bool)
             if let Some((key, date)) =
                 date_key.and_then(|key| row.dimensions.get(key).map(|date| (key, date)))
             {
-                let next_date = report
-                    .rows
-                    .get(row_index + 1)
-                    .and_then(|row| row.dimensions.get(key));
+                let next_date = rows
+                    .get(position + 1)
+                    .and_then(|(_, row)| row.dimensions.get(key));
                 if next_date != Some(date) {
                     if let Some(counts) = date_totals.get(date.as_str()) {
                         let mut cells = values(counts, cli, detailed);
                         cells[0].clear();
                         let subtotal_start = b.len();
                         identities.push((format!("subtotal:{key}:{date}"), b.len()));
-                        b.extend(summary_lines("Subtotal", counts, &cells, &summary_layout));
+                        b.extend(summary_lines("  Subtotal", counts, &cells, &summary_layout));
                         // Selection must scroll the trailing subtotal into view too.
                         if let Some(row) = session_rows.last_mut() {
                             if row.end == subtotal_start {
@@ -821,7 +1011,7 @@ pub fn view(cli: &Cli, report: &Report, style: &Style, width: usize, help: bool)
                 }
             }
         }
-        if report.rows.is_empty() {
+        if report.rows.is_empty() && (incomplete || !agent_sections || report.sources.is_empty()) {
             text(
                 &mut b,
                 style,
@@ -893,6 +1083,47 @@ mod tests {
         let report =
             crate::report::build(&cli, chrono_tz::Asia::Shanghai, &scan, None, now).unwrap();
         (cli, report)
+    }
+
+    #[test]
+    fn claude_selection_hides_quota_and_reset_in_normal_and_help_views() {
+        let (cli, codex_report) = quota_report();
+        let mut scan = crate::model::Scan::default();
+        for agent in [
+            crate::model::AgentKind::Codex,
+            crate::model::AgentKind::ClaudeCode,
+        ] {
+            scan.sources.push(crate::model::SourceStatus {
+                name: agent.to_string(),
+                agent,
+                root: "/unused".into(),
+                readable: true,
+                last_success: None,
+                error: None,
+                capability: crate::model::QuotaCapability::Unsupported,
+                coverage: Default::default(),
+                pricing_provider: None,
+            });
+        }
+        let mut report =
+            crate::report::build(&cli, chrono_tz::UTC, &scan, None, codex_report.generated_at)
+                .unwrap();
+        report.quotas = codex_report.quotas;
+        assert!(!report.quotas.is_empty());
+        assert!(quota_lines(&cli, &report, " / ").is_empty());
+        let output = linear(&cli, &report, 120, false).join("\n");
+        assert!(output.contains("Last 7 days"));
+        assert!(
+            !output.to_lowercase().contains("reset") && !output.contains("Quota"),
+            "{output}"
+        );
+        let help = view(&cli, &report, &Style::new(&cli, false), 120, true)
+            .body
+            .join("\n");
+        assert!(
+            !help.to_lowercase().contains("reset") && !help.contains("Quota"),
+            "{help}"
+        );
     }
 
     #[test]
@@ -1241,7 +1472,8 @@ mod regression_tests {
         let output = linear(&cli, &report, 140, false).join("\n");
         assert!(
             output.contains("LIVE FILTERED")
-                && output.contains("2s: +0 tokens / +0.0200 USD*")
+                && output.contains("Interval (2s):")
+                && output.contains("+0 tokens / +0.0200 USD*")
                 && output.contains("(33.0 tok/s)"),
             "{output}"
         );
@@ -1286,7 +1518,7 @@ mod regression_tests {
             Some(crate::monitor::Tracker::new(&Scan::default(), &report, false).info(0));
         let output = linear(&cli, &report, 140, false).join("\n");
         assert!(
-            output.contains("Today 00:00:00-12:34:56") && output.contains("2s:"),
+            output.contains("Today 00:00:00-12:34:56") && output.contains("Interval (2s):"),
             "{output}"
         );
         assert!(!output.contains("USD") && !output.contains("est."));
@@ -1372,6 +1604,148 @@ mod regression_tests {
                 .chain(v.body.iter())
                 .chain(v.footer.iter())
                 .all(|s| s.width() <= width));
+        }
+    }
+}
+
+#[cfg(test)]
+mod agent_layout_tests {
+    use super::*;
+    use clap::Parser;
+    #[test]
+    fn monitor_groups_models_and_indents_independent_activity() {
+        let cli = Cli::parse_from(["agent-usage", "monitor", "--no-cost", "--color", "never"]);
+        let mut report = crate::report::build(
+            &cli,
+            chrono_tz::UTC,
+            &crate::model::Scan::default(),
+            None,
+            chrono::Utc::now(),
+        )
+        .unwrap();
+        for (agent, model, tokens) in [
+            ("claude-code", "claude-example", 860),
+            ("codex", "gpt-example", 1240),
+        ] {
+            report.rows.push(crate::report::Row {
+                dimensions: [
+                    ("agent".into(), agent.into()),
+                    ("provider".into(), "unknown".into()),
+                    ("model".into(), model.into()),
+                ]
+                .into(),
+                counts: Counts {
+                    total: tokens,
+                    ..Default::default()
+                },
+            });
+        }
+        let mut info =
+            crate::monitor::Tracker::new(&crate::model::Scan::default(), &report, false).info(0);
+        for (agent, tokens) in [
+            (crate::model::AgentKind::Codex, 1240),
+            (crate::model::AgentKind::ClaudeCode, 860),
+        ] {
+            info.agent_activity.push(crate::report::AgentActivity {
+                agent,
+                window_tokens: tokens,
+                since_ready_tokens: 0,
+                window_cost_usd: None,
+                cost_partial: false,
+                average_session_output_tokens_per_second: 42.0,
+                output_tokens_per_second: 85.0,
+                output_speed_history: vec![],
+                output_speed_window_seconds: 30,
+            });
+        }
+        report.totals.total = 2100;
+        report.monitor = Some(info);
+        for width in [60, 100, 160] {
+            let output = linear(&cli, &report, width, false).join("\n");
+            assert!(output.contains("Interval (2s):"), "{output}");
+            assert!(output.contains("  Codex   +1240 tokens"), "{output}");
+            assert!(output.contains("  Claude   +860 tokens"), "{output}");
+            assert!(!output.contains("unknown /"));
+            assert!(!output.contains(" USD"));
+            assert!(output.find("gpt-example").unwrap() < output.find("claude-example").unwrap());
+        }
+    }
+}
+
+#[cfg(test)]
+mod report_agent_sections_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn reports_nest_agents_inside_dates_without_provider_prefixes() {
+        for command in ["daily", "monthly", "models", "sessions"] {
+            let cli = Cli::parse_from([
+                "agent-usage",
+                command,
+                "--all",
+                "--no-cost",
+                "--color",
+                "never",
+            ]);
+            let mut report = crate::report::build(
+                &cli,
+                chrono_tz::UTC,
+                &crate::model::Scan::default(),
+                None,
+                chrono::Utc::now(),
+            )
+            .unwrap();
+            let period = match command {
+                "daily" => Some(("day", "2026-11-10")),
+                "monthly" => Some(("month", "2026-11")),
+                _ => None,
+            };
+            for (agent, model) in [("claude-code", "claude-example"), ("codex", "gpt-example")] {
+                let mut dimensions = [
+                    ("agent".into(), agent.into()),
+                    ("provider".into(), "unknown".into()),
+                    ("model".into(), model.into()),
+                ]
+                .into_iter()
+                .collect::<std::collections::BTreeMap<_, _>>();
+                if let Some((key, date)) = period {
+                    dimensions.insert(key.into(), date.into());
+                }
+                report.rows.push(crate::report::Row {
+                    dimensions,
+                    counts: Counts {
+                        total: 10,
+                        ..Default::default()
+                    },
+                });
+            }
+            if let Some((key, date)) = period {
+                report.subtotals.push(crate::report::Row {
+                    dimensions: [(key.into(), date.into())].into(),
+                    counts: Counts {
+                        total: 20,
+                        ..Default::default()
+                    },
+                });
+            }
+            let output = linear(&cli, &report, 120, false).join("\n");
+            assert!(
+                output.lines().any(|line| line.trim() == "Codex")
+                    && output.lines().any(|line| line.trim() == "Claude"),
+                "{output}"
+            );
+            assert!(
+                !output.contains("unknown") && !output.contains("codex /"),
+                "{output}"
+            );
+            assert!(output.find("gpt-example").unwrap() < output.find("claude-example").unwrap());
+            if period.is_some() {
+                assert_eq!(output.matches("Subtotal").count(), 1, "{output}");
+                let body = view(&cli, &report, &Style::new(&cli, false), 120, false).body;
+                assert!(body.iter().all(|line| !line.trim().is_empty()), "{output}");
+                assert!(output.contains("\n  Codex\n    gpt-example"), "{output}");
+            }
         }
     }
 }

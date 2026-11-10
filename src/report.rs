@@ -307,6 +307,9 @@ pub struct SessionSpeed {
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentActivity {
     pub agent: AgentKind,
+    pub window_cost_usd: Option<Decimal>,
+    pub cost_partial: bool,
+    pub average_session_output_tokens_per_second: f64,
     pub since_ready_tokens: i128,
     pub window_tokens: i128,
     pub output_tokens_per_second: f64,

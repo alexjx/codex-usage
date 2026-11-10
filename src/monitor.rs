@@ -62,6 +62,26 @@ struct AgentChart {
     offset: Duration,
     history: VecDeque<Option<f64>>,
 }
+fn agent_costs(report: &Report) -> BTreeMap<AgentKind, Decimal> {
+    let mut costs: BTreeMap<_, _> = report
+        .sources
+        .iter()
+        .map(|s| (s.agent, Decimal::ZERO))
+        .collect();
+    for row in &report.rows {
+        if let (Some(agent), Some(cost)) = (
+            row.dimensions.get("agent").and_then(|s| match s.as_str() {
+                "codex" => Some(AgentKind::Codex),
+                "claude-code" => Some(AgentKind::ClaudeCode),
+                _ => None,
+            }),
+            row.counts.cost_usd,
+        ) {
+            *costs.entry(agent).or_default() += cost;
+        }
+    }
+    costs
+}
 pub struct Tracker {
     started: Instant,
     seen: BTreeSet<EventKey>,
@@ -84,6 +104,9 @@ pub struct Tracker {
     agent_since_ready: BTreeMap<AgentKind, i128>,
     agent_window: BTreeMap<AgentKind, i128>,
     agent_rate: BTreeMap<AgentKind, f64>,
+    agent_cost: BTreeMap<AgentKind, Decimal>,
+    agent_partial: BTreeSet<AgentKind>,
+    agent_cost_window: BTreeMap<AgentKind, Option<Decimal>>,
     agent_charts: BTreeMap<AgentKind, AgentChart>,
     chart_speed: Speed,
     chart_started: Duration,
@@ -141,6 +164,9 @@ impl Tracker {
                 .collect(),
             agent_window: BTreeMap::new(),
             agent_rate: BTreeMap::new(),
+            agent_cost: agent_costs(report),
+            agent_partial: BTreeSet::new(),
+            agent_cost_window: BTreeMap::new(),
             agent_charts: BTreeMap::new(),
             chart_speed: Speed::default(),
             chart_started: Duration::ZERO,
@@ -272,6 +298,24 @@ impl Tracker {
             .iter()
             .map(|(agent, since_ready)| AgentActivity {
                 agent: *agent,
+                window_cost_usd: self
+                    .agent_cost_window
+                    .get(agent)
+                    .copied()
+                    .unwrap_or(Some(Decimal::ZERO)),
+                cost_partial: self.agent_partial.contains(agent),
+                average_session_output_tokens_per_second: {
+                    let rates: Vec<_> = session_output_tokens_per_second
+                        .iter()
+                        .filter(|s| s.session.agent == *agent)
+                        .map(|s| s.output_tokens_per_second)
+                        .collect();
+                    if rates.is_empty() {
+                        0.0
+                    } else {
+                        rates.iter().sum::<f64>() / rates.len() as f64
+                    }
+                },
                 since_ready_tokens: *since_ready,
                 window_tokens: self.agent_window.get(agent).copied().unwrap_or_default(),
                 output_tokens_per_second: self.agent_rate.get(agent).copied().unwrap_or_default(),
@@ -437,6 +481,43 @@ impl Tracker {
                 },
             );
         }
+        self.agent_partial = report
+            .rows
+            .iter()
+            .filter(|row| row.counts.unpriced_tokens > 0 || row.counts.assumed_events > 0)
+            .flat_map(|row| row.counts.agents.iter())
+            .filter_map(|s| match s.as_str() {
+                "codex" => Some(AgentKind::Codex),
+                "claude-code" => Some(AgentKind::ClaudeCode),
+                _ => None,
+            })
+            .collect();
+        let costs = agent_costs(report);
+        for agent in agent_totals.keys() {
+            self.agent_cost_window.insert(
+                *agent,
+                costs.get(agent).and_then(|cost| {
+                    cost.checked_sub(if rollover {
+                        Decimal::ZERO
+                    } else {
+                        self.agent_cost.get(agent).copied().unwrap_or_default()
+                    })
+                }),
+            );
+        }
+        for row in &report.rows {
+            if row.counts.unpriced_tokens > 0 && row.counts.priced_tokens == 0 {
+                let agent = match row.dimensions.get("agent").map(String::as_str) {
+                    Some("codex") => AgentKind::Codex,
+                    Some("claude-code") => AgentKind::ClaudeCode,
+                    _ => continue,
+                };
+                if costs.get(&agent).is_none_or(|cost| cost.is_zero()) {
+                    self.agent_cost_window.insert(agent, None);
+                }
+            }
+        }
+        self.agent_cost = costs;
         let cost_partial = self.cost_delta.is_some() && unpriced_changed;
         let known_cost = priced_changed || cost.is_some_and(|cost| !cost.is_zero());
         self.activity = Activity {
@@ -1326,5 +1407,63 @@ mod regression_tests {
             1
         );
         assert!(r.monitor.unwrap().since_ready_cost_usd.is_none());
+    }
+}
+
+#[cfg(test)]
+mod agent_cost_tests {
+    use super::*;
+    use clap::Parser;
+    #[test]
+    fn agent_cost_deltas_include_independent_corrections() {
+        let cli = Cli::parse_from(["agent-usage", "monitor"]);
+        let mut scan = Scan::default();
+        for agent in [AgentKind::Codex, AgentKind::ClaudeCode] {
+            scan.sources.push(crate::model::SourceStatus {
+                name: agent.to_string(),
+                agent,
+                root: "/unused".into(),
+                readable: true,
+                last_success: None,
+                error: None,
+                capability: crate::model::QuotaCapability::Unsupported,
+                coverage: Default::default(),
+                pricing_provider: None,
+            });
+        }
+        let mut report = report::build(&cli, chrono_tz::UTC, &scan, None, Utc::now()).unwrap();
+        for (agent, cost) in [("codex", 10), ("claude-code", 20)] {
+            report.rows.push(report::Row {
+                dimensions: [("agent".into(), agent.into())].into(),
+                counts: report::Counts {
+                    cost_usd: Some(Decimal::new(cost, 1)),
+                    ..Default::default()
+                },
+            });
+        }
+        let mut tracker = Tracker::new(&scan, &report, true);
+        for agent in [AgentKind::Codex, AgentKind::ClaudeCode] {
+            tracker.agent_since_ready.insert(agent, 0);
+        }
+        report.rows[0].counts.cost_usd = Some(Decimal::new(13, 1));
+        report.rows[1].counts.cost_usd = Some(Decimal::new(18, 1));
+        tracker.observe_at(&cli, &scan, &mut report, 0, Duration::from_secs(2));
+        let info = tracker.info(0);
+        assert_eq!(
+            info.agent_activity
+                .iter()
+                .find(|a| a.agent == AgentKind::Codex)
+                .unwrap()
+                .window_cost_usd,
+            Some(Decimal::new(3, 1))
+        );
+        assert_eq!(
+            info.agent_activity
+                .iter()
+                .find(|a| a.agent == AgentKind::ClaudeCode)
+                .unwrap()
+                .window_cost_usd,
+            Some(Decimal::new(-2, 1))
+        );
     }
 }

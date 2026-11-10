@@ -109,6 +109,8 @@ agent-usage models --agent claude-code --root /path/to/.claude --all
 
 ## Reports
 
+Terminal reports group models under **Codex** and **Claude** headings, without agent or provider prefixes on model names. Daily and monthly reports nest these groups within each date or month and retain one subtotal per period. Provider metadata remains available in structured exports.
+
 | Command | Shows |
 | --- | --- |
 | `models` | Usage by agent, provider, model, and recorded service mode |
@@ -209,6 +211,8 @@ Custom grouping may deliberately combine agents or providers; the row's `agents`
 
 Use `--wide` for extra token breakdowns, `--exact` for full counts, and `--pager never` to print all rows into normal scrollback. Color adapts to the terminal; `--theme light`, `--theme dark`, `--color never`, and `--ascii` provide alternatives. `NO_COLOR` disables automatic color styling.
 
+When Claude is selected, terminal views hide quota/reset information and default daily reports show Last 7 days. Codex-only views retain reset-relative defaults and quota details. Explicit date selections still take precedence.
+
 ## Live monitor
 
 ```sh
@@ -223,7 +227,7 @@ Monitor always summarizes **today**, in the selected timezone. It measures **Cod
 - The model table separates agents and providers.
 - The per-session 60-second average remains independent.
 
-The screen places today's summary and live rates at the top, then the agent charts, then the model table. The full-selection total and controls stay at the bottom. Charts shrink or hide on small terminals; scrolling does not pause updates.
+The screen places today's summary and live rates at the top, then the agent charts, then model sections headed Codex and Claude. Model names have no added agent or provider prefix. A shared `Interval (2s):` heading introduces two-space-indented per-agent token/cost deltas and speeds; the duration follows `--interval`. The full-selection total and controls stay at the bottom. Charts shrink or hide on small terminals; scrolling does not pause updates.
 
 | Indicator | What it measures |
 | --- | --- |
