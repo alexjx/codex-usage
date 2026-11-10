@@ -17,7 +17,7 @@ pub fn conversation_json(
     serde_json::to_writer_pretty(
         &mut out,
         &Envelope {
-            schema_version: 1,
+            schema_version: 2,
             conversation,
             usage,
         },
@@ -40,6 +40,9 @@ pub fn json(report: &Report, mut out: impl Write, lines: bool) -> Result<()> {
 pub fn csv(report: &Report, out: impl Write) -> Result<()> {
     let mut w = csv::Writer::from_writer(out);
     w.write_record([
+        "schema_version",
+        "agent",
+        "provider",
         "day",
         "month",
         "source",
@@ -47,6 +50,8 @@ pub fn csv(report: &Report, out: impl Write) -> Result<()> {
         "project",
         "model",
         "mode",
+        "agents",
+        "providers",
         "input",
         "cached",
         "cache_write",
@@ -65,15 +70,25 @@ pub fn csv(report: &Report, out: impl Write) -> Result<()> {
     ])?;
     for row in &report.rows {
         let c = &row.counts;
-        let mut values = [
-            "day", "month", "source", "session", "project", "model", "mode",
-        ]
-        .into_iter()
-        .map(|key| row.dimensions.get(key).cloned().unwrap_or_default())
-        .collect::<Vec<_>>();
-        if values[6].is_empty() {
-            values[6] = c.modes.iter().cloned().collect::<Vec<_>>().join("|");
+        let mut values = ["agent", "provider"]
+            .into_iter()
+            .map(|key| row.dimensions.get(key).cloned().unwrap_or_default())
+            .collect::<Vec<_>>();
+        values.insert(0, "2".into());
+        values.extend(
+            [
+                "day", "month", "source", "session", "project", "model", "mode",
+            ]
+            .into_iter()
+            .map(|key| row.dimensions.get(key).cloned().unwrap_or_default()),
+        );
+        if values[8].is_empty() {
+            values[8] = c.modes.iter().cloned().collect::<Vec<_>>().join("|");
         }
+        values.extend([
+            serde_json::to_string(&c.agents)?,
+            serde_json::to_string(&c.providers)?,
+        ]);
         values.extend([
             c.input.to_string(),
             c.cached.to_string(),

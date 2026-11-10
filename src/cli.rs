@@ -1,3 +1,4 @@
+use crate::model::AgentKind;
 use chrono::NaiveDate;
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
@@ -40,6 +41,8 @@ pub enum Sort {
 pub enum Group {
     Model,
     Mode,
+    Agent,
+    Provider,
     Source,
     Day,
     Month,
@@ -74,15 +77,18 @@ impl Mode {
 #[derive(Debug, Clone, Parser, Serialize, Deserialize)]
 #[command(
     version,
-    about = "Local Codex usage reports and live monitoring",
-    after_help = "Defaults:\n  With no subcommand, run daily since the most recent quota reset in loaded logs.\n  Fall back to the last 7 days, including today, when reset data is unavailable.\n  Every invocation uses fresh command options. Monitor shows today only.\n  Costs estimate API model tokens in USD, not subscription charges.\n\nExamples:\n  codex-usage daily --last 7\n  codex-usage models --today --mode fast\n  codex-usage monitor --source wsl --source windows\n  codex-usage sources\n\nPress Ctrl+C to cancel loading; use q or Ctrl+C to leave the live viewer."
+    about = "Local Codex and Claude Code usage reports and live monitoring",
+    after_help = "Defaults:\n  With no subcommand, run daily since the most recent Codex quota reset when every\n  selected source is Codex. Any Claude Code source uses the last 7 days, including today.\n  Every invocation uses fresh command options. Monitor shows today only.\n  Costs estimate API model tokens in USD, not subscription charges.\n\nExamples:\n  agent-usage daily --last 7\n  agent-usage models --today --mode fast\n  agent-usage models --agent claude-code --all\n  agent-usage monitor --source codex --source claude\n  agent-usage sources\n\nPress Ctrl+C to cancel loading; use q or Ctrl+C to leave the live viewer."
 )]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
-    /// Config file; otherwise CODEX_USAGE_CONFIG or the native app config directory.
+    /// Config file; otherwise AGENT_USAGE_CONFIG or the native app config directory.
     #[arg(long, global = true, value_name = "PATH")]
     pub config: Option<PathBuf>,
+    /// Select agent; repeat to combine Codex and Claude Code.
+    #[arg(long = "agent", global = true, value_name = "AGENT")]
+    pub agents: Vec<AgentKind>,
     /// Read this session's conversation, including messages and tool activity.
     #[arg(long, global = true, hide = true)]
     #[serde(default)]
@@ -95,7 +101,7 @@ pub struct Cli {
         value_name = "NAME"
     )]
     pub sources: Vec<String>,
-    /// Read a Codex home directly; repeat to combine paths, or use with sources set.
+    /// Read an agent data root directly; repeat to combine paths. Requires --agent.
     #[arg(long = "root", global = true, value_name = "PATH")]
     pub roots: Vec<PathBuf>,
     /// Include an exact model ID; repeat to include several models.
@@ -104,8 +110,8 @@ pub struct Cli {
     /// Filter recorded service mode; missing historical settings remain unknown.
     #[arg(long, global = true)]
     pub mode: Option<Mode>,
-    /// Include a session ID; repeat to include several sessions.
-    #[arg(long = "session", global = true, value_name = "ID")]
+    /// Include a session selector; repeat to include several sessions.
+    #[arg(long = "session", global = true, value_name = "SELECTOR")]
     pub sessions: Vec<String>,
     /// Match project path or directory name.
     #[arg(long = "project", global = true, value_name = "PATH_OR_NAME")]
@@ -172,35 +178,35 @@ pub struct Cli {
 pub enum Command {
     /// Summarize usage by model and recorded service mode.
     #[command(
-        after_help = "Examples:\n  codex-usage models --today\n  codex-usage models --last 7 --mode fast\n  codex-usage models --all --format json\n\nDefault period: this month. Use --group-by model to combine service modes."
+        after_help = "Examples:\n  agent-usage models --today\n  agent-usage models --last 7 --mode fast\n  agent-usage models --all --format json\n\nDefault period: this month. Use --group-by model to combine service modes."
     )]
     Models,
     /// Report daily usage, with model and mode rows under each date.
     #[command(
-        after_help = "Examples:\n  codex-usage daily --last 7\n  codex-usage daily --since 2026-11-01 --until 2026-11-04\n  codex-usage daily --all --format csv\n\nDefault period: since the most recent quota reset, including short-term quotas.\nUnavailable, expired, or conflicting reset data falls back to the last 7 days.\nNo extra history is loaded to find a reset. --last N includes today; date bounds are inclusive."
+        after_help = "Examples:\n  agent-usage daily --last 7\n  agent-usage daily --since 2026-11-01 --until 2026-11-04\n  agent-usage daily --all --format csv\n  agent-usage daily --agent claude-code --last 7\n\nDefault period: Codex-only selections use the most recent quota reset,\nincluding short-term quotas. Any Claude Code source uses the last 7 days\nbecause Claude quota data is unsupported. Explicit dates always override this.\nNo extra history is loaded to find a reset. --last N includes today; date bounds are inclusive."
     )]
     Daily,
     /// Report monthly usage by model and recorded service mode.
     #[command(
-        after_help = "Examples:\n  codex-usage monthly --all\n  codex-usage monthly --since 2026-01-01\n\nDefault period: this month. Use --all or --since to include earlier months."
+        after_help = "Examples:\n  agent-usage monthly --all\n  agent-usage monthly --since 2026-01-01\n\nDefault period: this month. Use --all or --since to include earlier months."
     )]
     Monthly,
     /// Break down each session by model and recorded service mode.
     #[command(
-        after_help = "Examples:\n  codex-usage sessions --last 7\n  codex-usage sessions --all --project my-project\n\nDefault period: this month. A session can have several model/mode rows."
+        after_help = "Examples:\n  agent-usage sessions --last 7\n  agent-usage sessions --all --project my-project\n\nDefault period: this month. A session can have several model/mode rows."
     )]
     Sessions,
-    /// Report usage for one session ID.
+    /// Report usage for one session selector.
     #[command(
-        after_help = "Examples:\n  codex-usage session SESSION_ID --all\n  codex-usage session SESSION_ID --last 7\n  codex-usage session SESSION_ID --conversation\n  codex-usage session SESSION_ID --conversation --format json\n\nDefault period: this month. Use --all for the session's complete retained history."
+        after_help = "Examples:\n  agent-usage session codex:SESSION_ID --all\n  agent-usage session claude-code:SESSION_ID --last 7\n  agent-usage session claude-code:SESSION_ID:AGENT_ID --conversation\n  agent-usage session claude-code:SESSION_ID --conversation --format json\n\nSelectors are <agent>:<session>[:<execution>]; reserved bytes are percent-encoded.\nA bare session ID resolves only when exactly one session matches.\nDefault period: this month. Use --all for the session's complete retained history."
     )]
     Session {
-        /// Session ID shown by the sessions report.
+        /// Qualified session selector, or a unique bare session ID.
         id: String,
     },
     /// Live summary of today's usage in the selected timezone.
     #[command(
-        after_help = "Examples:\n  codex-usage monitor\n  codex-usage monitor --source wsl --source windows\n  codex-usage monitor --interval 5s\n  codex-usage monitor --format jsonl --frames 5 > live.jsonl\n\nToday's estimate starts at local midnight; its range ends at the latest snapshot.\nThe title shows the timezone. FILTERED marks active model/mode/session/project filters.\nThe activity row follows --interval (default 2s), showing changes since the previous snapshot.\nn/a means unavailable cost; * marks incomplete estimates.\nFullscreen: summary, 30s rolling output chart (up to 60 chart points), model table, pinned total/controls.\nThe chart opens with recent logged history, then updates each refresh.\nQuota status and approximate remaining total tokens/exhaustion appear when already-loaded logs support them.\nNo extra files are loaded for quota forecasts; unreliable forecasts are omitted.\nc toggles the chart; it hides automatically when space is limited.\nTerminal output updates in place; redirected output defaults to JSONL.\nq/Ctrl+C quits; Ctrl+C also cancels loading. Totals and chart reset at local midnight.\nCurrent speed uses actual elapsed time; the parentheses show the 60s per-session average."
+        after_help = "Examples:\n  agent-usage monitor\n  agent-usage monitor --source codex --source claude\n  agent-usage monitor --agent claude-code\n  agent-usage monitor --interval 5s\n  agent-usage monitor --format jsonl --frames 5 > live.jsonl\n\nToday's estimate starts at local midnight; its range ends at the latest snapshot.\nThe title shows the timezone. FILTERED marks active model/mode/session/project filters.\nEach selected agent has its own activity, 30s rolling output chart, and chart history;\nagents are never averaged together. The model table also separates agent and provider.\nThe activity row follows --interval (default 2s), showing changes since the previous snapshot.\nn/a means unavailable cost; * marks incomplete estimates.\nFullscreen: summary, per-agent charts (up to 60 points each), model table, pinned total/controls.\nCharts open with recent logged history, then update each refresh.\nQuota status and approximate remaining total tokens/exhaustion appear for Codex when loaded logs support them.\nNo extra files are loaded for quota forecasts; unreliable forecasts are omitted.\nc toggles the charts; they hide automatically when space is limited.\nTerminal output updates in place; redirected output defaults to JSONL.\nq/Ctrl+C quits; Ctrl+C also cancels loading. Totals and charts reset at local midnight.\nCurrent speed uses actual elapsed time; the parentheses show the 60s per-session average."
     )]
     Monitor {
         /// Refresh cadence, e.g. 2s or 1000ms (1s to 3600s).
@@ -212,7 +218,7 @@ pub enum Command {
     },
     /// List configured/discovered sources, or change their paths and enabled state.
     #[command(
-        after_help = "Examples:\n  codex-usage sources\n  codex-usage sources --format json\n  codex-usage sources set windows --kind windows --root /mnt/c/Users/NAME/.codex\n  codex-usage sources set wsl --kind wsl --root ~/.codex\n  codex-usage sources enable windows\n\nWith no action, lists saved sources and accessible candidates. Use the listed name\nto enable a discovered source. Windows and WSL paths are configured independently."
+        after_help = "Examples:\n  agent-usage sources\n  agent-usage sources --format json\n  agent-usage sources --agent claude-code\n  agent-usage sources set codex --agent codex --kind wsl --root ~/.codex\n  agent-usage sources set claude --agent claude-code --kind wsl --root ~/.claude\n  agent-usage sources enable windows-USER-claude-code\n\nWith no action, lists saved sources and accessible candidates with agent, OS,\nenabled state, and path availability. A new source requires --agent and --kind.\nUse the listed name to enable a discovered source; enabling materializes all\ncurrent implicit native sources first. Paths are configured independently."
     )]
     Sources {
         #[command(subcommand)]
@@ -220,12 +226,12 @@ pub enum Command {
     },
     /// Show the bundled pricing snapshot and any custom rate overrides.
     #[command(
-        after_help = "Examples:\n  codex-usage pricing\n  codex-usage pricing --format json\n  codex-usage pricing --pricing-file rates.toml\n\nRates are USD per million tokens. Reports use current rates unless --pricing-date\nis set; estimates exclude tool fees, regional uplifts, taxes and subscriptions."
+        after_help = "Examples:\n  agent-usage pricing\n  agent-usage pricing --format json\n  agent-usage pricing --pricing-file rates.toml\n\nRates are USD per million tokens for OpenAI, Anthropic, and common third-party\nAnthropic-compatible models. Cache writes are priced per TTL bucket; a missing\nrate leaves the event unpriced rather than silently discounted. Reports use\ncurrent rates unless --pricing-date is set; estimates exclude tool fees,\nregional uplifts, taxes and subscriptions."
     )]
     Pricing,
     /// Check source readability, parsing issues, and duplicate-record coverage.
     #[command(
-        after_help = "Examples:\n  codex-usage doctor --no-cost\n  codex-usage doctor --all --strict --no-cost\n  codex-usage doctor --source windows --format json\n\nUse --all to inspect every retained log. --no-cost checks data without requiring\nprice coverage. Report accounting details are also available with ? in the viewer."
+        after_help = "Examples:\n  agent-usage doctor --no-cost\n  agent-usage doctor --agent claude-code --no-cost\n  agent-usage doctor --all --strict --no-cost\n  agent-usage doctor --source claude-linux --format json\n\nUse --all to inspect every retained log. Each source reports its agent, quota\ncapability, local coverage, and excluded usage. --no-cost checks data without\nrequiring price coverage. Report accounting details are also available with ? in the viewer."
     )]
     Doctor,
 }
@@ -233,7 +239,7 @@ pub enum Command {
 pub enum SourceCommand {
     /// Add or update one source using --root PATH.
     #[command(
-        after_help = "Examples:\n  codex-usage sources set windows --kind windows --root /mnt/c/Users/NAME/.codex\n  codex-usage sources set wsl --kind wsl --root ~/.codex\n\nRequires exactly one --root. A new source requires --kind and starts enabled;\nupdating an existing source preserves its enabled state."
+        after_help = "Examples:\n  agent-usage sources set codex --agent codex --kind wsl --root ~/.codex\n  agent-usage sources set claude --agent claude-code --kind linux --root ~/.claude\n\nRequires exactly one --root. A new source requires --agent and --kind and starts\nenabled; updating an existing source preserves omitted agent/kind and its enabled state."
     )]
     Set {
         /// Name to create or update, e.g. windows or wsl.
@@ -244,7 +250,7 @@ pub enum SourceCommand {
     },
     /// Include a saved or discovered source in default reports.
     #[command(
-        after_help = "Example:\n  codex-usage sources enable windows\n\nUse a name shown by codex-usage sources. Enabling a discovered candidate saves it\nwithout dropping the current native source."
+        after_help = "Example:\n  agent-usage sources enable windows\n\nUse a name shown by agent-usage sources. Enabling a discovered candidate saves it\nwithout dropping the current native source."
     )]
     Enable {
         /// Saved source or discovered candidate name shown by sources.
@@ -252,7 +258,7 @@ pub enum SourceCommand {
     },
     /// Exclude a source from default reports while keeping its saved path.
     #[command(
-        after_help = "Example:\n  codex-usage sources disable windows\n\nThe source remains configured. Select it explicitly with --source NAME to read it\nwithout enabling it by default."
+        after_help = "Example:\n  agent-usage sources disable windows\n\nThe source remains configured. Select it explicitly with --source NAME to read it\nwithout enabling it by default."
     )]
     Disable {
         /// Source name shown by sources.
@@ -388,12 +394,28 @@ impl Cli {
             return self.group_by.clone();
         }
         match self.command {
-            None | Some(Command::Daily) => vec![Group::Day, Group::Model, Group::Mode],
-            Some(Command::Monthly) => vec![Group::Month, Group::Model, Group::Mode],
-            Some(Command::Sessions | Command::Session { .. }) => {
-                vec![Group::Session, Group::Model, Group::Mode]
-            }
-            _ => vec![Group::Model, Group::Mode],
+            None | Some(Command::Daily) => vec![
+                Group::Day,
+                Group::Agent,
+                Group::Provider,
+                Group::Model,
+                Group::Mode,
+            ],
+            Some(Command::Monthly) => vec![
+                Group::Month,
+                Group::Agent,
+                Group::Provider,
+                Group::Model,
+                Group::Mode,
+            ],
+            Some(Command::Sessions | Command::Session { .. }) => vec![
+                Group::Session,
+                Group::Agent,
+                Group::Provider,
+                Group::Model,
+                Group::Mode,
+            ],
+            _ => vec![Group::Agent, Group::Provider, Group::Model, Group::Mode],
         }
     }
     pub fn kind(&self) -> &'static str {

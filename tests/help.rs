@@ -1,5 +1,5 @@
+use agent_usage::cli::Cli;
 use clap::CommandFactory;
-use codex_usage::cli::Cli;
 use std::process::Command;
 
 #[test]
@@ -31,7 +31,7 @@ fn every_command_and_argument_has_a_help_description() {
 }
 
 fn help(path: &[&str]) -> String {
-    let output = Command::new(env!("CARGO_BIN_EXE_codex-usage"))
+    let output = Command::new(env!("CARGO_BIN_EXE_agent-usage"))
         .args(path)
         .arg("--help")
         .output()
@@ -126,7 +126,7 @@ fn built_in_help_command_resolves_nested_action_help() {
         vec!["help", "sources", "set"],
         vec!["sources", "help", "enable"],
     ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_codex-usage"))
+        let output = Command::new(env!("CARGO_BIN_EXE_agent-usage"))
             .args(&args)
             .output()
             .unwrap();
@@ -142,7 +142,7 @@ fn built_in_help_command_resolves_nested_action_help() {
 #[test]
 fn monitor_interval_and_frame_defaults_do_not_depend_on_prior_parses() {
     let matches = Cli::command()
-        .try_get_matches_from(["codex-usage", "monitor"])
+        .try_get_matches_from(["agent-usage", "monitor"])
         .unwrap();
     let monitor = matches.subcommand_matches("monitor").unwrap();
     assert_eq!(
@@ -152,7 +152,7 @@ fn monitor_interval_and_frame_defaults_do_not_depend_on_prior_parses() {
     assert_eq!(monitor.get_one::<u64>("frames"), None);
     let overridden = Cli::command()
         .try_get_matches_from([
-            "codex-usage",
+            "agent-usage",
             "monitor",
             "--interval",
             "5s",
@@ -169,7 +169,7 @@ fn monitor_interval_and_frame_defaults_do_not_depend_on_prior_parses() {
     );
     assert_eq!(monitor.get_one::<u64>("frames"), Some(&3));
     let fresh = Cli::command()
-        .try_get_matches_from(["codex-usage", "monitor"])
+        .try_get_matches_from(["agent-usage", "monitor"])
         .unwrap();
     let monitor = fresh.subcommand_matches("monitor").unwrap();
     assert_eq!(

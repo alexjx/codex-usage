@@ -1,5 +1,5 @@
 //! Persistent source configuration. Configuration never causes an unselected source to be read.
-use crate::model::Source;
+use crate::model::{AgentKind, Source};
 use anyhow::{anyhow, bail, Context, Result};
 use directories::{BaseDirs, ProjectDirs};
 use serde::{Deserialize, Serialize};
@@ -12,13 +12,29 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub const CONFIG_VERSION: u32 = 2;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    #[serde(default = "config_version")]
+    pub version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timezone: Option<String>,
     #[serde(default)]
     pub sources: Vec<Source>,
+}
+fn config_version() -> u32 {
+    CONFIG_VERSION
+}
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            version: CONFIG_VERSION,
+            timezone: None,
+            sources: Vec::new(),
+        }
+    }
 }
 
 /// Sources shown by `sources`; discovery does not persist or enable candidates.
@@ -32,13 +48,18 @@ impl SourceCatalog {
         let mut names: BTreeSet<_> = sources.iter().map(|s| s.name.clone()).collect();
         let mut roots = sources
             .iter()
-            .map(|s| path_identity(&s.root))
+            .map(|s| Ok((s.agent, path_identity(&s.root)?)))
             .collect::<Result<BTreeSet<_>>>()?;
         let mut candidates = Vec::new();
-        discovered.sort_by(|a, b| a.root.cmp(&b.root).then(a.name.cmp(&b.name)));
+        discovered.sort_by(|a, b| {
+            a.agent
+                .cmp(&b.agent)
+                .then(a.root.cmp(&b.root))
+                .then(a.name.cmp(&b.name))
+        });
         for mut candidate in discovered {
             candidate.root = normalize_path(&candidate.root)?;
-            if !roots.insert(path_identity(&candidate.root)?) {
+            if !roots.insert((candidate.agent, path_identity(&candidate.root)?)) {
                 continue;
             }
             // A discovered folder must not shadow a different saved source.
@@ -68,10 +89,10 @@ pub fn config_path(override_path: Option<&Path>) -> Result<PathBuf> {
     if let Some(path) = override_path {
         return normalize_path(path);
     }
-    if let Some(path) = env::var_os("CODEX_USAGE_CONFIG").filter(|value| !value.is_empty()) {
+    if let Some(path) = env::var_os("AGENT_USAGE_CONFIG").filter(|value| !value.is_empty()) {
         return normalize_path(Path::new(&path));
     }
-    let project = ProjectDirs::from("", "", "codex-usage")
+    let project = ProjectDirs::from("", "", "agent-usage")
         .ok_or_else(|| anyhow!("Cannot find your configuration directory; use --config <path>"))?;
     Ok(project.config_dir().join("config.toml"))
 }
@@ -90,6 +111,14 @@ impl Config {
         };
         let mut config: Self = toml::from_str(&input)
             .with_context(|| format!("Invalid configuration {}", path.display()))?;
+        if config.version != CONFIG_VERSION {
+            bail!(
+                "Configuration {} uses version {}; version {} is required",
+                path.display(),
+                config.version,
+                CONFIG_VERSION
+            );
+        }
         // Paths edited by hand are relative to the config file, not an unrelated shell cwd.
         let base = normalize_path(path)?
             .parent()
@@ -121,7 +150,7 @@ impl Config {
         let mut temporary = None;
         for _ in 0..100 {
             let name = format!(
-                ".codex-usage-{}-{}.tmp",
+                ".agent-usage-{}-{}.tmp",
                 std::process::id(),
                 NEXT.fetch_add(1, Ordering::Relaxed)
             );
@@ -158,7 +187,13 @@ impl Config {
         Ok(())
     }
 
-    pub fn set_source(&mut self, name: &str, kind: Option<&str>, root: &Path) -> Result<()> {
+    pub fn set_source(
+        &mut self,
+        name: &str,
+        agent: Option<AgentKind>,
+        kind: Option<&str>,
+        root: &Path,
+    ) -> Result<()> {
         validate_name(name)?;
         if let Some(kind) = kind {
             validate_kind(kind)?;
@@ -171,17 +206,24 @@ impl Config {
             .find(|source| source.name == name)
         {
             existing.root = root;
+            if let Some(agent) = agent {
+                existing.agent = agent;
+            }
             if let Some(kind) = kind {
                 existing.kind = kind.to_owned();
             }
         } else {
+            let agent = agent
+                .ok_or_else(|| anyhow!("New source {name:?} requires --agent codex|claude-code"))?;
             let kind = kind
                 .ok_or_else(|| anyhow!("New source {name:?} requires --kind wsl|windows|linux"))?;
             updated.sources.push(Source {
                 name: name.to_owned(),
+                agent,
                 kind: kind.to_owned(),
                 root,
                 enabled: true,
+                pricing_provider: None,
             });
         }
         updated.validate()?;
@@ -189,18 +231,30 @@ impl Config {
         Ok(())
     }
 
-    pub fn set_enabled(&mut self, name: &str, enabled: bool) -> Result<()> {
+    pub fn set_enabled(
+        &mut self,
+        name: &str,
+        enabled: bool,
+        agent: Option<AgentKind>,
+    ) -> Result<()> {
         if let Some(source) = self.sources.iter_mut().find(|source| source.name == name) {
+            if agent.is_some_and(|agent| agent != source.agent) {
+                bail!(
+                    "Source {name:?} is {}, not {}",
+                    source.agent,
+                    agent.unwrap()
+                );
+            }
             source.enabled = enabled;
             return Ok(());
         }
         let catalog = self.source_catalog()?;
-        self.set_enabled_from_catalog(name, enabled, catalog)
+        self.set_enabled_from_catalog(name, enabled, agent, catalog)
     }
 
     pub fn source_catalog(&self) -> Result<SourceCatalog> {
         let sources = if self.sources.is_empty() {
-            self.select(&[], &[])?
+            implicit_sources(&[])?
         } else {
             self.sources.clone()
         };
@@ -211,10 +265,23 @@ impl Config {
         &mut self,
         name: &str,
         enabled: bool,
+        agent: Option<AgentKind>,
         catalog: SourceCatalog,
     ) -> Result<()> {
-        let selected=catalog.sources.iter().chain(&catalog.candidates).find(|source|source.name==name)
-            .ok_or_else(||anyhow!("Unknown source {name:?}; run `codex-usage sources` and use a listed name, or configure a path with `sources set`"))?.clone();
+        let selected = catalog
+            .sources
+            .iter()
+            .chain(&catalog.candidates)
+            .find(|source| source.name == name)
+            .ok_or_else(|| anyhow!("Unknown source {name:?}; run `agent-usage sources` and use a listed name, or configure a path with `sources set`"))?
+            .clone();
+        if agent.is_some_and(|agent| agent != selected.agent) {
+            bail!(
+                "Source {name:?} is {}, not {}",
+                selected.agent,
+                agent.unwrap()
+            );
+        }
         let mut updated = self.clone();
         if updated.sources.is_empty() {
             // Preserve the native implicit source when registering the first candidate.
@@ -237,20 +304,35 @@ impl Config {
         Ok(())
     }
 
-    pub fn select(&self, names: &[String], roots: &[PathBuf]) -> Result<Vec<Source>> {
+    /// Pure selection, run before any transcript is read.
+    pub fn select(
+        &self,
+        names: &[String],
+        roots: &[PathBuf],
+        agents: &[AgentKind],
+    ) -> Result<Vec<Source>> {
+        let requested: BTreeSet<AgentKind> = agents.iter().copied().collect();
         if !names.is_empty() && !roots.is_empty() {
             bail!("Use --source or --root, not both");
         }
-        let selected = if !roots.is_empty() {
+        let mut selected = if !roots.is_empty() {
+            if requested.len() > 1 {
+                bail!("--root requires one --agent value (codex or claude-code)");
+            }
+            let agent = agents.first().copied().ok_or_else(|| {
+                anyhow!("--root requires --agent codex|claude-code so the layout is known")
+            })?;
             roots
                 .iter()
                 .enumerate()
                 .map(|(index, root)| {
                     Ok(Source {
                         name: format!("root-{}", index + 1),
+                        agent,
                         kind: native_kind(),
                         root: normalize_path(root)?,
                         enabled: true,
+                        pricing_provider: None,
                     })
                 })
                 .collect::<Result<Vec<_>>>()?
@@ -265,7 +347,7 @@ impl Config {
                     .sources
                     .iter()
                     .find(|source| &source.name == name)
-                    .ok_or_else(|| anyhow!("Unknown source {name:?}; run `codex-usage sources`"))?;
+                    .ok_or_else(|| anyhow!("Unknown source {name:?}; run `agent-usage sources`"))?;
                 selected.push(source.clone());
             }
             selected
@@ -277,29 +359,37 @@ impl Config {
                 .cloned()
                 .collect();
             if selected.is_empty() {
-                bail!("No sources enabled; run `codex-usage sources enable <name>`");
+                bail!("No sources enabled; run `agent-usage sources enable <name>`");
             }
             selected
         } else {
-            let kind = native_kind();
-            let root = if let Some(root) = env::var_os("CODEX_HOME").filter(|root| !root.is_empty())
-            {
-                normalize_path(Path::new(&root))?
-            } else {
-                home_dir()?.join(".codex")
-            };
-            vec![Source {
-                name: kind.clone(),
-                kind,
-                root,
-                enabled: true,
-            }]
+            implicit_sources(&[])?
         };
+        if !requested.is_empty() {
+            selected.retain(|source| requested.contains(&source.agent));
+        }
+        if selected.is_empty() {
+            bail!(
+                "No selected sources match --agent {}; run `agent-usage sources`",
+                agents
+                    .iter()
+                    .map(|agent| agent.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+        }
         validate_sources(&selected)?;
         Ok(selected)
     }
 
     pub fn validate(&self) -> Result<()> {
+        if self.version != CONFIG_VERSION {
+            bail!(
+                "Configuration version {} is unsupported; version {} is required",
+                self.version,
+                CONFIG_VERSION
+            );
+        }
         if let Some(timezone) = &self.timezone {
             timezone.parse::<chrono_tz::Tz>().with_context(|| {
                 format!("Unknown timezone {timezone:?}; use an IANA name such as Asia/Shanghai")
@@ -447,10 +537,11 @@ fn validate_sources(sources: &[Source]) -> Result<()> {
         if !names.insert(&source.name) {
             bail!("Duplicate source name {:?}", source.name);
         }
-        if !paths.insert(path_identity(&source.root)?) {
+        if !paths.insert((source.agent, path_identity(&source.root)?)) {
             bail!(
-                "Source {:?} points to an already configured root: {}",
+                "Source {:?} points to an already configured {} root: {}",
                 source.name,
+                source.agent,
                 source.root.display()
             );
         }
@@ -469,6 +560,44 @@ pub fn native_kind() -> String {
     } else {
         "linux".into()
     }
+}
+
+fn env_root(agent: AgentKind) -> (&'static str, &'static str) {
+    match agent {
+        AgentKind::Codex => ("CODEX_HOME", ".codex"),
+        AgentKind::ClaudeCode => ("CLAUDE_CONFIG_DIR", ".claude"),
+    }
+}
+
+/// Native implicit roots. An explicit environment root is retained even when it
+/// is currently unreadable; a missing conventional default is skipped.
+fn implicit_sources(agents: &[AgentKind]) -> Result<Vec<Source>> {
+    let requested: BTreeSet<AgentKind> = agents.iter().copied().collect();
+    let mut sources = Vec::new();
+    for agent in [AgentKind::Codex, AgentKind::ClaudeCode] {
+        if !requested.is_empty() && !requested.contains(&agent) {
+            continue;
+        }
+        let (variable, default) = env_root(agent);
+        let root = if let Some(root) = env::var_os(variable).filter(|root| !root.is_empty()) {
+            normalize_path(Path::new(&root))?
+        } else {
+            let root = home_dir()?.join(default);
+            if !root.is_dir() {
+                continue;
+            }
+            normalize_path(&root)?
+        };
+        sources.push(Source {
+            name: agent.as_str().into(),
+            agent,
+            kind: native_kind(),
+            root,
+            enabled: true,
+            pricing_provider: None,
+        });
+    }
+    Ok(sources)
 }
 
 /// Discover accessible Windows candidates on WSL, without selecting or saving them.
@@ -501,17 +630,7 @@ pub fn candidates() -> Vec<Source> {
             continue;
         };
         for profile in profiles.flatten() {
-            let root = profile.path().join(".codex");
-            if !root.is_dir() {
-                continue;
-            }
-            let Ok(root) = normalize_path(&root) else {
-                continue;
-            };
-            if !seen.insert(root.clone()) {
-                continue;
-            }
-            let name = profile
+            let label = profile
                 .file_name()
                 .to_string_lossy()
                 .chars()
@@ -523,17 +642,32 @@ pub fn candidates() -> Vec<Source> {
                     }
                 })
                 .collect::<String>();
-            result.push(Source {
-                name: format!("windows-{name}"),
-                kind: "windows".into(),
-                root,
-                enabled: false,
-            });
+            for agent in [AgentKind::Codex, AgentKind::ClaudeCode] {
+                let (_, default) = env_root(agent);
+                let root = profile.path().join(default);
+                if !root.is_dir() {
+                    continue;
+                }
+                let Ok(root) = normalize_path(&root) else {
+                    continue;
+                };
+                if !seen.insert((agent, root.clone())) {
+                    continue;
+                }
+                result.push(Source {
+                    name: format!("windows-{label}-{agent}"),
+                    agent,
+                    kind: "windows".into(),
+                    root,
+                    enabled: false,
+                    pricing_provider: None,
+                });
+            }
         }
     }
-    result.sort_by(|a, b| a.root.cmp(&b.root));
+    result.sort_by(|a, b| a.root.cmp(&b.root).then(a.agent.cmp(&b.agent)));
     if result.len() == 1 {
-        result[0].name = "windows".into();
+        result[0].name = format!("windows-{}", result[0].agent);
     }
     result
 }
@@ -543,27 +677,35 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    fn source(name: &str, agent: AgentKind, root: PathBuf) -> Source {
+        Source {
+            name: name.into(),
+            agent,
+            kind: "linux".into(),
+            root,
+            enabled: true,
+            pricing_provider: None,
+        }
+    }
+
     #[test]
     fn enabling_discovered_windows_preserves_implicit_native_source_and_persists() {
         let dir = tempdir().unwrap();
-        let native = Source {
-            name: "wsl".into(),
-            kind: "wsl".into(),
-            root: dir.path().join("wsl"),
-            enabled: true,
-        };
+        let native = source("codex", AgentKind::Codex, dir.path().join("codex"));
         let windows = Source {
-            name: "windows".into(),
-            kind: "windows".into(),
-            root: dir.path().join("windows"),
             enabled: false,
+            ..source(
+                "windows-user-codex",
+                AgentKind::Codex,
+                dir.path().join("windows"),
+            )
         };
         let mut config = Config::default();
         let catalog = SourceCatalog::new(vec![native.clone()], vec![windows.clone()]).unwrap();
         assert!(!catalog.candidates[0].enabled);
         assert!(config.sources.is_empty());
         config
-            .set_enabled_from_catalog("windows", true, catalog)
+            .set_enabled_from_catalog("windows-user-codex", true, None, catalog)
             .unwrap();
         assert_eq!(config.sources.len(), 2);
         assert_eq!(config.sources[0], native);
@@ -574,30 +716,48 @@ mod tests {
                 ..windows
             }
         );
-        assert_eq!(config.select(&[], &[]).unwrap().len(), 2);
+        assert_eq!(config.select(&[], &[], &[]).unwrap().len(), 2);
         let path = dir.path().join("config.toml");
         config.save(&path).unwrap();
         let mut saved = Config::load(&path).unwrap();
         assert_eq!(saved.sources, config.sources);
-        saved.set_enabled("windows", false).unwrap();
-        assert_eq!(saved.select(&[], &[]).unwrap(), vec![native]);
+        saved
+            .set_enabled("windows-user-codex", false, None)
+            .unwrap();
+        assert_eq!(saved.select(&[], &[], &[]).unwrap(), vec![native]);
+    }
+
+    #[test]
+    fn same_root_different_agents_are_distinct_sources() {
+        let dir = tempdir().unwrap();
+        let mut config = Config::default();
+        config
+            .set_source(
+                "shared-codex",
+                Some(AgentKind::Codex),
+                Some("linux"),
+                dir.path(),
+            )
+            .unwrap();
+        config
+            .set_source(
+                "shared-claude",
+                Some(AgentKind::ClaudeCode),
+                Some("linux"),
+                dir.path(),
+            )
+            .unwrap();
+        assert_eq!(config.sources.len(), 2);
+        let selected = config.select(&[], &[], &[AgentKind::ClaudeCode]).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].name, "shared-claude");
     }
 
     #[test]
     fn discovered_names_are_unique_and_do_not_replace_saved_sources() {
         let dir = tempdir().unwrap();
-        let existing = Source {
-            name: "windows".into(),
-            kind: "windows".into(),
-            root: dir.path().join("custom"),
-            enabled: false,
-        };
-        let discovered = Source {
-            name: "windows".into(),
-            kind: "windows".into(),
-            root: dir.path().join("discovered"),
-            enabled: false,
-        };
+        let existing = source("windows", AgentKind::Codex, dir.path().join("custom"));
+        let discovered = source("windows", AgentKind::Codex, dir.path().join("discovered"));
         let mut config = Config {
             sources: vec![existing.clone()],
             ..Default::default()
@@ -606,7 +766,7 @@ mod tests {
         let name = catalog.candidates[0].name.clone();
         assert_ne!(name, existing.name);
         config
-            .set_enabled_from_catalog(&name, true, catalog)
+            .set_enabled_from_catalog(&name, true, None, catalog)
             .unwrap();
         assert_eq!(config.sources[0], existing);
         assert_eq!(config.sources[1].root, discovered.root);
@@ -616,12 +776,7 @@ mod tests {
     #[test]
     fn catalog_deduplicates_roots_and_unknown_enable_does_not_mutate_config() {
         let dir = tempdir().unwrap();
-        let native = Source {
-            name: "wsl".into(),
-            kind: "wsl".into(),
-            root: dir.path().to_path_buf(),
-            enabled: true,
-        };
+        let native = source("codex", AgentKind::Codex, dir.path().to_path_buf());
         let catalog = SourceCatalog::new(
             vec![native.clone()],
             vec![Source {
@@ -634,7 +789,7 @@ mod tests {
         assert!(catalog.candidates.is_empty());
         let mut config = Config::default();
         assert!(config
-            .set_enabled_from_catalog("missing", true, catalog)
+            .set_enabled_from_catalog("missing", true, None, catalog)
             .is_err());
         assert!(config.sources.is_empty());
     }
@@ -644,20 +799,30 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut config = Config::default();
         config
-            .set_source("wsl", Some("wsl"), &dir.path().join("wsl"))
+            .set_source(
+                "wsl",
+                Some(AgentKind::Codex),
+                Some("wsl"),
+                &dir.path().join("wsl"),
+            )
             .unwrap();
         config
-            .set_source("windows", Some("windows"), &dir.path().join("windows"))
+            .set_source(
+                "windows",
+                Some(AgentKind::Codex),
+                Some("windows"),
+                &dir.path().join("windows"),
+            )
             .unwrap();
-        config.set_enabled("windows", false).unwrap();
+        config.set_enabled("windows", false, None).unwrap();
         let original = config.sources[1].clone();
         config
-            .set_source("wsl", None, &dir.path().join("moved"))
+            .set_source("wsl", None, None, &dir.path().join("moved"))
             .unwrap();
         assert_eq!(config.sources[1], original);
         assert_eq!(
             config
-                .select(&[], &[])
+                .select(&[], &[], &[])
                 .unwrap()
                 .iter()
                 .map(|s| s.name.as_str())
@@ -665,46 +830,68 @@ mod tests {
             vec!["wsl"]
         );
         assert_eq!(
-            config.select(&["windows".into()], &[]).unwrap()[0],
+            config.select(&["windows".into()], &[], &[]).unwrap()[0],
             original
         );
         assert_eq!(
             config
-                .select(&["wsl".into(), "windows".into()], &[])
+                .select(&["wsl".into(), "windows".into()], &[], &[])
                 .unwrap()
                 .len(),
             2
         );
         assert!(!config.sources[1].enabled);
         config
-            .set_source("windows", None, &dir.path().join("other-windows"))
+            .set_source("windows", None, None, &dir.path().join("other-windows"))
             .unwrap();
         assert!(!config.sources[1].enabled);
     }
 
     #[test]
-    fn disabled_unknown_and_conflicting_selection_fail() {
+    fn disabled_unknown_conflicting_and_agent_filtered_selection_fail() {
         let dir = tempdir().unwrap();
         let mut config = Config::default();
         config
-            .set_source("wsl", Some("wsl"), &dir.path().join("wsl"))
+            .set_source(
+                "wsl",
+                Some(AgentKind::Codex),
+                Some("wsl"),
+                &dir.path().join("wsl"),
+            )
             .unwrap();
-        config.set_enabled("wsl", false).unwrap();
+        config.set_enabled("wsl", false, None).unwrap();
         assert!(config
-            .select(&[], &[])
+            .select(&[], &[], &[])
             .unwrap_err()
             .to_string()
             .contains("No sources enabled"));
-        assert!(config.select(&["unknown".into()], &[]).is_err());
+        assert!(config.select(&["unknown".into()], &[], &[]).is_err());
         assert!(config
-            .select(&["wsl".into()], &[dir.path().to_path_buf()])
+            .select(&["wsl".into()], &[dir.path().to_path_buf()], &[])
             .is_err());
-        let selected = config.select(&[], &[dir.path().to_path_buf()]).unwrap();
+        // --root requires one explicit agent.
+        assert!(config
+            .select(&[], &[dir.path().to_path_buf()], &[])
+            .is_err());
+        assert!(config
+            .select(
+                &[],
+                &[dir.path().to_path_buf()],
+                &[AgentKind::Codex, AgentKind::ClaudeCode]
+            )
+            .is_err());
+        let selected = config
+            .select(&[], &[dir.path().to_path_buf()], &[AgentKind::ClaudeCode])
+            .unwrap();
         assert_eq!(selected[0].name, "root-1");
+        assert_eq!(selected[0].agent, AgentKind::ClaudeCode);
         assert_eq!(
             selected[0].root.canonicalize().unwrap(),
             dir.path().canonicalize().unwrap()
         );
+        assert!(config
+            .select(&["wsl".into()], &[], &[AgentKind::ClaudeCode])
+            .is_err());
     }
 
     #[test]
@@ -712,22 +899,43 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut config = Config::default();
         config
-            .set_source("first", Some("linux"), dir.path())
+            .set_source("first", Some(AgentKind::Codex), Some("linux"), dir.path())
             .unwrap();
         assert!(config
-            .set_source("alias", Some("wsl"), &dir.path().join("."))
+            .set_source(
+                "alias",
+                Some(AgentKind::Codex),
+                Some("wsl"),
+                &dir.path().join(".")
+            )
             .is_err());
         assert_eq!(config.sources.len(), 1);
         assert!(config
-            .set_source("new", None, &dir.path().join("new"))
+            .set_source("new", Some(AgentKind::Codex), None, &dir.path().join("new"))
             .is_err());
         assert!(config
-            .set_source("bad name", Some("linux"), &dir.path().join("new"))
+            .set_source("new", None, Some("linux"), &dir.path().join("new"))
             .is_err());
         assert!(config
-            .set_source("new", Some("other"), &dir.path().join("new"))
+            .set_source(
+                "bad name",
+                Some(AgentKind::Codex),
+                Some("linux"),
+                &dir.path().join("new")
+            )
             .is_err());
-        assert!(config.set_enabled("missing", true).is_err());
+        assert!(config
+            .set_source(
+                "new",
+                Some(AgentKind::Codex),
+                Some("other"),
+                &dir.path().join("new")
+            )
+            .is_err());
+        assert!(config.set_enabled("missing", true, None).is_err());
+        assert!(config
+            .set_enabled("first", false, Some(AgentKind::ClaudeCode))
+            .is_err());
     }
 
     #[test]
@@ -739,25 +947,43 @@ mod tests {
             ..Config::default()
         };
         config
-            .set_source("wsl", Some("wsl"), &dir.path().join("not-mounted"))
+            .set_source(
+                "wsl",
+                Some(AgentKind::Codex),
+                Some("wsl"),
+                &dir.path().join("not-mounted"),
+            )
             .unwrap();
         config.save(&path).unwrap();
-        config.set_enabled("wsl", false).unwrap();
+        config.set_enabled("wsl", false, None).unwrap();
         config.save(&path).unwrap();
         let loaded = Config::load(&path).unwrap();
         assert_eq!(loaded.sources, config.sources);
         assert_eq!(loaded.timezone, config.timezone);
+        assert_eq!(loaded.version, CONFIG_VERSION);
         assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
     }
 
     #[test]
-    fn malformed_config_and_unknown_timezone_are_errors() {
+    fn malformed_config_unknown_timezone_and_legacy_version_are_rejected() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("config.toml");
         assert!(Config::load(&path).unwrap().sources.is_empty());
         fs::write(&path, "invalid = true").unwrap();
         assert!(Config::load(&path).is_err());
-        fs::write(&path, "timezone = 'not/a-zone'").unwrap();
+        fs::write(&path, "version=2\ntimezone = 'not/a-zone'").unwrap();
+        assert!(Config::load(&path).is_err());
+        fs::write(&path, "version=1\ntimezone = 'UTC'").unwrap();
+        assert!(Config::load(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("version"));
+        // A source must declare its agent.
+        fs::write(
+            &path,
+            "version=2\n[[sources]]\nname='local'\nkind='linux'\nroot='x'\n",
+        )
+        .unwrap();
         assert!(Config::load(&path).is_err());
     }
 
@@ -767,7 +993,7 @@ mod tests {
         let path = dir.path().join("config.toml");
         fs::write(
             &path,
-            "[[sources]]\nname='local'\nkind='linux'\nroot='sessions-root'\n",
+            "version=2\n[[sources]]\nname='local'\nagent='codex'\nkind='linux'\nroot='sessions-root'\n",
         )
         .unwrap();
         let config = Config::load(&path).unwrap();
@@ -784,10 +1010,20 @@ mod tests {
         symlink(dir.path().join("real"), dir.path().join("link")).unwrap();
         let mut config = Config::default();
         config
-            .set_source("real", Some("linux"), &dir.path().join("real/missing"))
+            .set_source(
+                "real",
+                Some(AgentKind::Codex),
+                Some("linux"),
+                &dir.path().join("real/missing"),
+            )
             .unwrap();
         assert!(config
-            .set_source("link", Some("linux"), &dir.path().join("link/missing"))
+            .set_source(
+                "link",
+                Some(AgentKind::Codex),
+                Some("linux"),
+                &dir.path().join("link/missing")
+            )
             .is_err());
     }
 }

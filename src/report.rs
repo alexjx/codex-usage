@@ -1,6 +1,6 @@
 use crate::{
     cli::{Cli, Command, Group, Sort},
-    model::{Coverage, Scan, SourceStatus, UsageEvent},
+    model::{AgentKind, Coverage, Scan, SessionKey, SourceStatus, UsageEvent},
     pricing::{Estimate, Pricer},
 };
 use anyhow::{anyhow, bail, Context, Result};
@@ -19,18 +19,24 @@ pub struct Period {
     pub basis: String,
 }
 impl Period {
-    pub fn make(cli: &Cli, tz: Tz, now: DateTime<Utc>) -> Result<Self> {
+    pub fn make(
+        cli: &Cli,
+        tz: Tz,
+        now: DateTime<Utc>,
+        agents: &BTreeSet<AgentKind>,
+    ) -> Result<Self> {
         if cli.has_monitor_range() {
             bail!("monitor summarizes today only; use daily for historical ranges");
         }
         let today = now.with_timezone(&tz).date_naive();
+        let default_daily = cli.default_daily_period();
         let (start, end) = if cli.monitor() || cli.today {
             (Some(today), Some(today))
         } else if cli.all {
             (None, None)
         } else if cli.since.is_some() || cli.until.is_some() {
             (cli.since, cli.until)
-        } else if let Some(days) = cli.last.or_else(|| cli.default_daily_period().then_some(7)) {
+        } else if let Some(days) = cli.last.or_else(|| default_daily.then_some(7)) {
             (
                 Some(
                     today
@@ -59,8 +65,16 @@ impl Period {
                 })
         };
         Ok(Self {
-            basis: if cli.default_daily_period() {
-                "last_7_days_fallback"
+            basis: if default_daily {
+                if agents.contains(&AgentKind::ClaudeCode) {
+                    if agents.len() > 1 {
+                        "last_7_days_multi_agent"
+                    } else {
+                        "last_7_days_no_quota_capability"
+                    }
+                } else {
+                    "last_7_days_fallback"
+                }
             } else {
                 "calendar"
             }
@@ -93,9 +107,12 @@ impl Period {
         now: DateTime<Utc>,
         quotas: &[crate::quota::QuotaSummary],
         sources: &[SourceStatus],
+        agents: &BTreeSet<AgentKind>,
     ) -> Result<Self> {
-        let mut period = Self::make(cli, tz, now)?;
-        if !cli.default_daily_period() {
+        let mut period = Self::make(cli, tz, now, agents)?;
+        // Quota-relative defaults are a Codex capability only. A Claude source,
+        // even one with no events, keeps the combined range at seven days.
+        if !cli.default_daily_period() || agents.iter().any(|agent| *agent != AgentKind::Codex) {
             return Ok(period);
         }
         // Select the most recent reset per source, including short-term windows.
@@ -174,11 +191,15 @@ pub struct Counts {
     pub pricing_reasons: BTreeSet<String>,
     pub rate_ids: BTreeSet<String>,
     pub modes: BTreeSet<String>,
+    pub agents: BTreeSet<String>,
+    pub providers: BTreeSet<String>,
 }
 impl Counts {
     fn add(&mut self, event: &UsageEvent, estimate: Option<&Estimate>) -> Result<()> {
         let u = &event.usage;
         self.modes.insert(event.mode().to_string());
+        self.agents.insert(event.id.agent.to_string());
+        self.providers.insert(event.provider.clone());
         macro_rules! sum {
             ($field:ident, $v:expr) => {
                 self.$field = self
@@ -243,9 +264,21 @@ pub struct Row {
 }
 impl Row {
     pub fn label(&self) -> String {
-        let label = ["source", "session", "project", "model"]
+        let label = ["source", "agent", "provider", "session", "project", "model"]
             .into_iter()
-            .filter_map(|key| self.dimensions.get(key).cloned())
+            .filter_map(|key| {
+                self.dimensions.get(key).cloned().map(|value| {
+                    if key == "session"
+                        && value
+                            .parse::<SessionKey>()
+                            .is_ok_and(|key| key.execution_id.is_some())
+                    {
+                        format!("{value} (subagent)")
+                    } else {
+                        value
+                    }
+                })
+            })
             .collect::<Vec<_>>()
             .join(" / ");
         if label.is_empty() {
@@ -256,13 +289,29 @@ impl Row {
     }
     pub fn identity(&self) -> String {
         [
-            "day", "month", "source", "session", "project", "model", "mode",
+            "day", "month", "source", "agent", "provider", "session", "project", "model", "mode",
         ]
         .into_iter()
         .filter_map(|k| self.dimensions.get(k).cloned())
         .collect::<Vec<_>>()
         .join(" / ")
     }
+}
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionSpeed {
+    pub session: SessionKey,
+    pub output_tokens_per_second: f64,
+}
+/// Per-agent throughput and rolling chart history. Agents are measured
+/// independently; their token deltas are never added to each other's series.
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentActivity {
+    pub agent: AgentKind,
+    pub since_ready_tokens: i128,
+    pub window_tokens: i128,
+    pub output_tokens_per_second: f64,
+    pub output_speed_history: Vec<Option<f64>>,
+    pub output_speed_window_seconds: u64,
 }
 #[derive(Debug, Clone, Serialize)]
 pub struct MonitorInfo {
@@ -279,8 +328,9 @@ pub struct MonitorInfo {
     pub output_speed_history: Vec<Option<f64>>,
     pub output_speed_window_seconds: u64,
     pub average_session_output_tokens_per_second: f64,
-    pub session_output_tokens_per_second: BTreeMap<String, f64>,
+    pub session_output_tokens_per_second: Vec<SessionSpeed>,
     pub session_speed_window_seconds: u64,
+    pub agent_activity: Vec<AgentActivity>,
     pub scan_millis: u128,
 }
 #[derive(Debug, Clone, Serialize)]
@@ -301,15 +351,78 @@ pub struct Report {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub monitor: Option<MonitorInfo>,
 }
-pub fn matches(cli: &Cli, period: &Period, event: &UsageEvent) -> bool {
+/// Argument-level selector error (exit status 2), distinct from processing
+/// failures such as unreadable sources.
+#[derive(Debug)]
+pub struct SelectorError(pub String);
+impl std::fmt::Display for SelectorError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+impl std::error::Error for SelectorError {}
+
+/// Resolved session selectors. A qualified selector matches exactly; a bare
+/// native ID resolves only when it identifies one SessionKey.
+#[derive(Debug, Clone, Default)]
+pub struct Selection {
+    pub sessions_requested: bool,
+    pub sessions: BTreeSet<SessionKey>,
+    pub command_requested: bool,
+    pub command: Option<SessionKey>,
+}
+fn resolve_one(text: &str, candidates: &BTreeSet<SessionKey>) -> Result<Option<SessionKey>> {
+    if text.contains(':') {
+        let key = text.parse::<SessionKey>().map_err(|error| {
+            SelectorError(format!("Invalid session selector {text:?}: {error}"))
+        })?;
+        return Ok(Some(key));
+    }
+    let matches: Vec<_> = candidates
+        .iter()
+        .filter(|key| key.native_id == text)
+        .cloned()
+        .collect();
+    match matches.as_slice() {
+        [] => Ok(None),
+        [key] => Ok(Some(key.clone())),
+        _ => Err(SelectorError(format!(
+            "Session {text:?} is ambiguous; use a qualified selector: {}",
+            matches
+                .iter()
+                .map(SessionKey::selector)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+        .into()),
+    }
+}
+impl Selection {
+    pub fn resolve(cli: &Cli, scan: &Scan) -> Result<Self> {
+        let mut candidates: BTreeSet<SessionKey> = scan.sessions.keys().cloned().collect();
+        candidates.extend(scan.events.iter().map(|event| event.session.clone()));
+        let mut selection = Self::default();
+        if !cli.sessions.is_empty() {
+            selection.sessions_requested = true;
+            for text in &cli.sessions {
+                if let Some(key) = resolve_one(text, &candidates)? {
+                    selection.sessions.insert(key);
+                }
+            }
+        }
+        if let Some(Command::Session { id }) = &cli.command {
+            selection.command_requested = true;
+            selection.command = resolve_one(id, &candidates)?;
+        }
+        Ok(selection)
+    }
+}
+pub fn matches(cli: &Cli, period: &Period, event: &UsageEvent, selection: &Selection) -> bool {
     period.includes(event.timestamp)
         && (cli.models.is_empty() || cli.models.contains(&event.model))
         && cli.mode.is_none_or(|mode| mode.as_str() == event.mode())
-        && (cli.sessions.is_empty() || cli.sessions.contains(&event.session))
-        && match &cli.command {
-            Some(Command::Session { id }) => event.session == *id,
-            _ => true,
-        }
+        && (!selection.sessions_requested || selection.sessions.contains(&event.session))
+        && (!selection.command_requested || selection.command.as_ref() == Some(&event.session))
         && (cli.projects.is_empty()
             || cli.projects.iter().any(|p| {
                 event.project.as_ref().is_some_and(|path| {
@@ -318,6 +431,33 @@ pub fn matches(cli: &Cli, period: &Period, event: &UsageEvent) -> bool {
                         || normalized.trim_end_matches('/').rsplit('/').next() == Some(p.as_str())
                 })
             }))
+}
+/// Resolve the pricing scenario for a deduplicated event. Conflicting configured
+/// providers across origins make pricing unavailable but retain token usage.
+fn scenario_estimate(
+    pricer: &Pricer,
+    event: &UsageEvent,
+    providers: &BTreeMap<String, Option<String>>,
+) -> Estimate {
+    let origins: Vec<&String> = if event.origins.is_empty() {
+        vec![&event.source]
+    } else {
+        event.origins.iter().collect()
+    };
+    let configured: BTreeSet<&String> = origins
+        .iter()
+        .filter_map(|origin| providers.get(*origin).and_then(Option::as_ref))
+        .collect();
+    if configured.len() > 1 {
+        return Estimate {
+            cost: None,
+            status: "unpriced".into(),
+            assumptions: Vec::new(),
+            reason: Some("Conflicting pricing scenarios across duplicate origins".into()),
+            rate_id: None,
+        };
+    }
+    pricer.estimate_scenario(event, configured.iter().next().map(|value| value.as_str()))
 }
 pub fn build(
     cli: &Cli,
@@ -345,13 +485,25 @@ pub fn build_cancellable(
     stopped: &std::sync::atomic::AtomicBool,
 ) -> Result<Report> {
     crate::cancel::check(stopped)?;
-    let quotas = crate::quota::summarize(
-        &scan.quota_snapshots,
-        &scan.events,
-        now,
-        scan.coverage.incomplete() || scan.sources.iter().any(|source| !source.readable),
-    );
-    let period = Period::with_quota(cli, tz, now, &quotas, &scan.sources)?;
+    let agents: BTreeSet<AgentKind> = scan.sources.iter().map(|source| source.agent).collect();
+    let source_quality: BTreeMap<String, bool> = scan
+        .sources
+        .iter()
+        .map(|source| {
+            (
+                source.name.clone(),
+                !source.readable || source.coverage.incomplete(),
+            )
+        })
+        .collect();
+    let quotas = crate::quota::summarize(&scan.quota_snapshots, &scan.events, now, &source_quality);
+    let period = Period::with_quota(cli, tz, now, &quotas, &scan.sources, &agents)?;
+    let selection = Selection::resolve(cli, scan)?;
+    let providers: BTreeMap<String, Option<String>> = scan
+        .sources
+        .iter()
+        .map(|source| (source.name.clone(), source.pricing_provider.clone()))
+        .collect();
     let groups = cli.groups();
     let date_key = if groups.contains(&Group::Day) {
         Some("day")
@@ -360,13 +512,13 @@ pub fn build_cancellable(
     } else {
         None
     };
-    let mut grouped: BTreeMap<Vec<String>, (Row, BTreeSet<String>)> = BTreeMap::new();
-    let mut dated: BTreeMap<String, (Row, BTreeSet<String>)> = BTreeMap::new();
+    let mut grouped: BTreeMap<Vec<String>, (Row, BTreeSet<SessionKey>)> = BTreeMap::new();
+    let mut dated: BTreeMap<String, (Row, BTreeSet<SessionKey>)> = BTreeMap::new();
     let mut total = Counts::default();
     let mut sessions = BTreeSet::new();
     for event in &scan.events {
         crate::cancel::check(stopped)?;
-        if !matches(cli, &period, event) {
+        if !matches(cli, &period, event, &selection) {
             continue;
         }
         let dimensions: BTreeMap<String, String> = groups
@@ -374,6 +526,8 @@ pub fn build_cancellable(
             .map(|g| match g {
                 Group::Model => ("model", event.model.clone()),
                 Group::Mode => ("mode", event.mode().to_string()),
+                Group::Agent => ("agent", event.id.agent.to_string()),
+                Group::Provider => ("provider", event.provider.clone()),
                 Group::Source => ("source", event.source.clone()),
                 Group::Day => (
                     "day",
@@ -391,7 +545,7 @@ pub fn build_cancellable(
                         .format("%Y-%m")
                         .to_string(),
                 ),
-                Group::Session => ("session", event.session.clone()),
+                Group::Session => ("session", event.session.selector()),
                 Group::Project => ("project", event.project.clone().unwrap_or("unknown".into())),
             })
             .map(|(k, v)| (k.to_string(), v))
@@ -407,7 +561,7 @@ pub fn build_cancellable(
                 BTreeSet::new(),
             )
         });
-        let estimate = pricer.map(|pricer| pricer.estimate(event));
+        let estimate = pricer.map(|pricer| scenario_estimate(pricer, event, &providers));
         row.counts.add(event, estimate.as_ref())?;
         group_sessions.insert(event.session.clone());
         if let (Some(date_key), Some(date)) = (date_key, date) {
@@ -473,7 +627,7 @@ pub fn build_cancellable(
     });
     crate::cancel::check(stopped)?;
     Ok(Report {
-        schema_version: 1,
+        schema_version: 2,
         generated_at: now,
         kind: cli.kind().into(),
         period,
@@ -493,17 +647,22 @@ pub fn build_cancellable(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Usage;
+    use crate::model::{EventKey, Usage};
     use clap::Parser;
 
     fn event(id: &str, session: &str, model: &str, tier: Option<&str>, time: &str) -> UsageEvent {
         UsageEvent {
-            id: id.into(),
+            id: EventKey::new(AgentKind::Codex, id),
             timestamp: time.parse().unwrap(),
-            session: session.into(),
+            session: SessionKey::main(AgentKind::Codex, session),
             model: model.into(),
             provider: "openai".into(),
             tier: tier.map(str::to_owned),
+            mode: match tier {
+                Some("priority" | "fast") => crate::model::UsageMode::Fast,
+                Some(_) => crate::model::UsageMode::Regular,
+                None => crate::model::UsageMode::Unknown,
+            },
             project: Some("/work/test-project".into()),
             usage: Usage {
                 input: 100,
@@ -512,15 +671,18 @@ mod tests {
                 output: 20,
                 reasoning: Some(10),
             },
+            cache_writes: None,
             source: "fixture".into(),
             origins: BTreeSet::new(),
             context_tokens: None,
-            cache_retention: None,
         }
+    }
+    fn agents() -> BTreeSet<AgentKind> {
+        [AgentKind::Codex].into()
     }
 
     fn dated_report(args: &[&str], scan: &Scan, pricer: Option<&Pricer>, tz: Tz) -> Report {
-        let cli = Cli::parse_from(std::iter::once("codex-usage").chain(args.iter().copied()));
+        let cli = Cli::parse_from(std::iter::once("agent-usage").chain(args.iter().copied()));
         build(
             &cli,
             tz,
@@ -741,34 +903,36 @@ mod tests {
     #[test]
     fn timezone_dates_and_end_bounds() {
         let cli = Cli::parse_from([
-            "codex-usage",
+            "agent-usage",
             "--since",
             "2026-11-01",
             "--until",
             "2026-11-01",
         ]);
-        let p = Period::make(&cli, chrono_tz::Asia::Shanghai, Utc::now()).unwrap();
+        let p = Period::make(&cli, chrono_tz::Asia::Shanghai, Utc::now(), &agents()).unwrap();
         assert!(p.includes("2026-10-31T16:00:00Z".parse().unwrap()));
         assert!(!p.includes("2026-11-01T16:00:00Z".parse().unwrap()));
     }
     #[test]
     fn daylight_savings_day_has_correct_length() {
-        let cli = Cli::parse_from(["codex-usage", "--today"]);
+        let cli = Cli::parse_from(["agent-usage", "--today"]);
         let p = Period::make(
             &cli,
             chrono_tz::America::New_York,
             "2026-11-01T17:00:00Z".parse().unwrap(),
+            &agents(),
         )
         .unwrap();
         assert_eq!((p.end.unwrap() - p.start.unwrap()).num_hours(), 25);
     }
     #[test]
     fn last_days_uses_selected_timezone_and_includes_today() {
-        let cli = Cli::parse_from(["codex-usage", "daily", "--last", "30"]);
+        let cli = Cli::parse_from(["agent-usage", "daily", "--last", "30"]);
         let p = Period::make(
             &cli,
             chrono_tz::Asia::Shanghai,
             "2026-11-04T18:00:00Z".parse().unwrap(),
+            &agents(),
         )
         .unwrap();
         assert_eq!(p.label, "2026-10-07–2026-11-05");
@@ -786,11 +950,12 @@ mod tests {
     }
     #[test]
     fn last_days_counts_calendar_dates_across_daylight_saving() {
-        let cli = Cli::parse_from(["codex-usage", "daily"]);
+        let cli = Cli::parse_from(["agent-usage", "daily"]);
         let p = Period::make(
             &cli,
             chrono_tz::America::New_York,
             "2026-11-05T17:00:00Z".parse().unwrap(),
+            &agents(),
         )
         .unwrap();
         assert_eq!(p.label, "2026-10-30–2026-11-05");
@@ -800,11 +965,11 @@ mod tests {
     fn daily_explicit_ranges_and_other_report_defaults_are_preserved() {
         let now = "2026-11-04T18:00:00Z".parse().unwrap();
         for (args, expected) in [
-            (vec!["codex-usage", "daily", "--today"], "2026-11-05"),
-            (vec!["codex-usage", "daily", "--all"], "All time"),
+            (vec!["agent-usage", "daily", "--today"], "2026-11-05"),
+            (vec!["agent-usage", "daily", "--all"], "All time"),
             (
                 vec![
-                    "codex-usage",
+                    "agent-usage",
                     "daily",
                     "--since",
                     "2026-11-01",
@@ -813,24 +978,24 @@ mod tests {
                 ],
                 "2026-11-01–2026-11-03",
             ),
-            (vec!["codex-usage", "models"], "2026-11-01–2026-11-05"),
-            (vec!["codex-usage"], "2026-10-30–2026-11-05"),
-            (vec!["codex-usage", "daily"], "2026-10-30–2026-11-05"),
-            (vec!["codex-usage", "monthly"], "2026-11-01–2026-11-05"),
-            (vec!["codex-usage", "sessions"], "2026-11-01–2026-11-05"),
+            (vec!["agent-usage", "models"], "2026-11-01–2026-11-05"),
+            (vec!["agent-usage"], "2026-10-30–2026-11-05"),
+            (vec!["agent-usage", "daily"], "2026-10-30–2026-11-05"),
+            (vec!["agent-usage", "monthly"], "2026-11-01–2026-11-05"),
+            (vec!["agent-usage", "sessions"], "2026-11-01–2026-11-05"),
             (
-                vec!["codex-usage", "session", "example"],
+                vec!["agent-usage", "session", "example"],
                 "2026-11-01–2026-11-05",
             ),
             (
-                vec!["codex-usage", "daily", "--last", "7"],
+                vec!["agent-usage", "daily", "--last", "7"],
                 "2026-10-30–2026-11-05",
             ),
-            (vec!["codex-usage", "daily", "--last", "1"], "2026-11-05"),
+            (vec!["agent-usage", "daily", "--last", "1"], "2026-11-05"),
         ] {
             let cli = Cli::parse_from(args);
             assert_eq!(
-                Period::make(&cli, chrono_tz::Asia::Shanghai, now)
+                Period::make(&cli, chrono_tz::Asia::Shanghai, now, &agents())
                     .unwrap()
                     .label,
                 expected
@@ -839,11 +1004,12 @@ mod tests {
     }
     #[test]
     fn monitor_is_today_only_in_selected_timezone_and_rolls_at_midnight() {
-        let cli = Cli::parse_from(["codex-usage", "monitor"]);
+        let cli = Cli::parse_from(["agent-usage", "monitor"]);
         let first = Period::make(
             &cli,
             chrono_tz::Asia::Shanghai,
             "2026-11-04T18:00:00Z".parse().unwrap(),
+            &agents(),
         )
         .unwrap();
         assert_eq!(first.label, "2026-11-05");
@@ -854,19 +1020,200 @@ mod tests {
             &cli,
             chrono_tz::Asia::Shanghai,
             "2026-11-05T16:00:00Z".parse().unwrap(),
+            &agents(),
         )
         .unwrap();
         assert_eq!(next.label, "2026-11-06");
         assert_eq!(first.end, next.start);
         for args in [
-            vec!["codex-usage", "monitor", "--all"],
-            vec!["codex-usage", "monitor", "--since", "2026-11-01"],
-            vec!["codex-usage", "monitor", "--until", "2026-11-01"],
-            vec!["codex-usage", "monitor", "--last", "7"],
+            vec!["agent-usage", "monitor", "--all"],
+            vec!["agent-usage", "monitor", "--since", "2026-11-01"],
+            vec!["agent-usage", "monitor", "--until", "2026-11-01"],
+            vec!["agent-usage", "monitor", "--last", "7"],
         ] {
-            assert!(
-                Period::make(&Cli::parse_from(args), chrono_tz::UTC, chrono::Utc::now()).is_err()
-            );
+            assert!(Period::make(
+                &Cli::parse_from(args),
+                chrono_tz::UTC,
+                chrono::Utc::now(),
+                &agents()
+            )
+            .is_err());
         }
+    }
+
+    fn status(name: &str, agent: AgentKind) -> SourceStatus {
+        SourceStatus {
+            name: name.into(),
+            agent,
+            root: format!("/{name}").into(),
+            readable: true,
+            last_success: Some(Utc::now()),
+            error: None,
+            capability: match agent {
+                AgentKind::Codex => crate::model::QuotaCapability::RecordedSnapshots,
+                AgentKind::ClaudeCode => crate::model::QuotaCapability::Unsupported,
+            },
+            coverage: Coverage::default(),
+            pricing_provider: None,
+        }
+    }
+    fn cross_agent_scan() -> Scan {
+        let mut codex = event(
+            "same",
+            "shared",
+            "gpt-6.1-sol",
+            Some("standard"),
+            "2026-11-01T00:00:00Z",
+        );
+        codex.id = EventKey::new(AgentKind::Codex, "message:same");
+        codex.session = SessionKey::main(AgentKind::Codex, "shared");
+        let mut claude = event(
+            "same",
+            "shared",
+            "claude-test",
+            None,
+            "2026-11-01T00:00:00Z",
+        );
+        claude.id = EventKey::new(AgentKind::ClaudeCode, "message:same");
+        claude.session = SessionKey::main(AgentKind::ClaudeCode, "shared");
+        claude.provider = "unknown".into();
+        claude.mode = crate::model::UsageMode::Regular;
+        Scan {
+            events: vec![codex, claude],
+            sources: vec![
+                status("codex-root", AgentKind::Codex),
+                status("claude-root", AgentKind::ClaudeCode),
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn equal_native_ids_across_agents_remain_distinct_in_rows_counts_and_csv() {
+        let cli = Cli::parse_from([
+            "agent-usage",
+            "sessions",
+            "--all",
+            "--no-cost",
+            "--color",
+            "never",
+        ]);
+        let report = build(&cli, chrono_tz::UTC, &cross_agent_scan(), None, Utc::now()).unwrap();
+        assert_eq!(report.schema_version, 2);
+        assert_eq!(report.totals.events, 2);
+        assert_eq!(report.totals.sessions, 2);
+        assert_eq!(report.totals.agents.len(), 2);
+        assert_eq!(report.rows.len(), 2);
+        let sessions: BTreeSet<_> = report
+            .rows
+            .iter()
+            .map(|row| row.dimensions["session"].clone())
+            .collect();
+        assert_eq!(
+            sessions,
+            ["codex:shared".into(), "claude-code:shared".into()].into()
+        );
+        let mut csv = Vec::new();
+        crate::export::csv(&report, &mut csv).unwrap();
+        let text = String::from_utf8(csv).unwrap();
+        assert!(text.starts_with(
+            "schema_version,agent,provider,day,month,source,session,project,model,mode,agents,providers,"
+        ));
+        assert!(text.lines().nth(1).unwrap().starts_with("2,"));
+        assert!(text.contains("\"[\"\"codex\"\"]\""));
+        assert!(text.contains("claude-code:shared"));
+    }
+
+    #[test]
+    fn ambiguous_bare_session_ids_require_a_qualified_selector() {
+        let scan = cross_agent_scan();
+        let bare = Cli::parse_from(["agent-usage", "session", "shared", "--all"]);
+        let error = Selection::resolve(&bare, &scan).unwrap_err().to_string();
+        assert!(error.contains("ambiguous"));
+        assert!(error.contains("codex:shared") && error.contains("claude-code:shared"));
+        let qualified = Cli::parse_from(["agent-usage", "session", "claude-code:shared", "--all"]);
+        let selection = Selection::resolve(&qualified, &scan).unwrap();
+        assert_eq!(
+            selection.command,
+            Some(SessionKey::main(AgentKind::ClaudeCode, "shared"))
+        );
+        // A bare ID that is unique still resolves.
+        let mut single = scan;
+        single
+            .events
+            .retain(|event| event.id.agent == AgentKind::Codex);
+        let bare = Cli::parse_from(["agent-usage", "session", "shared", "--all"]);
+        assert_eq!(
+            Selection::resolve(&bare, &single).unwrap().command,
+            Some(SessionKey::main(AgentKind::Codex, "shared"))
+        );
+    }
+
+    #[test]
+    fn claude_sources_keep_the_combined_daily_default_at_seven_days() {
+        let now = "2026-11-04T18:00:00Z".parse().unwrap();
+        let reset = now - chrono::Duration::days(2);
+        let quota = crate::quota::QuotaSummary {
+            source: "codex-root".into(),
+            limit_id: "codex".into(),
+            bucket: "primary".into(),
+            used_percent: 50.0,
+            window_minutes: 300,
+            observed_at: now,
+            next_reset: now + chrono::Duration::hours(1),
+            last_reset: Some(reset),
+            last_reset_basis: "observed".into(),
+            status: "current".into(),
+            remaining_tokens: None,
+            exhausts_at: None,
+            forecast_status: "insufficient_history".into(),
+            forecast_window_seconds: None,
+            forecast_used_percent: None,
+            forecast_tokens: None,
+        };
+        let sources = vec![
+            status("codex-root", AgentKind::Codex),
+            status("claude-root", AgentKind::ClaudeCode),
+        ];
+        let cli = Cli::parse_from(["agent-usage", "daily"]);
+        let mixed = [AgentKind::Codex, AgentKind::ClaudeCode]
+            .into_iter()
+            .collect();
+        let period = Period::with_quota(
+            &cli,
+            chrono_tz::Asia::Shanghai,
+            now,
+            std::slice::from_ref(&quota),
+            &sources,
+            &mixed,
+        )
+        .unwrap();
+        assert_eq!(period.basis, "last_7_days_multi_agent");
+        assert_eq!(period.label, "2026-10-30–2026-11-05");
+
+        let claude_only = [AgentKind::ClaudeCode].into_iter().collect();
+        let period = Period::with_quota(
+            &cli,
+            chrono_tz::Asia::Shanghai,
+            now,
+            std::slice::from_ref(&quota),
+            &sources,
+            &claude_only,
+        )
+        .unwrap();
+        assert_eq!(period.basis, "last_7_days_no_quota_capability");
+
+        let codex_only = [AgentKind::Codex].into_iter().collect();
+        let period = Period::with_quota(
+            &cli,
+            chrono_tz::Asia::Shanghai,
+            now,
+            &[quota],
+            &sources[..1],
+            &codex_only,
+        )
+        .unwrap();
+        assert_eq!(period.basis, "last_reset_observed");
+        assert_eq!(period.start, Some(reset));
     }
 }

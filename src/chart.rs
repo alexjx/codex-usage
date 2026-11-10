@@ -1,7 +1,7 @@
 //! Compact rolling output-speed history for the full-screen monitor.
 use crate::{
     render::{self, Style},
-    report::MonitorInfo,
+    report::{AgentActivity, MonitorInfo},
 };
 use unicode_width::UnicodeWidthStr;
 
@@ -26,14 +26,54 @@ pub fn speed_history(
     rows: usize,
     ascii: bool,
 ) -> Vec<String> {
+    history(
+        &info.output_speed_history,
+        info.output_speed_window_seconds,
+        None,
+        style,
+        width,
+        rows,
+        ascii,
+    )
+}
+
+/// One agent's independent throughput chart.
+pub fn agent_history(
+    activity: &AgentActivity,
+    style: &Style,
+    width: usize,
+    rows: usize,
+    ascii: bool,
+) -> Vec<String> {
+    let title = format!("{} output tok/s", activity.agent);
+    history(
+        &activity.output_speed_history,
+        activity.output_speed_window_seconds,
+        Some(&title),
+        style,
+        width,
+        rows,
+        ascii,
+    )
+}
+
+fn history(
+    history: &[Option<f64>],
+    window_seconds: u64,
+    title_prefix: Option<&str>,
+    style: &Style,
+    width: usize,
+    rows: usize,
+    ascii: bool,
+) -> Vec<String> {
     if width < 32 || rows < 2 {
         return Vec::new();
     }
     // Reserve enough room for abbreviated or scientific tick labels at every scale.
     let axis_width = 7;
     let plot_width = width.saturating_sub(axis_width + 2);
-    let count = info.output_speed_history.len().min(plot_width);
-    let samples = &info.output_speed_history[info.output_speed_history.len() - count..];
+    let count = history.len().min(plot_width);
+    let samples = &history[history.len() - count..];
     let (peak, average, valid) = samples
         .iter()
         .flatten()
@@ -49,10 +89,8 @@ pub fn speed_history(
         });
     let scale = peak.max(1.0);
     let separator = if ascii { " / " } else { " · " };
-    let title = format!(
-        "Output tok/s{separator}{}s avg",
-        info.output_speed_window_seconds
-    );
+    let base = title_prefix.unwrap_or("Output tok/s");
+    let title = format!("{base}{separator}{window_seconds}s avg");
     let statistics = if valid == 0 {
         format!("avg n/a{separator}peak n/a")
     } else {
@@ -60,8 +98,8 @@ pub fn speed_history(
     };
     let title = if title.width() + statistics.width() + 2 <= width {
         title.as_str()
-    } else if "Output tok/s".len() + statistics.width() + 2 <= width {
-        "Output tok/s"
+    } else if base.len() + statistics.width() + 2 <= width {
+        base
     } else {
         "tok/s"
     };
@@ -142,7 +180,7 @@ mod tests {
     use clap::Parser;
 
     fn fixture(history: Vec<Option<f64>>) -> (MonitorInfo, Style) {
-        let cli = Cli::parse_from(["codex-usage", "monitor", "--no-cost", "--color", "never"]);
+        let cli = Cli::parse_from(["agent-usage", "monitor", "--no-cost", "--color", "never"]);
         let report = report::build(
             &cli,
             chrono_tz::UTC,

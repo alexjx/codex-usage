@@ -252,13 +252,23 @@ where
             }
             if show_chart && chart_available {
                 if let Some(info) = &report.monitor {
-                    let chart = crate::chart::speed_history(
-                        info,
-                        &style,
-                        width,
-                        (room / 3).clamp(2, 18).min(room - 7),
-                        cli.ascii,
-                    );
+                    let count = info.agent_activity.len().max(1);
+                    let rows = ((room.saturating_sub(count * 2)) / (3 * count))
+                        .clamp(2, 18)
+                        .min(room.saturating_sub(7));
+                    let mut chart = Vec::new();
+                    if info.agent_activity.is_empty() {
+                        chart = crate::chart::speed_history(info, &style, width, rows, cli.ascii);
+                    } else {
+                        for (index, agent) in info.agent_activity.iter().enumerate() {
+                            if index > 0 {
+                                chart.push(String::new());
+                            }
+                            chart.extend(crate::chart::agent_history(
+                                agent, &style, width, rows, cli.ascii,
+                            ));
+                        }
+                    }
                     if !chart.is_empty() {
                         v.header.splice(
                             v.chart_anchor..v.chart_anchor,
@@ -361,7 +371,9 @@ where
                         KeyCode::Enter if selecting => {
                             notice = None;
                             let selected = &v.session_rows[selected_session];
-                            let id = &selected.session;
+                            let Some(session) = selected.key.clone() else {
+                                continue;
+                            };
                             // Row context affects only reader navigation, not the report.
                             let mut reader_cli = cli.clone();
                             if let Some(model) = &selected.model {
@@ -370,7 +382,7 @@ where
                             if let Some(mode) = &selected.mode {
                                 reader_cli.mode = crate::cli::Mode::from_str(mode, false).ok();
                             }
-                            match load_conversation(cli, sources, id, &stopped, true) {
+                            match load_conversation(cli, sources, &session, &stopped, true) {
                                 Ok(conversation) => {
                                     if conversation_ui::run(
                                         &reader_cli,
@@ -484,7 +496,7 @@ where
 pub fn load_conversation(
     cli: &Cli,
     sources: &[Source],
-    session: &str,
+    session: &crate::model::SessionKey,
     stopped: &Arc<AtomicBool>,
     in_screen: bool,
 ) -> Result<Conversation> {

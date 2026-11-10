@@ -29,9 +29,11 @@ impl Fixture {
         }
     }
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_codex-usage"))
+        Command::new(env!("CARGO_BIN_EXE_agent-usage"))
             .arg("--config")
             .arg(&self.config)
+            .arg("--agent")
+            .arg("codex")
             .arg("--root")
             .arg(&self.root)
             .args(["--timezone", "UTC", "--no-cost"])
@@ -341,8 +343,12 @@ fn conflicting_source_resets_are_not_combined_into_one_account() {
     );
     let report = f.json(&[
         "daily",
+        "--agent",
+        "codex",
         "--root",
         f.root.to_str().unwrap(),
+        "--agent",
+        "codex",
         "--root",
         other.to_str().unwrap(),
     ]);

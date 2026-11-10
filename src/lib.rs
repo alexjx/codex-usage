@@ -1,3 +1,4 @@
+mod agents;
 pub mod cancel;
 pub mod chart;
 pub mod cli;

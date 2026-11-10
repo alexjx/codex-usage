@@ -29,7 +29,7 @@ impl Fixture {
         }
     }
     fn command(&self) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_codex-usage"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agent-usage"));
         command.arg("--config").arg(&self.config);
         command
     }
@@ -40,6 +40,8 @@ impl Fixture {
         let output = self
             .command()
             .args(args)
+            .arg("--agent")
+            .arg("codex")
             .arg("--root")
             .arg(&self.root)
             .args(["--all", "--no-cost", "--format", "json"])
@@ -158,6 +160,8 @@ fn separate_source_configuration_persists_and_selects_only_requested_roots() {
         "wsl",
         "--kind",
         "wsl",
+        "--agent",
+        "codex",
         "--root",
         f.root.to_str().unwrap(),
     ]));
@@ -167,6 +171,8 @@ fn separate_source_configuration_persists_and_selects_only_requested_roots() {
         "windows",
         "--kind",
         "windows",
+        "--agent",
+        "codex",
         "--root",
         windows.to_str().unwrap(),
     ]));
@@ -210,6 +216,8 @@ fn separate_source_configuration_persists_and_selects_only_requested_roots() {
             "models",
             "--source",
             "wsl",
+            "--agent",
+            "codex",
             "--root",
             f.root.to_str().unwrap()
         ])
@@ -329,6 +337,8 @@ fn daily_monthly_and_csv_export_preserve_all_usage_without_ansi() {
             "--timezone",
             "UTC",
         ])
+        .arg("--agent")
+        .arg("codex")
         .arg("--root")
         .arg(&f.root)
         .output()
@@ -379,6 +389,8 @@ fn timezone_date_bounds_are_inclusive_without_losing_prior_counter_baseline() {
             "--format",
             "json",
         ])
+        .arg("--agent")
+        .arg("codex")
         .arg("--root")
         .arg(&f.root)
         .output()
@@ -415,8 +427,12 @@ fn copied_cross_source_sessions_are_counted_once_but_each_source_can_stand_alone
     let output = f
         .command()
         .args(["models", "--all", "--no-cost", "--format", "json"])
+        .arg("--agent")
+        .arg("codex")
         .arg("--root")
         .arg(&f.root)
+        .arg("--agent")
+        .arg("codex")
         .arg("--root")
         .arg(&second)
         .output()
@@ -464,6 +480,8 @@ fn custom_model_cost_is_exact_and_unknown_cost_never_becomes_zero() {
     let output = f
         .command()
         .args(["models", "--all", "--format", "json"])
+        .arg("--agent")
+        .arg("codex")
         .arg("--root")
         .arg(&f.root)
         .arg("--pricing-file")
@@ -511,8 +529,12 @@ fn retimestamped_copies_use_the_earliest_recorded_day_with_a_diagnostic() {
     let output = f
         .command()
         .args(["daily", "--all", "--timezone", "UTC", "--format", "json"])
+        .arg("--agent")
+        .arg("codex")
         .arg("--root")
         .arg(&f.root)
+        .arg("--agent")
+        .arg("codex")
         .arg("--root")
         .arg(windows)
         .output()
@@ -539,12 +561,16 @@ fn copied_request_mode_aliases_and_retention_metadata_preserve_exact_cost() {
     request["payload"]["cache_retention"] = json!("12h");
     write_log(&windows, "rich", vec![metadata("s"), ctx, request]);
     let rates = f._dir.path().join("rates.toml");
-    fs::write(&rates, "[[rates]]\nmodel='write-model'\ntier='fast'\ninput='2'\ncached='0.1'\noutput='10'\ncache_write='2.5'\ncache_write_12h='5'\ncache_write_mode='subset'\n").unwrap();
+    fs::write(&rates, "[[rates]]\nmodel='write-model'\ntier='fast'\ninput='2'\ncached='0.1'\noutput='10'\ncache_write_mode='subset'\n[rates.cache_write_rates]\n\"1800\"='2.5'\n\"43200\"='5'\n").unwrap();
     let output = f
         .command()
         .args(["models", "--all", "--format", "json"])
+        .arg("--agent")
+        .arg("codex")
         .arg("--root")
         .arg(&f.root)
+        .arg("--agent")
+        .arg("codex")
         .arg("--root")
         .arg(windows)
         .arg("--pricing-file")
@@ -600,8 +626,12 @@ fn copied_legacy_counters_excluding_compaction_do_not_add_usage_or_cost_twice() 
     let output = f
         .command()
         .args(["models", "--all", "--format", "json"])
+        .arg("--agent")
+        .arg("codex")
         .arg("--root")
         .arg(&f.root)
+        .arg("--agent")
+        .arg("codex")
         .arg("--root")
         .arg(windows)
         .output()
@@ -676,8 +706,12 @@ fn independent_accounting_ledger_reconciles_copies_mirrors_groupings_and_exact_c
         let output = f
             .command()
             .args([command, "--all", "--format", "json"])
+            .arg("--agent")
+            .arg("codex")
             .arg("--root")
             .arg(&f.root)
+            .arg("--agent")
+            .arg("codex")
             .arg("--root")
             .arg(&windows)
             .output()
@@ -718,8 +752,12 @@ fn independent_accounting_ledger_reconciles_copies_mirrors_groupings_and_exact_c
     let output = f
         .command()
         .args(["daily", "--all", "--format", "csv"])
+        .arg("--agent")
+        .arg("codex")
         .arg("--root")
         .arg(&f.root)
+        .arg("--agent")
+        .arg("codex")
         .arg("--root")
         .arg(windows)
         .output()
@@ -779,6 +817,8 @@ fn reports_and_monitor_filter_old_files_before_parsing() {
         let output = f
             .command()
             .args(args)
+            .arg("--agent")
+            .arg("codex")
             .arg("--root")
             .arg(&f.root)
             .args(["--timezone", "UTC", "--no-cost", "--strict"])
@@ -793,6 +833,8 @@ fn reports_and_monitor_filter_old_files_before_parsing() {
     let all = f
         .command()
         .args(["models", "--all", "--no-cost", "--strict"])
+        .arg("--agent")
+        .arg("codex")
         .arg("--root")
         .arg(&f.root)
         .output()
@@ -846,6 +888,8 @@ fn monitor_uses_twelve_hours_of_grace_while_reports_keep_two_days() {
                 "--strict",
                 "--no-cost",
             ])
+            .arg("--agent")
+            .arg("codex")
             .arg("--root")
             .arg(&f.root)
             .output()
@@ -866,6 +910,8 @@ fn monitor_uses_twelve_hours_of_grace_while_reports_keep_two_days() {
                 "--strict",
                 "--no-cost",
             ])
+            .arg("--agent")
+            .arg("codex")
             .arg("--root")
             .arg(&f.root)
             .output()
@@ -902,6 +948,8 @@ fn monitor_distinguishes_unpriced_window_changes_from_a_known_cost_subtotal() {
             "--interval",
             "1s",
         ])
+        .arg("--agent")
+        .arg("codex")
         .arg("--root")
         .arg(&f.root)
         .stdout(Stdio::piped())
@@ -961,6 +1009,8 @@ fn monitor_activity_label_and_metadata_follow_the_configured_interval() {
             let mut command = f.command();
             command
                 .args(["monitor", "--frames", "1", "--no-cost", "--format", format])
+                .arg("--agent")
+                .arg("codex")
                 .arg("--root")
                 .arg(&f.root);
             if let Some(interval) = interval {
@@ -1022,6 +1072,8 @@ fn monitor_reads_real_appends_and_defers_partial_records_without_counting_histor
             "--interval",
             "1s",
         ])
+        .arg("--agent")
+        .arg("codex")
         .arg("--root")
         .arg(&f.root)
         .stdout(Stdio::piped())
@@ -1047,7 +1099,7 @@ fn monitor_reads_real_appends_and_defers_partial_records_without_counting_histor
     );
     assert_eq!(
         baseline["monitor"]["session_output_tokens_per_second"],
-        json!({})
+        json!([])
     );
     let append = usage(
         "live-session",
@@ -1104,10 +1156,22 @@ fn monitor_reads_real_appends_and_defers_partial_records_without_counting_histor
             .unwrap()
             > 0.0
     );
+    let live = monitor["session_output_tokens_per_second"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|record| record["session"]["native_id"] == "live-session")
+        .expect("structured session speed");
     assert_eq!(
         monitor["average_session_output_tokens_per_second"],
-        monitor["session_output_tokens_per_second"]["live-session"]
+        live["output_tokens_per_second"]
     );
+    assert_eq!(live["session"]["agent"], "codex");
+    assert!(monitor["agent_activity"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|agent| { agent["agent"] == "codex" && agent["output_speed_history"].is_array() }));
     assert!(snapshots.iter().skip(2).any(|snapshot| snapshot["monitor"]
         ["output_tokens_per_second"]
         .as_f64()
@@ -1218,6 +1282,8 @@ fn priced_json(f: &Fixture, args: &[&str]) -> Value {
     let output = f
         .command()
         .args(args)
+        .arg("--agent")
+        .arg("codex")
         .arg("--root")
         .arg(&f.root)
         .args(["--all", "--format", "json"])
@@ -1341,6 +1407,8 @@ fn default_model_groups_separate_fast_regular_and_unknown_and_mode_filter_is_exa
             "--pager",
             "never",
         ])
+        .arg("--agent")
+        .arg("codex")
         .arg("--root")
         .arg(&f.root)
         .output()
@@ -1370,6 +1438,8 @@ fn daily_human_dates_are_single_group_headings_while_exports_keep_day_and_mode_p
             "--timezone",
             "UTC",
         ])
+        .arg("--agent")
+        .arg("codex")
         .arg("--root")
         .arg(&f.root)
         .output()
@@ -1409,6 +1479,8 @@ fn daily_human_dates_are_single_group_headings_while_exports_keep_day_and_mode_p
             "--timezone",
             "UTC",
         ])
+        .arg("--agent")
+        .arg("codex")
         .arg("--root")
         .arg(&f.root)
         .output()
@@ -1507,6 +1579,8 @@ fn human_reports_end_with_full_selection_totals_and_partial_cost_markers() {
             cmd.arg("--all");
         }
         let output = cmd
+            .arg("--agent")
+            .arg("codex")
             .arg("--root")
             .arg(&f.root)
             .args([
@@ -1540,6 +1614,8 @@ fn human_reports_end_with_full_selection_totals_and_partial_cost_markers() {
     let empty = Fixture::new();
     let output = empty
         .command()
+        .arg("--agent")
+        .arg("codex")
         .arg("--root")
         .arg(&empty.root)
         .args(["--all", "--no-cost", "--color", "never", "--pager", "never"])
@@ -1598,6 +1674,8 @@ fn monitor_summarizes_today_only_and_rejects_historical_ranges() {
     let output = f
         .command()
         .args(["monitor", "--frames", "1", "--no-cost", "--timezone", "UTC"])
+        .arg("--agent")
+        .arg("codex")
         .arg("--root")
         .arg(&f.root)
         .output()
@@ -1644,7 +1722,14 @@ fn listed_implicit_native_source_can_be_enabled_and_disabled() {
         .unwrap();
     success(&listed);
     let catalog: Value = serde_json::from_slice(&listed.stdout).unwrap();
-    let name = catalog["sources"][0]["name"].as_str().unwrap();
+    let codex = catalog["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["agent"] == "codex")
+        .expect("implicit codex source");
+    assert_eq!(codex["root"], json!(f.root.to_string_lossy()));
+    let name = codex["name"].as_str().unwrap();
     let enabled = f
         .command()
         .env("CODEX_HOME", &f.root)
@@ -1654,12 +1739,22 @@ fn listed_implicit_native_source_can_be_enabled_and_disabled() {
     success(&enabled);
     let config: toml::Value = toml::from_str(&fs::read_to_string(&f.config).unwrap()).unwrap();
     let sources = config["sources"].as_array().unwrap();
-    assert_eq!(sources.len(), 1);
-    assert_eq!(sources[0]["name"].as_str(), Some(name));
-    assert_eq!(sources[0]["enabled"].as_bool(), Some(true));
+    assert_eq!(config["version"].as_integer(), Some(2));
+    let saved = sources
+        .iter()
+        .find(|source| source["name"].as_str() == Some(name))
+        .expect("enabled source persisted");
+    assert_eq!(saved["agent"].as_str(), Some("codex"));
+    assert_eq!(saved["enabled"].as_bool(), Some(true));
     success(&f.run(&["sources", "disable", name]));
     let config: toml::Value = toml::from_str(&fs::read_to_string(&f.config).unwrap()).unwrap();
-    assert_eq!(config["sources"][0]["enabled"].as_bool(), Some(false));
+    let saved = config["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["name"].as_str() == Some(name))
+        .unwrap();
+    assert_eq!(saved["enabled"].as_bool(), Some(false));
 }
 
 fn date_subtotal_fixture() -> Fixture {
@@ -1758,6 +1853,8 @@ fn date_subtotals_are_separate_exact_counts_with_distinct_sessions_and_known_cos
     ] {
         let mut cmd = f.command();
         cmd.args([command, "--all", "--format", "json", "--timezone", "UTC"])
+            .arg("--agent")
+            .arg("codex")
             .arg("--root")
             .arg(&f.root);
         if let Some(grouping) = grouping {
@@ -1821,6 +1918,8 @@ fn date_subtotals_are_separate_exact_counts_with_distinct_sessions_and_known_cos
     let output = f
         .command()
         .args(["models", "--all", "--format", "json"])
+        .arg("--agent")
+        .arg("codex")
         .arg("--root")
         .arg(&f.root)
         .output()
@@ -1843,6 +1942,8 @@ fn date_subtotals_follow_timezone_filters_and_disabled_or_missing_prices() {
             .command()
             .args(["daily", "--format", "json"])
             .args(extra)
+            .arg("--agent")
+            .arg("codex")
             .arg("--root")
             .arg(&f.root)
             .output()
@@ -1905,6 +2006,8 @@ fn human_date_subtotals_follow_each_period_and_keep_wide_alignment_and_csv_rows(
             "--timezone",
             "UTC",
         ])
+        .arg("--agent")
+        .arg("codex")
         .arg("--root")
         .arg(&f.root);
         if command == "models" {
@@ -1983,6 +2086,8 @@ fn human_date_subtotals_follow_each_period_and_keep_wide_alignment_and_csv_rows(
             "--timezone",
             "UTC",
         ])
+        .arg("--agent")
+        .arg("codex")
         .arg("--root")
         .arg(&f.root)
         .output()
@@ -2001,6 +2106,8 @@ fn human_date_subtotals_follow_each_period_and_keep_wide_alignment_and_csv_rows(
     let output = f
         .command()
         .args(["daily", "--all", "--format", "csv", "--timezone", "UTC"])
+        .arg("--agent")
+        .arg("codex")
         .arg("--root")
         .arg(&f.root)
         .output()
@@ -2074,6 +2181,8 @@ fn stacked_date_subtotals_remain_complete_after_wrapped_long_model_rows() {
             "--timezone",
             "UTC",
         ])
+        .arg("--agent")
+        .arg("codex")
         .arg("--root")
         .arg(&f.root)
         .output()
@@ -2091,4 +2200,147 @@ fn stacked_date_subtotals_remain_complete_after_wrapped_long_model_rows() {
     assert_eq!(lines[positions[1] + 1], "220 tokens", "{text}");
     assert_eq!(lines[lines.len() - 2], "Total", "{text}");
     assert_eq!(lines.last(), Some(&"335 tokens"), "{text}");
+}
+
+#[test]
+fn claude_agent_uses_qualified_sessions_and_verified_provider_pricing() {
+    let dir = tempdir().unwrap();
+    let claude = dir.path().join("claude");
+    fs::create_dir_all(claude.join("projects/p")).unwrap();
+    let transcript = claude.join("projects/p/session-1.jsonl");
+    fs::write(
+        &transcript,
+        concat!(
+            "{\"type\":\"assistant\",\"sessionId\":\"session-1\",\"timestamp\":\"2026-11-01T10:00:00Z\",",
+            "\"cwd\":\"/project\",\"message\":{\"id\":\"msg_1\",\"model\":\"deepseek-flash\",",
+            "\"usage\":{\"input_tokens\":100,\"cache_read_input_tokens\":800,",
+            "\"cache_creation_input_tokens\":200,\"output_tokens\":50}}}\n"
+        ),
+    )
+    .unwrap();
+    let config = dir.path().join("config.toml");
+    let output = Command::new(env!("CARGO_BIN_EXE_agent-usage"))
+        .arg("--config")
+        .arg(&config)
+        .args([
+            "models",
+            "--agent",
+            "claude-code",
+            "--root",
+            claude.to_str().unwrap(),
+            "--all",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    success(&output);
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["schema_version"], 2);
+    assert_eq!(report["totals"]["total"], 1150);
+    assert_eq!(report["totals"]["events"], 1);
+    assert_eq!(report["totals"]["cost_usd"], "0.0001548");
+    assert_eq!(report["totals"]["agents"], json!(["claude-code"]));
+    assert_eq!(report["totals"]["providers"], json!(["unknown"]));
+    assert_eq!(report["sources"][0]["agent"], "claude-code");
+    assert_eq!(report["sources"][0]["capability"], "unsupported");
+    let row = &report["rows"][0];
+    assert_eq!(row["dimensions"]["agent"], "claude-code");
+    assert_eq!(row["dimensions"]["model"], "deepseek-flash");
+    assert!(report["totals"]["assumptions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|value| value
+            .as_str()
+            .unwrap()
+            .contains("resolved from model namespace")));
+
+    let sessions = Command::new(env!("CARGO_BIN_EXE_agent-usage"))
+        .arg("--config")
+        .arg(&config)
+        .args([
+            "sessions",
+            "--agent",
+            "claude-code",
+            "--root",
+            claude.to_str().unwrap(),
+            "--all",
+            "--no-cost",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    success(&sessions);
+    let sessions: Value = serde_json::from_slice(&sessions.stdout).unwrap();
+    assert_eq!(
+        sessions["rows"][0]["dimensions"]["session"],
+        "claude-code:session-1"
+    );
+    assert_eq!(sessions["totals"]["sessions"], 1);
+
+    // --root needs an explicit agent so the transcript layout is known.
+    let missing = Command::new(env!("CARGO_BIN_EXE_agent-usage"))
+        .arg("--config")
+        .arg(&config)
+        .args(["models", "--root", claude.to_str().unwrap(), "--all"])
+        .output()
+        .unwrap();
+    assert_eq!(missing.status.code(), Some(2));
+}
+
+#[test]
+fn ambiguous_bare_session_selectors_exit_with_argument_status() {
+    let dir = tempdir().unwrap();
+    let codex = dir.path().join("codex");
+    fs::create_dir_all(codex.join("sessions")).unwrap();
+    write_log(
+        &codex,
+        "shared",
+        vec![
+            json!({"type":"session_meta","timestamp":"2026-11-01T00:00:00Z","payload":{
+                "id":"shared","model_provider":"openai","cwd":"/p"}}),
+            json!({"type":"token_usage_record","timestamp":"2026-11-01T00:00:01Z","payload":{
+                "thread_id":"shared","turn_id":"t","response_id":"r",
+                "usage":{"input_tokens":10,"output_tokens":1,"total_tokens":11}}}),
+        ],
+    );
+    let claude = dir.path().join("claude");
+    fs::create_dir_all(claude.join("projects/p")).unwrap();
+    fs::write(
+        claude.join("projects/p/shared.jsonl"),
+        "{\"type\":\"assistant\",\"sessionId\":\"shared\",\"timestamp\":\"2026-11-01T00:00:00Z\",\"message\":{\"id\":\"m\",\"model\":\"deepseek-flash\",\"usage\":{\"input_tokens\":1,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens\":1}}}\n",
+    )
+    .unwrap();
+    let config = dir.path().join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "version = 2\n[[sources]]\nname='c'\nagent='codex'\nkind='linux'\nroot='{}'\n[[sources]]\nname='a'\nagent='claude-code'\nkind='linux'\nroot='{}'\n",
+            codex.display(),
+            claude.display()
+        ),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_agent-usage"))
+        .arg("--config")
+        .arg(&config)
+        .args([
+            "session",
+            "shared",
+            "--all",
+            "--no-cost",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("ambiguous"), "{error}");
+    assert!(
+        error.contains("codex:shared") && error.contains("claude-code:shared"),
+        "{error}"
+    );
 }

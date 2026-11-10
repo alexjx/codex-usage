@@ -1,13 +1,22 @@
 //! Offline per-request API-equivalent token pricing. Rates never identify backend aliases.
-use crate::model::UsageEvent;
+//!
+//! Cache writes are priced per verified TTL bucket. A recorded provider always
+//! wins; a source pricing scenario is used only when the transcript did not
+//! record a provider, and that assumption is disclosed.
+use crate::model::{UsageEvent, UsageMode};
 use anyhow::{bail, Context, Result};
 use chrono::NaiveDate;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{collections::BTreeSet, fs, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::Path,
+};
 
 const BUNDLE: &str = include_str!("../data/pricing.toml");
+const LEGACY_WRITE_TTL_SECONDS: u64 = 1800;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Estimate {
@@ -55,10 +64,12 @@ struct Rate {
     output: Decimal,
     #[serde(default)]
     cached: Option<Decimal>,
+    /// USD per million cache-write tokens, keyed by positive TTL seconds.
     #[serde(default)]
-    cache_write: Option<Decimal>,
+    cache_write_rates: BTreeMap<String, Decimal>,
+    /// Rate for writes whose recorded TTL is unknown. Absent means unpriced.
     #[serde(default)]
-    cache_write_12h: Option<Decimal>,
+    cache_write_unknown: Option<Decimal>,
     /// Explicitly verified provider/custom semantics. Absent means unverified.
     #[serde(default)]
     cache_write_mode: Option<String>,
@@ -101,19 +112,54 @@ fn tier(value: &str) -> &str {
         value => value,
     }
 }
+/// Claude Code may append a context hint such as `[1m]` to the recorded ID.
+fn base_model(model: &str) -> &str {
+    model.split('[').next().unwrap_or(model)
+}
+/// Resolve the API-equivalent pricing scenario from the model namespace when the
+/// transcript did not record a backend provider. The assumption is disclosed.
+fn provider_from_model(model: &str) -> Option<&'static str> {
+    let model = base_model(model).to_ascii_lowercase();
+    if model.starts_with("claude") {
+        Some("anthropic")
+    } else if model.starts_with("deepseek") {
+        Some("deepseek")
+    } else if model.starts_with("glm") {
+        Some("zhipu")
+    } else if model.starts_with("kimi") || model.starts_with("moonshot") {
+        Some("moonshot")
+    } else if model.starts_with("minimax") {
+        Some("minimax")
+    } else {
+        None
+    }
+}
+fn mode_tier(mode: UsageMode) -> Option<&'static str> {
+    match mode {
+        UsageMode::Regular => Some("standard"),
+        UsageMode::Fast => Some("fast"),
+        UsageMode::Flex => Some("flex"),
+        UsageMode::Ultrafast => Some("ultrafast"),
+        UsageMode::Batch => Some("batch"),
+        UsageMode::Unknown => None,
+    }
+}
 impl Rate {
-    fn matches(&self, event: &UsageEvent, date: NaiveDate, tier_name: &str) -> bool {
-        self.model == event.model
-            && self.provider == event.provider
+    fn matches(
+        &self,
+        model: &str,
+        provider: &str,
+        tier_name: &str,
+        date: NaiveDate,
+        input: u64,
+    ) -> bool {
+        self.model == model
+            && self.provider == provider
             && self.tier == tier_name
             && self.from.is_none_or(|bound| date >= bound)
             && self.until.is_none_or(|bound| date <= bound)
-            && self
-                .min_input
-                .is_none_or(|bound| event.usage.input >= bound)
-            && self
-                .max_input
-                .is_none_or(|bound| event.usage.input <= bound)
+            && self.min_input.is_none_or(|bound| input >= bound)
+            && self.max_input.is_none_or(|bound| input <= bound)
     }
     fn overlaps(&self, other: &Self) -> bool {
         self.model == other.model
@@ -123,6 +169,12 @@ impl Rate {
             && other.from.unwrap_or(NaiveDate::MIN) <= self.until.unwrap_or(NaiveDate::MAX)
             && self.min_input.unwrap_or(0) <= other.max_input.unwrap_or(u64::MAX)
             && other.min_input.unwrap_or(0) <= self.max_input.unwrap_or(u64::MAX)
+    }
+    fn write_rate(&self, ttl: u64) -> Option<Decimal> {
+        self.cache_write_rates.get(&ttl.to_string()).copied()
+    }
+    fn has_write_rates(&self) -> bool {
+        !self.cache_write_rates.is_empty() || self.cache_write_unknown.is_some()
     }
 }
 
@@ -145,14 +197,28 @@ impl Table {
             if !["standard", "fast", "flex", "ultrafast", "batch"].contains(&rate.tier.as_str()) {
                 bail!("unsupported pricing tier {}", rate.tier);
             }
-            if rate.input < Decimal::ZERO
-                || rate.output < Decimal::ZERO
-                || [rate.cached, rate.cache_write, rate.cache_write_12h]
-                    .iter()
-                    .flatten()
-                    .any(|v| *v < Decimal::ZERO)
-            {
+            if rate.input < Decimal::ZERO || rate.output < Decimal::ZERO {
                 bail!("negative rate in {}", rate.id);
+            }
+            if rate.cached.is_some_and(|value| value < Decimal::ZERO) {
+                bail!("negative rate in {}", rate.id);
+            }
+            if rate
+                .cache_write_unknown
+                .is_some_and(|value| value < Decimal::ZERO)
+            {
+                bail!("negative cache-write rate in {}", rate.id);
+            }
+            for (key, value) in &rate.cache_write_rates {
+                let ttl: u64 = key
+                    .parse()
+                    .with_context(|| format!("invalid cache-write TTL {key:?} in {}", rate.id))?;
+                if ttl == 0 {
+                    bail!("cache-write TTL must be positive in {}", rate.id);
+                }
+                if *value < Decimal::ZERO {
+                    bail!("negative cache-write rate in {}", rate.id);
+                }
             }
             if rate
                 .from
@@ -161,7 +227,7 @@ impl Table {
                 || rate
                     .min_input
                     .zip(rate.max_input)
-                    .is_some_and(|(start, end)| start > end)
+                    .is_some_and(|(start, end)| end < start)
             {
                 bail!("reversed date/context range in {}", rate.id);
             }
@@ -262,17 +328,92 @@ impl Pricer {
         })
     }
 
+    fn find_rate<'a>(
+        &self,
+        table: &'a Table,
+        model: &str,
+        provider: &str,
+        tier_name: &str,
+        date: NaiveDate,
+        input: u64,
+    ) -> Option<&'a Rate> {
+        table
+            .rates
+            .iter()
+            .find(|r| r.matches(model, provider, tier_name, date, input))
+            .or_else(|| {
+                let base = base_model(model);
+                if base == model {
+                    return None;
+                }
+                table
+                    .rates
+                    .iter()
+                    .find(|r| r.matches(base, provider, tier_name, date, input))
+            })
+    }
+
     pub fn estimate(&self, event: &UsageEvent) -> Estimate {
+        self.estimate_scenario(event, None)
+    }
+
+    /// Price with a source-provided provider scenario used only when the
+    /// transcript recorded an unknown provider.
+    pub fn estimate_scenario(
+        &self,
+        event: &UsageEvent,
+        pricing_provider: Option<&str>,
+    ) -> Estimate {
         let mut assumptions = Vec::new();
         if let Err(error) = event.usage.validate() {
             return Estimate::unpriced(error.to_string(), assumptions, None);
         }
-        let tier_name = match event.tier.as_deref() {
-            Some(value) => tier(value),
-            None => {
-                assumptions.push("Standard tier assumed: service tier not recorded".into());
-                "standard"
+        let provider = if event.provider != "unknown" {
+            if let Some(fallback) = pricing_provider {
+                if fallback != event.provider {
+                    assumptions.push(format!(
+                        "Configured pricing provider {fallback:?} ignored: transcript recorded {}",
+                        event.provider
+                    ));
+                }
             }
+            event.provider.clone()
+        } else if let Some(fallback) = pricing_provider.filter(|value| !value.is_empty()) {
+            assumptions.push(format!(
+                "Pricing scenario {fallback:?}: backend provider not recorded"
+            ));
+            fallback.to_owned()
+        } else if let Some(provider) = provider_from_model(&event.model) {
+            assumptions.push(format!(
+                "Pricing scenario {provider:?}: backend provider not recorded, resolved from model namespace"
+            ));
+            provider.to_owned()
+        } else {
+            return Estimate::unpriced(
+                "Provider not recorded and no source pricing scenario configured",
+                assumptions,
+                None,
+            );
+        };
+        let tier_name = match event.tier.as_deref() {
+            Some(value) => {
+                let value = tier(value);
+                if !["standard", "fast", "flex", "ultrafast", "batch"].contains(&value) {
+                    return Estimate::unpriced(
+                        format!("No verified rate for service tier {value:?}"),
+                        assumptions,
+                        None,
+                    );
+                }
+                value
+            }
+            None => match mode_tier(event.mode) {
+                Some(value) => value,
+                None => {
+                    assumptions.push("Standard tier assumed: service tier not recorded".into());
+                    "standard"
+                }
+            },
         };
         let date = if self.current_snapshot {
             self.bundled.verified
@@ -287,14 +428,26 @@ impl Pricer {
         }
         let mut rate = self
             .custom
-            .iter()
-            .flat_map(|t| &t.rates)
-            .find(|r| r.matches(event, date, tier_name))
+            .as_ref()
+            .and_then(|table| {
+                self.find_rate(
+                    table,
+                    &event.model,
+                    &provider,
+                    tier_name,
+                    date,
+                    event.usage.input,
+                )
+            })
             .or_else(|| {
-                self.bundled
-                    .rates
-                    .iter()
-                    .find(|r| r.matches(event, date, tier_name))
+                self.find_rate(
+                    &self.bundled,
+                    &event.model,
+                    &provider,
+                    tier_name,
+                    date,
+                    event.usage.input,
+                )
             });
         if rate.is_none()
             && !self.current_snapshot
@@ -302,11 +455,14 @@ impl Pricer {
             && self.repricing.is_none()
         {
             if let Some(verified) = self.bundled.verified {
-                rate = self
-                    .bundled
-                    .rates
-                    .iter()
-                    .find(|r| r.matches(event, verified, tier_name));
+                rate = self.find_rate(
+                    &self.bundled,
+                    &event.model,
+                    &provider,
+                    tier_name,
+                    verified,
+                    event.usage.input,
+                );
                 if rate.is_some() {
                     assumptions.push(format!(
                         "Estimated using rates verified on {verified}; historical price not recorded"
@@ -317,8 +473,8 @@ impl Pricer {
         let Some(rate) = rate else {
             return Estimate::unpriced(
                 format!(
-                    "No verified rate for {}/{}/{} on {}",
-                    event.provider, event.model, tier_name, date
+                    "No verified rate for {provider}/{}/{tier_name} on {date}",
+                    event.model
                 ),
                 assumptions,
                 None,
@@ -335,7 +491,7 @@ impl Pricer {
         let writes = match event.usage.cache_write {
             Some(value) => value,
             None => {
-                if rate.cache_write.is_some() || rate.cache_write_12h.is_some() {
+                if rate.has_write_rates() {
                     assumptions.push(
                         "Cache-write count unavailable: assumes no cache-write charge".into(),
                     );
@@ -346,7 +502,6 @@ impl Pricer {
         let Some(mut ordinary) = event.usage.input.checked_sub(cached) else {
             return Estimate::unpriced("Cached input exceeds input", assumptions, id);
         };
-        let mut write_rate = Decimal::ZERO;
         if writes > 0 {
             match rate.cache_write_mode.as_deref() {
                 Some("subset") => {
@@ -368,31 +523,71 @@ impl Pricer {
                     )
                 }
             }
-            let retention = match event.cache_retention.as_deref() {
-                Some("30m") | Some("30min") => "30m",
-                Some("12h") => "12h",
-                Some(other) => {
-                    return Estimate::unpriced(
-                        format!("No cache-write rate for retention {other}"),
-                        assumptions,
-                        id,
-                    )
+        }
+        // Resolve write cost per TTL bucket.
+        let mut write_cost = Decimal::ZERO;
+        let mut add_write = |tokens: u64, cost: Decimal| -> Result<(), String> {
+            let value = Decimal::from(tokens)
+                .checked_mul(cost)
+                .ok_or_else(|| "Decimal arithmetic overflow".to_string())?;
+            write_cost = write_cost
+                .checked_add(value)
+                .ok_or_else(|| "Decimal arithmetic overflow".to_string())?;
+            Ok(())
+        };
+        if writes > 0 {
+            match event.cache_writes.as_ref() {
+                Some(breakdown) => {
+                    if let Some(total) = breakdown.total() {
+                        if total != writes {
+                            return Estimate::unpriced(
+                                "Cache-write breakdown does not match the recorded total",
+                                assumptions,
+                                id,
+                            );
+                        }
+                    }
+                    for (ttl, tokens) in &breakdown.by_ttl_seconds {
+                        if *tokens == 0 {
+                            continue;
+                        }
+                        let Some(cost) = rate.write_rate(*ttl) else {
+                            return Estimate::unpriced(
+                                format!("No cache-write rate for TTL {ttl}s"),
+                                assumptions,
+                                id,
+                            );
+                        };
+                        if let Err(error) = add_write(*tokens, cost) {
+                            return Estimate::unpriced(error, assumptions, id);
+                        }
+                    }
+                    if breakdown.unknown_ttl > 0 {
+                        let Some(cost) = rate.cache_write_unknown else {
+                            return Estimate::unpriced(
+                                "Cache-write rate unavailable for unknown TTL",
+                                assumptions,
+                                id,
+                            );
+                        };
+                        if let Err(error) = add_write(breakdown.unknown_ttl, cost) {
+                            return Estimate::unpriced(error, assumptions, id);
+                        }
+                    }
                 }
-                None if rate.cache_write_12h.is_none() => "30m",
                 None => {
-                    assumptions.push("Cache retention unavailable: assumes 30m writes".into());
-                    "30m"
+                    // Legacy Codex retention semantics: missing duration means 30m.
+                    let Some(cost) = rate.write_rate(LEGACY_WRITE_TTL_SECONDS) else {
+                        return Estimate::unpriced("Cache-write rate unavailable", assumptions, id);
+                    };
+                    if rate.write_rate(43_200).is_some() {
+                        assumptions.push("Cache retention unavailable: assumes 30m writes".into());
+                    }
+                    if let Err(error) = add_write(writes, cost) {
+                        return Estimate::unpriced(error, assumptions, id);
+                    }
                 }
-            };
-            let selected = if retention == "12h" {
-                rate.cache_write_12h
-            } else {
-                rate.cache_write
-            };
-            let Some(selected) = selected else {
-                return Estimate::unpriced("Cache-write rate unavailable", assumptions, id);
-            };
-            write_rate = selected;
+            }
         }
         let cached_rate = match (cached, rate.cached) {
             (0, _) => Decimal::ZERO,
@@ -406,11 +601,7 @@ impl Pricer {
                     .checked_mul(cached_rate)
                     .and_then(|c| v.checked_add(c))
             })
-            .and_then(|v| {
-                Decimal::from(writes)
-                    .checked_mul(write_rate)
-                    .and_then(|c| v.checked_add(c))
-            })
+            .and_then(|v| v.checked_add(write_cost))
             .and_then(|v| {
                 Decimal::from(event.usage.output)
                     .checked_mul(rate.output)
@@ -438,16 +629,17 @@ impl Pricer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Usage;
+    use crate::model::{AgentKind, CacheWriteBreakdown, EventKey, SessionKey, Usage};
     use std::io::Write;
     fn event() -> UsageEvent {
         UsageEvent {
-            id: "response-1".into(),
+            id: EventKey::new(AgentKind::Codex, "response-1"),
             timestamp: "2026-11-04T10:00:00Z".parse().unwrap(),
-            session: "test-session".into(),
+            session: SessionKey::main(AgentKind::Codex, "test-session"),
             model: "gpt-6.1-sol".into(),
             provider: "openai".into(),
             tier: Some("standard".into()),
+            mode: UsageMode::Regular,
             project: None,
             usage: Usage {
                 input: 100_000,
@@ -456,11 +648,31 @@ mod tests {
                 output: 20_000,
                 reasoning: Some(12_000),
             },
+            cache_writes: None,
             source: "test".into(),
             origins: BTreeSet::new(),
             context_tokens: None,
-            cache_retention: None,
         }
+    }
+    fn claude_event() -> UsageEvent {
+        let mut value = event();
+        value.id = EventKey::new(AgentKind::ClaudeCode, "message:m");
+        value.session = SessionKey::main(AgentKind::ClaudeCode, "s");
+        value.model = "claude-test".into();
+        value.provider = "unknown".into();
+        value.tier = None;
+        value.usage = Usage {
+            input: 1100,
+            cached: Some(800),
+            cache_write: Some(200),
+            output: 50,
+            reasoning: None,
+        };
+        value.cache_writes = Some(CacheWriteBreakdown {
+            by_ttl_seconds: [(300, 150), (3600, 50)].into(),
+            unknown_ttl: 0,
+        });
+        value
     }
     fn custom(raw: &str) -> Pricer {
         let mut file = tempfile::NamedTempFile::new().unwrap();
@@ -485,6 +697,11 @@ mod tests {
             e.timestamp = format!("{date}T12:00:00Z").parse().unwrap();
             for (tier_name, expected) in [("standard", "0.286"), ("priority", "0.572")] {
                 e.tier = Some(tier_name.into());
+                e.mode = if tier_name == "priority" {
+                    UsageMode::Fast
+                } else {
+                    UsageMode::Regular
+                };
                 let estimate = p.estimate(&e);
                 assert_eq!(estimate.cost.unwrap().to_string(), expected);
                 assert_eq!(estimate.status, "priced");
@@ -495,6 +712,7 @@ mod tests {
         assert_eq!(p.metadata()["historical_pricing"], false);
         assert_eq!(p.metadata()["fallback_mode"], "none");
         e.tier = None;
+        e.mode = UsageMode::Unknown;
         assert!(p
             .estimate(&e)
             .assumptions
@@ -534,6 +752,7 @@ mod tests {
         e.usage.input += 1;
         assert!(p.estimate(&e).rate_id.unwrap().ends_with(":long"));
         e.tier = Some("priority".into());
+        e.mode = UsageMode::Fast;
         assert!(p.estimate(&e).rate_id.unwrap().contains(":fast:"));
         e.tier = Some("imaginary".into());
         assert!(p.estimate(&e).cost.is_none());
@@ -544,14 +763,15 @@ mod tests {
         let mut e = event();
         // Official rates: short Standard 2/0.1/10, long 4/0.2/15;
         // Fast doubles these. Each case has 60k cached input and 20k output.
-        for (input, service_tier, expected) in [
-            (272_000, "standard", "0.63"),
-            (272_001, "standard", "1.160004"),
-            (272_000, "priority", "1.26"),
-            (272_001, "fast", "2.320008"),
+        for (input, service_tier, mode, expected) in [
+            (272_000, "standard", UsageMode::Regular, "0.63"),
+            (272_001, "standard", UsageMode::Regular, "1.160004"),
+            (272_000, "priority", UsageMode::Fast, "1.26"),
+            (272_001, "fast", UsageMode::Fast, "2.320008"),
         ] {
             e.usage.input = input;
             e.tier = Some(service_tier.into());
+            e.mode = mode;
             for reasoning in [0, 12_000, 20_000] {
                 e.usage.reasoning = Some(reasoning);
                 assert_eq!(p.estimate(&e).cost.unwrap().to_string(), expected);
@@ -572,15 +792,94 @@ mod tests {
     }
 
     #[test]
+    fn claude_mixed_ttl_costs_and_missing_metadata_are_explicit() {
+        let p = custom("[[rates]]\nmodel='claude-test'\nprovider='anthropic'\ninput='2'\ncached='0.2'\noutput='10'\ncache_write_mode='subset'\n[rates.cache_write_rates]\n\"300\"='2.5'\n\"3600\"='4'\n");
+        let estimate = p.estimate_scenario(&claude_event(), Some("anthropic"));
+        // (200 uncached*2 + 800 read*0.2 + 150*2.5 + 50*4 + 50 output*10) / 1e6
+        assert_eq!(estimate.cost.unwrap().to_string(), "0.001435");
+        assert_eq!(estimate.status, "assumed");
+        assert!(estimate
+            .assumptions
+            .iter()
+            .any(|a| a.contains("Pricing scenario \"anthropic\"")));
+        // An unknown vendor namespace still requires an explicit scenario.
+        let mut unnamespaced = claude_event();
+        unnamespaced.model = "vendor-unknown".into();
+        assert!(p.estimate(&unnamespaced).cost.is_none());
+        // A claude-* namespace resolves to Anthropic with a disclosed assumption.
+        assert!(p.estimate(&claude_event()).cost.is_some());
+        let mut unknown = claude_event();
+        unknown.cache_writes = Some(CacheWriteBreakdown::unknown(200));
+        assert!(p
+            .estimate_scenario(&unknown, Some("anthropic"))
+            .cost
+            .is_none());
+        let explicit = custom("[[rates]]\nmodel='claude-test'\nprovider='anthropic'\ninput='2'\ncached='0.2'\noutput='10'\ncache_write_mode='subset'\ncache_write_unknown='3'\n");
+        assert!(explicit
+            .estimate_scenario(&unknown, Some("anthropic"))
+            .cost
+            .is_some());
+    }
+
+    #[test]
+    fn third_party_model_namespaces_resolve_pricing_scenarios() {
+        let p = Pricer::load_current(None).unwrap();
+        let mut e = claude_event();
+        e.model = "deepseek-flash".into();
+        e.usage = Usage {
+            input: 900,
+            cached: Some(800),
+            cache_write: Some(0),
+            output: 50,
+            reasoning: None,
+        };
+        e.cache_writes = Some(CacheWriteBreakdown::default());
+        let estimate = p.estimate(&e);
+        assert_eq!(estimate.cost.unwrap().to_string(), "0.0000948");
+        assert!(estimate
+            .assumptions
+            .iter()
+            .any(|a| a.contains("resolved from model namespace")));
+        // Context hints are stripped only if the exact ID has no rate.
+        e.model = "deepseek-v4.1-flash[1m]".into();
+        assert_eq!(p.estimate(&e).cost.unwrap().to_string(), "0.0000948");
+        // Reported cache writes are charged like cache-miss input for DeepSeek.
+        e.model = "deepseek-flash".into();
+        e.usage.input = 1100;
+        e.usage.cache_write = Some(200);
+        e.cache_writes = Some(CacheWriteBreakdown::unknown(200));
+        assert_eq!(p.estimate(&e).cost.unwrap().to_string(), "0.0001548");
+        for (model, expected) in [
+            ("glm-5.3", "0.000848"),
+            ("kimi-k3", "0.00189"),
+            ("minimax-m3", "0.000198"),
+            ("claude-opus-5-5", "0.00236"),
+        ] {
+            e.model = model.into();
+            e.usage.cache_write = Some(0);
+            e.cache_writes = Some(CacheWriteBreakdown::default());
+            let estimate = p.estimate(&e);
+            assert_eq!(estimate.cost.unwrap().to_string(), expected, "{model}");
+        }
+    }
+
+    #[test]
     fn write_retention_and_missing_cache_rates_do_not_produce_silent_discounts() {
-        let p = custom("[[rates]]\nmodel='gpt-6.1-sol'\ninput='2'\ncached='0.1'\noutput='10'\ncache_write='2.5'\ncache_write_12h='5'\ncache_write_mode='subset'\n");
+        let p = custom("[[rates]]\nmodel='gpt-6.1-sol'\ninput='2'\ncached='0.1'\noutput='10'\ncache_write_mode='subset'\n[rates.cache_write_rates]\n\"1800\"='2.5'\n\"43200\"='5'\n");
         let mut e = event();
         e.usage.cache_write = Some(10_000);
-        e.cache_retention = Some("12h".into());
+        e.cache_writes = Some(CacheWriteBreakdown::from_ttl(43_200, 10_000));
         // 30k ordinary*2 + 60k cached*0.1 + 10k writes*5 + 20k output*10.
         assert_eq!(p.estimate(&e).cost.unwrap().to_string(), "0.316");
-        e.cache_retention = Some("unsupported".into());
+        e.cache_writes = Some(CacheWriteBreakdown::unknown(10_000));
         assert!(p.estimate(&e).cost.is_none());
+        e.cache_writes = None;
+        let legacy = p.estimate(&e);
+        assert_eq!(legacy.cost.unwrap().to_string(), "0.291");
+        assert!(legacy
+            .assumptions
+            .iter()
+            .any(|a| a.contains("assumes 30m writes")));
         let p = Pricer::load_current(None).unwrap();
         e = event();
         e.model = "gpt-5.5-pro".into();
@@ -592,6 +891,7 @@ mod tests {
     fn missing_tier_is_marked_and_past_rates_are_not_invented() {
         let mut e = event();
         e.tier = None;
+        e.mode = UsageMode::Unknown;
         assert_eq!(
             Pricer::load(None, None).unwrap().estimate(&e).status,
             "assumed"
@@ -624,6 +924,7 @@ mod tests {
             .iter()
             .any(|a| a.contains("rates verified on 2026-11-04; historical price not recorded")));
         e.tier = Some("priority".into());
+        e.mode = UsageMode::Fast;
         assert_eq!(p.estimate(&e).cost.unwrap().to_string(), "0.572");
         assert!(p.estimate(&e).rate_id.unwrap().contains(":fast:"));
         e.usage.input = 272_001;
@@ -702,6 +1003,7 @@ mod tests {
         let mut e = event();
         assert_eq!(p.estimate(&e).cost.unwrap().to_string(), "0.38");
         e.tier = Some("fast".into());
+        e.mode = UsageMode::Fast;
         assert_eq!(p.estimate(&e).cost.unwrap().to_string(), "0.572");
     }
     #[test]
@@ -713,12 +1015,12 @@ mod tests {
             .estimate(&e)
             .cost
             .is_none());
-        let p=custom("[[rates]]\nmodel='gpt-6.1-sol'\ninput='2'\ncached='0.1'\noutput='10'\ncache_write='2.5'\ncache_write_mode='subset'\n");
+        let p=custom("[[rates]]\nmodel='gpt-6.1-sol'\ninput='2'\ncached='0.1'\noutput='10'\ncache_write_mode='subset'\n[rates.cache_write_rates]\n\"1800\"='2.5'\n");
         assert_eq!(p.estimate(&e).cost.unwrap().to_string(), "0.291");
-        let p=custom("[[rates]]\nmodel='gpt-6.1-sol'\ninput='2'\ncached='0.1'\noutput='10'\ncache_write='0.5'\ncache_write_mode='additive'\n");
+        let p=custom("[[rates]]\nmodel='gpt-6.1-sol'\ninput='2'\ncached='0.1'\noutput='10'\ncache_write_mode='additive'\n[rates.cache_write_rates]\n\"1800\"='0.5'\n");
         assert_eq!(p.estimate(&e).cost.unwrap().to_string(), "0.291");
         e.usage.cache_write = Some(50_000);
-        let p=custom("[[rates]]\nmodel='gpt-6.1-sol'\ninput='2'\ncached='0.1'\noutput='10'\ncache_write='2.5'\ncache_write_mode='subset'\n");
+        let p=custom("[[rates]]\nmodel='gpt-6.1-sol'\ninput='2'\ncached='0.1'\noutput='10'\ncache_write_mode='subset'\n[rates.cache_write_rates]\n\"1800\"='2.5'\n");
         assert!(p.estimate(&e).cost.is_none());
     }
     #[test]
@@ -728,5 +1030,15 @@ mod tests {
         assert!(Table::parse(raw, "custom").is_err());
         let raw="[[rates]]\nmodel='x'\nfrom='2026-01-01'\nuntil='2026-01-31'\ninput='1'\noutput='2'\n[[rates]]\nmodel='x'\nfrom='2026-02-01'\ninput='3'\noutput='4'\n";
         assert!(Table::parse(raw, "custom").is_ok());
+        assert!(Table::parse(
+            "[[rates]]\nmodel='x'\ninput='1'\noutput='2'\n[rates.cache_write_rates]\n\"0\"='1'\n",
+            "custom"
+        )
+        .is_err());
+        assert!(Table::parse(
+            "[[rates]]\nmodel='x'\ninput='1'\noutput='2'\n[rates.cache_write_rates]\n\"x\"='1'\n",
+            "custom"
+        )
+        .is_err());
     }
 }

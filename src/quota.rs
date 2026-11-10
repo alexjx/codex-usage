@@ -3,7 +3,7 @@
 //! Quota percentages belong to an account, not to a log file. Source identities
 //! are kept separate because a rollout does not identify the signed-in account.
 //! Estimates describe the locally observed workload, never a token entitlement.
-use crate::model::UsageEvent;
+use crate::model::{AgentKind, EventKey, UsageEvent};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -82,11 +82,13 @@ pub struct QuotaSummary {
 }
 
 /// Summarize only data the caller already loaded. No history discovery is done.
+/// `source_quality` is source-local: an unrelated agent's parser error must not
+/// disable a complete Codex forecast.
 pub fn summarize(
     snapshots: &[QuotaSnapshot],
     events: &[UsageEvent],
     now: DateTime<Utc>,
-    incomplete: bool,
+    source_quality: &BTreeMap<String, bool>,
 ) -> Vec<QuotaSummary> {
     let mut groups: BTreeMap<(&str, &str, &str), Vec<&QuotaSnapshot>> = BTreeMap::new();
     for snapshot in snapshots {
@@ -159,6 +161,7 @@ pub fn summarize(
                 forecast_used_percent: None,
                 forecast_tokens: None,
             };
+            let incomplete = source_quality.get(&summary.source).copied().unwrap_or(true);
             forecast(&mut summary, &samples, events, now, incomplete);
             summary
         })
@@ -244,12 +247,12 @@ fn forecast(
     }
     summary.forecast_window_seconds = Some(seconds);
     summary.forecast_used_percent = Some(consumed);
-    let mut unique = BTreeMap::<&str, &UsageEvent>::new();
+    let mut unique = BTreeMap::<&EventKey, &UsageEvent>::new();
     for event in events.iter().filter(|event| {
         event.timestamp > first.timestamp
             && event.timestamp <= summary.observed_at
             && (event.source == summary.source || event.origins.contains(&summary.source))
-            && event.provider == "openai"
+            && event.id.agent == AgentKind::Codex
     }) {
         if let Some(previous) = unique.insert(&event.id, event) {
             if previous != event {
@@ -348,6 +351,7 @@ mod tests {
     use crate::model::Usage;
     use serde_json::json;
 
+    use crate::model::SessionKey;
     fn time(seconds: i64) -> DateTime<Utc> {
         DateTime::from_timestamp(1_800_000_000 + seconds, 0).unwrap()
     }
@@ -362,14 +366,18 @@ mod tests {
             resets_at: time(3600),
         }
     }
+    fn quality(incomplete: bool) -> BTreeMap<String, bool> {
+        [("wsl".into(), incomplete), ("windows".into(), incomplete)].into()
+    }
     fn event(seconds: i64, input: u64, output: u64) -> UsageEvent {
         UsageEvent {
-            id: format!("response-{seconds}"),
+            id: EventKey::new(AgentKind::Codex, format!("response-{seconds}")),
             timestamp: time(seconds),
-            session: "session".into(),
+            session: SessionKey::main(AgentKind::Codex, "session"),
             model: "test-model".into(),
             provider: "openai".into(),
             tier: Some("standard".into()),
+            mode: crate::model::UsageMode::Regular,
             project: None,
             usage: Usage {
                 input,
@@ -378,10 +386,10 @@ mod tests {
                 reasoning: Some(output),
                 ..Usage::default()
             },
+            cache_writes: None,
             source: "wsl".into(),
             origins: BTreeSet::new(),
             context_tokens: None,
-            cache_retention: None,
         }
     }
     fn evidence() -> (Vec<QuotaSnapshot>, Vec<UsageEvent>) {
@@ -418,7 +426,7 @@ mod tests {
     #[test]
     fn estimate_counts_total_tokens_once_and_uses_snapshot_time_for_eta() {
         let (samples, events) = evidence();
-        let summary = &summarize(&samples, &events, time(250), false)[0];
+        let summary = &summarize(&samples, &events, time(250), &quality(false))[0];
         assert_eq!(summary.forecast_status, "estimated");
         assert_eq!(summary.remaining_tokens, Some(12000));
         assert_eq!(summary.forecast_tokens, Some(3000));
@@ -428,13 +436,35 @@ mod tests {
     }
 
     #[test]
+    fn unrelated_agent_quality_and_events_do_not_disable_codex_forecasts() {
+        let (samples, mut events) = evidence();
+        let quality = BTreeMap::from([("wsl".into(), false), ("claude".into(), true)]);
+        let summary = &summarize(&samples, &events, time(250), &quality)[0];
+        assert_eq!(summary.forecast_status, "estimated");
+        assert_eq!(summary.remaining_tokens, Some(12000));
+        let mut claude = event(60, 1, 1);
+        claude.id = EventKey::new(AgentKind::ClaudeCode, "claude");
+        claude.source = "wsl".into();
+        events.push(claude);
+        assert_eq!(
+            summarize(&samples, &events, time(250), &quality)[0].forecast_status,
+            "estimated"
+        );
+        let quality = BTreeMap::from([("wsl".into(), true), ("claude".into(), false)]);
+        assert_eq!(
+            summarize(&samples, &events, time(250), &quality)[0].forecast_status,
+            "incomplete_data"
+        );
+    }
+
+    #[test]
     fn copied_snapshots_and_usage_do_not_inflate_estimates() {
         let (mut samples, mut events) = evidence();
-        let expected = summarize(&samples, &events, time(240), false)[0].remaining_tokens;
+        let expected = summarize(&samples, &events, time(240), &quality(false))[0].remaining_tokens;
         samples.extend(samples.clone());
         events.extend(events.clone());
         assert_eq!(
-            summarize(&samples, &events, time(240), false)[0].remaining_tokens,
+            summarize(&samples, &events, time(240), &quality(false))[0].remaining_tokens,
             expected
         );
     }
@@ -451,11 +481,11 @@ mod tests {
         for event in &mut events {
             event.origins.insert("windows".into());
         }
-        let result = summarize(&samples, &events, time(240), false);
+        let result = summarize(&samples, &events, time(240), &quality(false));
         assert_eq!(result.len(), 2);
         assert!(result.iter().all(|s| s.remaining_tokens == Some(12000)));
         events[0].origins.clear();
-        assert!(summarize(&samples, &events, time(240), false)
+        assert!(summarize(&samples, &events, time(240), &quality(false))
             .iter()
             .find(|s| s.source == "windows")
             .unwrap()
@@ -471,12 +501,12 @@ mod tests {
             (time(3600), false, "expired"),
             (time(240), true, "incomplete_data"),
         ] {
-            let summary = &summarize(&samples, &events, now, incomplete)[0];
+            let summary = &summarize(&samples, &events, now, &quality(incomplete))[0];
             assert_eq!(summary.forecast_status, expected);
             assert!(summary.remaining_tokens.is_none());
             assert!(summary.exhausts_at.is_none());
         }
-        assert!(summarize(&[sample(241, 99.0)], &events, time(240), false).is_empty());
+        assert!(summarize(&[sample(241, 99.0)], &events, time(240), &quality(false)).is_empty());
     }
 
     #[test]
@@ -484,12 +514,17 @@ mod tests {
         let mut first = sample(0, 80.0);
         first.resets_at += Duration::seconds(1);
         let latest = sample(240, 84.0);
-        let result = summarize(&[first.clone(), latest.clone()], &[], time(240), false);
+        let result = summarize(
+            &[first.clone(), latest.clone()],
+            &[],
+            time(240),
+            &quality(false),
+        );
         assert_eq!(result[0].last_reset_basis, "estimated");
         assert_eq!(result[0].last_reset, Some(time(3600 - 18000)));
         first.timestamp = time(-18000);
         first.resets_at = time(3600 - 18000);
-        let result = summarize(&[first, latest], &[], time(240), false);
+        let result = summarize(&[first, latest], &[], time(240), &quality(false));
         assert_eq!(result[0].last_reset_basis, "observed");
         assert_eq!(result[0].last_reset, Some(time(3600 - 18000)));
     }
@@ -500,17 +535,17 @@ mod tests {
         let mut changed = samples.clone();
         changed[1].used_percent = 79.0;
         assert_eq!(
-            summarize(&changed, &events, time(240), false)[0].forecast_status,
+            summarize(&changed, &events, time(240), &quality(false))[0].forecast_status,
             "quota_changed"
         );
         changed = samples.clone();
         changed[0].resets_at -= Duration::seconds(300);
-        assert!(summarize(&changed, &events, time(240), false)[0]
+        assert!(summarize(&changed, &events, time(240), &quality(false))[0]
             .remaining_tokens
             .is_none());
         changed = vec![sample(0, 80.0), sample(1800, 84.0)];
         assert_eq!(
-            summarize(&changed, &events, time(1800), false)[0].forecast_status,
+            summarize(&changed, &events, time(1800), &quality(false))[0].forecast_status,
             "sparse_history"
         );
     }
@@ -523,18 +558,18 @@ mod tests {
             vec![sample(0, 80.0), sample(240, 80.0)],
             vec![sample(0, 80.0), sample(60, 84.0)],
         ] {
-            assert!(summarize(&changed, &events, time(240), false)[0]
+            assert!(summarize(&changed, &events, time(240), &quality(false))[0]
                 .remaining_tokens
                 .is_none());
         }
         assert_eq!(
-            summarize(&samples, &[], time(240), false)[0].forecast_status,
+            summarize(&samples, &[], time(240), &quality(false))[0].forecast_status,
             "missing_usage"
         );
         let mut events = events;
         events[1].model = "different-model".into();
         assert_eq!(
-            summarize(&samples, &events, time(240), false)[0].forecast_status,
+            summarize(&samples, &events, time(240), &quality(false))[0].forecast_status,
             "changing_workload"
         );
     }
@@ -543,7 +578,7 @@ mod tests {
     fn exhausted_resets_first_and_already_elapsed_predictions_are_distinguished() {
         let (mut samples, events) = evidence();
         samples[2].used_percent = 100.0;
-        let summary = &summarize(&samples, &events, time(240), false)[0];
+        let summary = &summarize(&samples, &events, time(240), &quality(false))[0];
         assert_eq!(summary.forecast_status, "exhausted");
         assert_eq!(summary.remaining_tokens, Some(0));
         assert!(summary.exhausts_at.is_none());
@@ -551,14 +586,14 @@ mod tests {
         for sample in &mut samples {
             sample.resets_at = time(600);
         }
-        let summary = &summarize(&samples, &events, time(240), false)[0];
+        let summary = &summarize(&samples, &events, time(240), &quality(false))[0];
         assert_eq!(summary.forecast_status, "resets_first");
         assert_eq!(summary.remaining_tokens, Some(12000));
         assert!(summary.exhausts_at.is_none());
         samples[0].used_percent = 80.0;
         samples[1].used_percent = 89.0;
         samples[2].used_percent = 99.0;
-        let summary = &summarize(&samples, &events, time(260), false)[0];
+        let summary = &summarize(&samples, &events, time(260), &quality(false))[0];
         assert_eq!(summary.forecast_status, "awaiting_update");
         assert!(summary.remaining_tokens.is_none());
     }
@@ -568,12 +603,12 @@ mod tests {
         let (mut samples, events) = evidence();
         samples.push(sample(120, 83.0));
         assert_eq!(
-            summarize(&samples, &events, time(240), false)[0].forecast_status,
+            summarize(&samples, &events, time(240), &quality(false))[0].forecast_status,
             "conflicting_snapshots"
         );
         let (mut samples, events) = evidence();
         samples.push(sample(240, 100.0));
-        let summary = &summarize(&samples, &events, time(240), false)[0];
+        let summary = &summarize(&samples, &events, time(240), &quality(false))[0];
         assert_eq!(summary.forecast_status, "conflicting_snapshots");
         assert!(summary.remaining_tokens.is_none());
         let (samples, mut events) = evidence();
@@ -581,7 +616,7 @@ mod tests {
         conflict.usage.input += 1;
         events.push(conflict);
         assert_eq!(
-            summarize(&samples, &events, time(240), false)[0].forecast_status,
+            summarize(&samples, &events, time(240), &quality(false))[0].forecast_status,
             "inconsistent_usage"
         );
     }

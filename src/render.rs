@@ -289,6 +289,8 @@ pub struct View {
 }
 pub struct SessionRow {
     pub session: String,
+    /// Typed navigation target; never reconstructed from rendered text.
+    pub key: Option<crate::model::SessionKey>,
     pub model: Option<String>,
     pub mode: Option<String>,
     pub start: usize,
@@ -405,7 +407,7 @@ pub fn view(cli: &Cli, report: &Report, style: &Style, width: usize, help: bool)
         style,
         "accent",
         &format!(
-            "Codex Usage / {}{}{}{sep}{}{sep}{}",
+            "Agent Usage / {}{}{}{sep}{}{sep}{}",
             report.kind,
             if cli.monitor() { " LIVE" } else { "" },
             if filtered { " FILTERED" } else { "" },
@@ -480,15 +482,17 @@ pub fn view(cli: &Cli, report: &Report, style: &Style, width: usize, help: bool)
     }
     text(&mut h, style, "cost", &summary, width);
     if report.period.basis.starts_with("last_7_days_") {
+        let reason = match report.period.basis.as_str() {
+            "last_7_days_conflicting_resets" => "quota resets differ by source",
+            "last_7_days_multi_agent" => "multiple agents selected",
+            "last_7_days_no_quota_capability" => "quota unavailable for this agent",
+            _ => "quota reset unavailable",
+        };
         text(
             &mut h,
             style,
             "meta",
-            &if report.period.basis == "last_7_days_conflicting_resets" {
-                format!("Last 7 days{sep}quota resets differ by source")
-            } else {
-                format!("Last 7 days{sep}quota reset unavailable")
-            },
+            &format!("Last 7 days{sep}{reason}"),
             width,
         );
     }
@@ -523,6 +527,22 @@ pub fn view(cli: &Cli, report: &Report, style: &Style, width: usize, help: bool)
             m.average_session_output_tokens_per_second
         ));
         text(&mut h, style, "accent", &delta, width);
+        if m.agent_activity.len() > 1 {
+            let agents = m
+                .agent_activity
+                .iter()
+                .map(|agent| {
+                    format!(
+                        "{} {} tok / {:.0} out tok/s",
+                        agent.agent,
+                        number(agent.since_ready_tokens.max(0) as u64, cli.exact),
+                        agent.output_tokens_per_second
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(sep);
+            text(&mut h, style, "meta", &agents, width);
+        }
     }
     for (warning, line) in quota_lines(cli, report, sep) {
         text(
@@ -767,6 +787,7 @@ pub fn view(cli: &Cli, report: &Report, style: &Style, width: usize, help: bool)
             if let Some(session) = row.dimensions.get("session") {
                 session_rows.push(SessionRow {
                     session: session.clone(),
+                    key: session.parse().ok(),
                     model: row.dimensions.get("model").cloned(),
                     mode: row.dimensions.get("mode").cloned().or_else(|| {
                         (row.counts.modes.len() == 1)
@@ -858,7 +879,7 @@ mod tests {
     use clap::Parser;
 
     fn quota_report() -> (Cli, Report) {
-        let cli = Cli::parse_from(["codex-usage", "daily", "--no-cost", "--color", "never"]);
+        let cli = Cli::parse_from(["agent-usage", "daily", "--no-cost", "--color", "never"]);
         let now = "2026-11-05T00:40:33Z".parse().unwrap();
         let next_reset: chrono::DateTime<chrono::Utc> = "2026-11-05T15:40:33Z".parse().unwrap();
         let mut scan = crate::model::Scan::default();
@@ -945,7 +966,7 @@ mod regression_tests {
     use clap::Parser;
     #[test]
     fn session_selection_ranges_keep_full_ids_through_wrapping_and_help() {
-        let cli = Cli::parse_from(["codex-usage", "sessions", "--all", "--color", "never"]);
+        let cli = Cli::parse_from(["agent-usage", "sessions", "--all", "--color", "never"]);
         let mut report = report::build(
             &cli,
             chrono_tz::UTC,
@@ -1006,7 +1027,7 @@ mod regression_tests {
 
     #[test]
     fn monitor_line_uses_rolling_deltas_instead_of_since_ready_totals() {
-        let cli = Cli::parse_from(["codex-usage", "monitor", "--color", "never"]);
+        let cli = Cli::parse_from(["agent-usage", "monitor", "--color", "never"]);
         let mut report = report::build(
             &cli,
             chrono_tz::UTC,
@@ -1031,6 +1052,7 @@ mod regression_tests {
             average_session_output_tokens_per_second: 33.0,
             session_output_tokens_per_second: Default::default(),
             session_speed_window_seconds: 60,
+            agent_activity: Vec::new(),
             scan_millis: 0,
         });
         let output = linear(&cli, &report, 140, false).join("\n");
@@ -1070,7 +1092,7 @@ mod regression_tests {
             ),
         ] {
             let cli = Cli::parse_from([
-                "codex-usage",
+                "agent-usage",
                 "monitor",
                 "--timezone",
                 zone,
@@ -1097,7 +1119,7 @@ mod regression_tests {
     #[test]
     fn selected_model_and_mode_survive_date_subtotal_and_mixed_mode_rows() {
         let cli = Cli::parse_from([
-            "codex-usage",
+            "agent-usage",
             "sessions",
             "--all",
             "--group-by",
@@ -1156,14 +1178,18 @@ mod regression_tests {
     #[test]
     fn monitor_marks_data_gaps_and_does_not_present_unknown_cost_as_free() {
         for readable in [true, false] {
-            let cli = Cli::parse_from(["codex-usage", "monitor", "--color", "never"]);
+            let cli = Cli::parse_from(["agent-usage", "monitor", "--color", "never"]);
             let mut scan = Scan::default();
             scan.sources.push(crate::model::SourceStatus {
                 name: "local".into(),
+                agent: crate::model::AgentKind::Codex,
                 root: "/unused".into(),
                 readable,
                 last_success: None,
                 error: None,
+                capability: crate::model::QuotaCapability::RecordedSnapshots,
+                coverage: Default::default(),
+                pricing_provider: None,
             });
             scan.coverage.uncertain = usize::from(readable);
             let mut report =
@@ -1188,7 +1214,7 @@ mod regression_tests {
     #[test]
     fn monitor_partial_cost_and_filtered_scope_stay_compact_and_wrap() {
         let cli = Cli::parse_from([
-            "codex-usage",
+            "agent-usage",
             "monitor",
             "--session",
             "s",
@@ -1241,7 +1267,7 @@ mod regression_tests {
     #[test]
     fn no_cost_monitor_keeps_range_without_cost_fields_and_uses_ascii_separator() {
         let cli = Cli::parse_from([
-            "codex-usage",
+            "agent-usage",
             "monitor",
             "--no-cost",
             "--ascii",
@@ -1268,7 +1294,7 @@ mod regression_tests {
 
     #[test]
     fn diagnostic_counts_are_only_in_on_demand_help() {
-        let cli = Cli::parse_from(["codex-usage", "--color", "never"]);
+        let cli = Cli::parse_from(["agent-usage", "--color", "never"]);
         let mut report = report::build(
             &cli,
             chrono_tz::UTC,
@@ -1302,7 +1328,7 @@ mod regression_tests {
     }
     #[test]
     fn wide_stacked_view_keeps_detail_and_sanitizes_terminal_controls() {
-        let cli = Cli::parse_from(["codex-usage", "--wide", "--no-cost", "--color", "never"]);
+        let cli = Cli::parse_from(["agent-usage", "--wide", "--no-cost", "--color", "never"]);
         let mut report = report::build(
             &cli,
             chrono_tz::UTC,

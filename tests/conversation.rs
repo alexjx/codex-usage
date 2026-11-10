@@ -32,7 +32,7 @@ impl Fixture {
         }
     }
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_codex-usage"))
+        Command::new(env!("CARGO_BIN_EXE_agent-usage"))
             .arg("--config")
             .arg(&self.config)
             .args(args)
@@ -123,6 +123,8 @@ fn conversation_json_keeps_messages_tools_and_usage_independent() {
         "session",
         SESSION,
         "--all",
+        "--agent",
+        "codex",
         "--root",
         f.root(),
         "--format",
@@ -133,13 +135,15 @@ fn conversation_json_keeps_messages_tools_and_usage_independent() {
         SESSION,
         "--conversation",
         "--all",
+        "--agent",
+        "codex",
         "--root",
         f.root(),
         "--format",
         "json",
     ]);
-    assert_eq!(explored["schema_version"], 1);
-    assert_eq!(explored["conversation"]["session_id"], SESSION);
+    assert_eq!(explored["schema_version"], 2);
+    assert_eq!(explored["conversation"]["session"]["native_id"], SESSION);
     assert_eq!(explored["usage"]["totals"], usage["totals"]);
     assert_eq!(explored["usage"]["totals"]["total"], 120);
     assert_eq!(
@@ -195,6 +199,8 @@ fn full_conversation_pipe_output_has_no_ansi_or_preview_truncation() {
         SESSION,
         "--conversation",
         "--all",
+        "--agent",
+        "codex",
         "--root",
         f.root(),
         "--color",
@@ -243,6 +249,8 @@ fn conversation_lookup_ignores_report_mtime_cutoff_but_obeys_session_and_source_
         "--today",
         "--timezone",
         "UTC",
+        "--agent",
+        "codex",
         "--root",
         f.root(),
         "--format",
@@ -256,7 +264,7 @@ fn conversation_lookup_ignores_report_mtime_cutoff_but_obeys_session_and_source_
     assert!(!serde_json::to_string(&result["conversation"])
         .unwrap()
         .contains("UNRELATED SESSION TEXT"));
-    assert_eq!(result["conversation"]["session_id"], SESSION);
+    assert_eq!(result["conversation"]["session"]["native_id"], SESSION);
 }
 
 #[test]
@@ -271,8 +279,12 @@ fn copied_logs_do_not_duplicate_conversation_or_accounting() {
         SESSION,
         "--conversation",
         "--all",
+        "--agent",
+        "codex",
         "--root",
         f.root(),
+        "--agent",
+        "codex",
         "--root",
         windows.to_str().unwrap(),
         "--format",
@@ -312,6 +324,8 @@ fn conversation_and_monitor_options_do_not_carry_over_to_later_invocations() {
         SESSION,
         "--conversation",
         "--all",
+        "--agent",
+        "codex",
         "--root",
         f.root(),
         "--format",
@@ -321,6 +335,8 @@ fn conversation_and_monitor_options_do_not_carry_over_to_later_invocations() {
         "session",
         SESSION,
         "--all",
+        "--agent",
+        "codex",
         "--root",
         f.root(),
         "--format",
@@ -330,15 +346,17 @@ fn conversation_and_monitor_options_do_not_carry_over_to_later_invocations() {
     assert!(usage.get("conversation").is_none());
     assert_eq!(usage["totals"], first["usage"]["totals"]);
 
-    let daily = f.run(&["--root", f.root(), "--color", "never"]);
+    let daily = f.run(&["--agent", "codex", "--root", f.root(), "--color", "never"]);
     success(&daily);
     let text = String::from_utf8(daily.stdout).unwrap();
-    assert!(text.contains("Codex Usage / Daily"), "{text}");
+    assert!(text.contains("Agent Usage / Daily"), "{text}");
     assert!(!text.contains("Please check the costs."), "{text}");
     assert!(serde_json::from_str::<Value>(&text).is_err());
 
     let monitor = f.run(&[
         "monitor",
+        "--agent",
+        "codex",
         "--root",
         f.root(),
         "--frames",
@@ -347,7 +365,7 @@ fn conversation_and_monitor_options_do_not_carry_over_to_later_invocations() {
         "jsonl",
     ]);
     success(&monitor);
-    let daily = f.json(&["--root", f.root(), "--format", "json"]);
+    let daily = f.json(&["--agent", "codex", "--root", f.root(), "--format", "json"]);
     assert_eq!(daily["kind"], "Daily");
     assert!(daily.get("conversation").is_none());
     assert_eq!(daily["totals"], usage["totals"]);
@@ -364,7 +382,7 @@ fn conversation_reports_missing_sessions_and_rejects_inapplicable_formats() {
         vec!["models", "--conversation"],
         vec!["monitor", "--conversation", "--frames", "1"],
     ] {
-        args.extend(["--root", f.root()]);
+        args.extend(["--agent", "codex", "--root", f.root()]);
         let output = f.run(&args);
         assert_eq!(
             output.status.code(),
@@ -382,6 +400,8 @@ fn conversation_reports_missing_sessions_and_rejects_inapplicable_formats() {
         "session",
         "absent-session",
         "--conversation",
+        "--agent",
+        "codex",
         "--root",
         f.root(),
     ]);
@@ -412,6 +432,8 @@ fn incomplete_trailing_messages_remain_pending_until_the_record_is_complete() {
         SESSION,
         "--conversation",
         "--all",
+        "--agent",
+        "codex",
         "--root",
         f.root(),
         "--format",
@@ -429,6 +451,8 @@ fn incomplete_trailing_messages_remain_pending_until_the_record_is_complete() {
         SESSION,
         "--conversation",
         "--all",
+        "--agent",
+        "codex",
         "--root",
         f.root(),
         "--format",
@@ -464,6 +488,8 @@ fn conversation_can_read_retained_compressed_archives() {
         SESSION,
         "--conversation",
         "--today",
+        "--agent",
+        "codex",
         "--root",
         f.root(),
     ]);

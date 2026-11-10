@@ -907,7 +907,7 @@ fn paint_line(style: &Style, line: &Line, query: &str, focused: bool) -> String 
 }
 fn details(conversation: &Conversation, report: &Report, width: usize) -> Vec<String> {
     let mut raw = vec![
-        format!("Session: {}", conversation.session_id),
+        format!("Session: {}", conversation.session),
         format!(
             "Project: {}",
             conversation.project.as_deref().unwrap_or("unknown")
@@ -935,7 +935,7 @@ fn details(conversation: &Conversation, report: &Report, width: usize) -> Vec<St
         report
             .rows
             .iter()
-            .filter(|row| row.dimensions.get("session") == Some(&conversation.session_id))
+            .filter(|row| row.dimensions.get("session") == Some(&conversation.session.selector()))
             .map(|row| &row.counts)
             .collect()
     };
@@ -962,7 +962,7 @@ fn details(conversation: &Conversation, report: &Report, width: usize) -> Vec<St
     if partial {
         raw.push("* Known priced subtotal; some usage is unpriced or assumed.".into());
     }
-    if let Some(parent) = &conversation.parent_session {
+    if let Some(parent) = &conversation.parent {
         raw.push(format!("Parent session: {parent}"));
     }
     if conversation.pending > 0 {
@@ -1054,8 +1054,8 @@ fn chrome(conversation: &Conversation, state: &State, paint: &Paint<'_>) -> Chro
     let sep = if cli.ascii { " / " } else { " · " };
     let mut header = vec![short(
         &format!(
-            "Codex Usage / Sessions / {}{}{}",
-            short(&conversation.session_id, 20),
+            "Agent Usage / Sessions / {}{}{}",
+            short(&conversation.session.to_string(), 20),
             sep,
             conversation.project.as_deref().unwrap_or("unknown project")
         ),
@@ -1221,7 +1221,7 @@ fn frame(
 pub fn plain(conversation: &Conversation, tz: Tz) -> String {
     let mut out = format!(
         "Session {}\nProject: {}\nAll retained conversation / {}\n\n",
-        conversation::sanitize(&conversation.session_id),
+        conversation::sanitize(&conversation.session.selector()),
         conversation::sanitize(conversation.project.as_deref().unwrap_or("unknown")),
         tz
     );
@@ -1305,7 +1305,7 @@ pub fn run(
         let reload_stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&reload_stop);
         let _cancel = CancelReload(Arc::clone(&reload_stop));
-        let session = conversation.session_id.clone();
+        let session = conversation.session.clone();
         scope.spawn(move || {
             while requests_rx.recv().is_ok() {
                 let result = conversation::load(sources, &session, &worker_stop);
@@ -1819,7 +1819,7 @@ mod tests {
     use super::*;
     use crate::{
         conversation::{ConversationFile, Turn},
-        model::Scan,
+        model::{AgentKind, Scan, SessionKey},
         report::{self, Counts, Row},
     };
     use clap::Parser;
@@ -1844,7 +1844,7 @@ mod tests {
     }
     fn fixture() -> (Cli, Conversation, Report) {
         let cli = Cli::parse_from([
-            "codex-usage",
+            "agent-usage",
             "sessions",
             "--all",
             "--no-cost",
@@ -1860,7 +1860,7 @@ mod tests {
         )
         .unwrap();
         let conversation = Conversation {
-            session_id: "session-test".into(),
+            session: SessionKey::main(AgentKind::Codex, "session-test"),
             project: Some("/work/project".into()),
             sources: vec!["local".into()],
             files: Vec::<ConversationFile>::new(),
@@ -1892,7 +1892,7 @@ mod tests {
                 },
             ],
             warnings: vec![],
-            parent_session: None,
+            parent: None,
             pending: 0,
         };
         (cli, conversation, report)
@@ -2037,7 +2037,7 @@ mod tests {
         report.kind = "Sessions".into();
         report.rows = vec![
             Row {
-                dimensions: BTreeMap::from([("session".into(), conversation.session_id.clone())]),
+                dimensions: BTreeMap::from([("session".into(), conversation.session.selector())]),
                 counts: Counts {
                     total: 100,
                     cost_usd: Some(Decimal::new(25, 2)),
@@ -2045,7 +2045,7 @@ mod tests {
                 },
             },
             Row {
-                dimensions: BTreeMap::from([("session".into(), conversation.session_id.clone())]),
+                dimensions: BTreeMap::from([("session".into(), conversation.session.selector())]),
                 counts: Counts {
                     total: 20,
                     cost_usd: None,

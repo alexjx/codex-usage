@@ -56,7 +56,7 @@ impl Fixture {
         }
     }
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_codex-usage"))
+        Command::new(env!("CARGO_BIN_EXE_agent-usage"))
             .arg("--config")
             .arg(&self.config)
             .args(args)
@@ -94,6 +94,8 @@ impl Fixture {
             "daily",
             "--last",
             "7",
+            "--agent",
+            "codex",
             "--root",
             self.root(),
             "--format",
@@ -135,6 +137,8 @@ fn assert_models(report: &Value, model: &str) {
 fn bare_command_falls_back_to_last_seven_days_without_quota() {
     let f = Fixture::new();
     let report = f.report(&[
+        "--agent",
+        "codex",
         "--root",
         f.root(),
         "--format",
@@ -163,7 +167,15 @@ fn report_exports_and_filters_do_not_change_later_defaults() {
     assert_models(&filtered, "alpha");
     assert_eq!(filtered["totals"]["total"], 330);
     for command in [Some("daily"), None] {
-        let mut args = vec!["--root", f.root(), "--timezone", "UTC", "--no-cost"];
+        let mut args = vec![
+            "--agent",
+            "codex",
+            "--root",
+            f.root(),
+            "--timezone",
+            "UTC",
+            "--no-cost",
+        ];
         if let Some(command) = command {
             args.insert(0, command);
         }
@@ -181,6 +193,8 @@ fn report_exports_and_filters_do_not_change_later_defaults() {
     }
     let fresh = f.report(&[
         "daily",
+        "--agent",
+        "codex",
         "--root",
         f.root(),
         "--format",
@@ -212,6 +226,8 @@ fn switching_commands_never_carries_report_options() {
     ] {
         let report = f.report(&[
             command,
+            "--agent",
+            "codex",
             "--root",
             f.root(),
             "--all",
@@ -223,6 +239,8 @@ fn switching_commands_never_carries_report_options() {
         assert_eq!(report["totals"]["total"], 1650, "{command}: {report}");
     }
     let bare = f.report(&[
+        "--agent",
+        "codex",
         "--root",
         f.root(),
         "--format",
@@ -243,6 +261,8 @@ fn monitor_is_explicit_and_its_interval_and_filters_start_fresh() {
     let f = Fixture::new();
     let first = f.snapshots(&[
         "monitor",
+        "--agent",
+        "codex",
         "--root",
         f.root(),
         "--interval",
@@ -262,6 +282,8 @@ fn monitor_is_explicit_and_its_interval_and_filters_start_fresh() {
     assert_models(&first[0], "alpha");
     let fresh = f.snapshots(&[
         "monitor",
+        "--agent",
+        "codex",
         "--root",
         f.root(),
         "--frames",
@@ -275,6 +297,8 @@ fn monitor_is_explicit_and_its_interval_and_filters_start_fresh() {
     assert_eq!(fresh[0]["monitor"]["window_seconds"], 2.0);
     assert_eq!(fresh[0]["totals"]["total"], 440);
     let bare = f.report(&[
+        "--agent",
+        "codex",
         "--root",
         f.root(),
         "--format",
@@ -298,6 +322,8 @@ fn old_history_files_are_ignored_and_left_untouched() {
     ] {
         fs::write(f.preference(), sentinel).unwrap();
         let report = f.report(&[
+            "--agent",
+            "codex",
             "--root",
             f.root(),
             "--format",
@@ -327,6 +353,8 @@ fn source_and_timezone_configuration_remain_persistent_per_profile() {
             name,
             "--kind",
             "linux",
+            "--agent",
+            "codex",
             "--root",
             f.root(),
         ]));
@@ -363,6 +391,8 @@ fn last_is_a_calendar_window_for_only_the_current_invocation() {
     );
     let today = f.report(&[
         "daily",
+        "--agent",
+        "codex",
         "--root",
         f.root(),
         "--last",

@@ -1,7 +1,4 @@
-use anyhow::{bail, Result};
-use chrono::Utc;
-use chrono_tz::Tz;
-use codex_usage::{
+use agent_usage::{
     cancel,
     cli::{Cli, Command, Format, SourceCommand},
     config::{self, Config},
@@ -14,6 +11,9 @@ use codex_usage::{
     report::{self, Report},
     ui,
 };
+use anyhow::{bail, Result};
+use chrono::Utc;
+use chrono_tz::Tz;
 use std::{
     io::{self, Write},
     path::Path,
@@ -36,7 +36,15 @@ fn fail(error: anyhow::Error, code: i32) -> ! {
     }) {
         std::process::exit(0);
     }
-    eprintln!("codex-usage: {error:#}");
+    let code = if error
+        .chain()
+        .any(|cause| cause.is::<report::SelectorError>())
+    {
+        2
+    } else {
+        code
+    };
+    eprintln!("agent-usage: {error:#}");
     std::process::exit(code)
 }
 fn main() {
@@ -67,8 +75,10 @@ fn main() {
         return;
     }
     let selected = config
-        .select(&cli.sources, &cli.roots)
+        .select(&cli.sources, &cli.roots, &cli.agents)
         .unwrap_or_else(|e| fail(e, 2));
+    let agents: std::collections::BTreeSet<_> =
+        selected.iter().map(|source| source.agent).collect();
     let timezone = cli
         .timezone
         .clone()
@@ -77,7 +87,7 @@ fn main() {
     let tz: Tz = timezone
         .parse()
         .unwrap_or_else(|_| fail(anyhow::anyhow!("unknown timezone {timezone}"), 2));
-    report::Period::make(&cli, tz, Utc::now()).unwrap_or_else(|e| fail(e, 2));
+    report::Period::make(&cli, tz, Utc::now(), &agents).unwrap_or_else(|e| fail(e, 2));
     let format = cli
         .format
         .unwrap_or(if cli.monitor() && !ui::interactive() {
@@ -126,17 +136,22 @@ fn source_command(cli: &Cli, config: &mut Config, path: &Path) -> Result<()> {
     let Some(Command::Sources { action }) = &cli.command else {
         unreachable!()
     };
+    if cli.agents.len() > 1 {
+        bail!("sources accept one --agent value");
+    }
+    let agent = cli.agents.first().copied();
     match action {
         Some(SourceCommand::Set { name, kind }) => {
             if cli.roots.len() != 1 {
                 bail!("sources set requires exactly one --root PATH");
             }
-            config.set_source(name, kind.as_deref(), &cli.roots[0])?;
+            config.set_source(name, agent, kind.as_deref(), &cli.roots[0])?;
             config.save(path)?;
             let source = config.sources.iter().find(|s| s.name == *name).unwrap();
             println!(
-                "{} -> {} ({})",
+                "{} ({}) -> {} ({})",
                 source.name,
+                source.agent,
                 source.root.display(),
                 if source.enabled {
                     "enabled"
@@ -150,31 +165,47 @@ fn source_command(cli: &Cli, config: &mut Config, path: &Path) -> Result<()> {
         }
         Some(SourceCommand::Enable { name }) | Some(SourceCommand::Disable { name }) => {
             let enabled = matches!(action, Some(SourceCommand::Enable { .. }));
-            config.set_enabled(name, enabled)?;
+            config.set_enabled(name, enabled, agent)?;
             config.save(path)?;
             println!("{name} {}", if enabled { "enabled" } else { "disabled" });
         }
         None => {
             let catalog = config.source_catalog()?;
-            let configured = catalog.sources;
-            let candidates = catalog.candidates;
+            let filter = |sources: Vec<Source>| -> Vec<Source> {
+                sources
+                    .into_iter()
+                    .filter(|source| agent.is_none_or(|agent| source.agent == agent))
+                    .collect()
+            };
+            let configured = filter(catalog.sources);
+            let candidates = filter(catalog.candidates);
             if cli.format == Some(Format::Json) {
                 serde_json::to_writer_pretty(
                     io::stdout(),
-                    &serde_json::json!({"config":path,"sources":configured,"candidates":candidates}),
+                    &serde_json::json!({"config":path,"version":config::CONFIG_VERSION,"sources":configured,"candidates":candidates}),
                 )?;
                 println!();
             } else {
                 println!("Sources / {}", path.display());
+                println!(
+                    "{:<16} {:<12} {:<10} {:<8} {:<12} Root",
+                    "Name", "Agent", "OS", "State", "Availability"
+                );
                 for source in &configured {
                     println!(
-                        "{:<18} {:<8} {:<8} {}",
+                        "{:<16} {:<12} {:<10} {:<8} {:<9} {}",
                         source.name,
+                        source.agent,
                         source.kind,
                         if source.enabled {
                             "enabled"
                         } else {
                             "disabled"
+                        },
+                        if source.root.is_dir() {
+                            "available"
+                        } else {
+                            "missing"
                         },
                         source.root.display()
                     );
@@ -182,7 +213,12 @@ fn source_command(cli: &Cli, config: &mut Config, path: &Path) -> Result<()> {
                 if !candidates.is_empty() {
                     println!("\nAvailable (enable to configure)");
                     for candidate in candidates {
-                        println!("{:<18} {}", candidate.name, candidate.root.display());
+                        println!(
+                            "{:<16} {:<12} {}",
+                            candidate.name,
+                            candidate.agent,
+                            candidate.root.display()
+                        );
                     }
                 }
             }
@@ -236,7 +272,7 @@ fn load_pricer(cli: &Cli) -> Result<Pricer> {
 }
 fn strict(cli: &Cli, report: &Report, allow_wait: bool) -> Result<()> {
     if !allow_wait && report.sources.iter().all(|s| !s.readable) {
-        bail!("No selected source is readable; run codex-usage doctor");
+        bail!("No selected source is readable; run agent-usage doctor");
     }
     if cli.strict {
         if report.coverage.incomplete() || report.sources.iter().any(|s| !s.readable) {
@@ -262,7 +298,8 @@ fn scan_report(
     let started = Instant::now();
     // Resolve quota-relative dates only after this bounded scan. Quota metadata
     // must never widen daily's seven-day discovery or monitor's startup range.
-    let period = report::Period::make(cli, tz, Utc::now())?;
+    let agents: std::collections::BTreeSet<_> = sources.iter().map(|source| source.agent).collect();
+    let period = report::Period::make(cli, tz, Utc::now(), &agents)?;
     let scan = if cli.monitor() {
         let cutoff = period
             .start
@@ -306,24 +343,34 @@ fn run(
         } else {
             for source in &report.sources {
                 println!(
-                    "{} {} / {}",
+                    "{} ({}) {} / quota {} / {}",
                     source.name,
+                    source.agent,
                     if source.readable {
                         "ready"
                     } else {
                         "unreadable"
                     },
+                    source.capability.as_str(),
                     source.root.display()
+                );
+                println!(
+                    "  {} files / {} conflicts / {} uncertain / {} excluded usage",
+                    source.coverage.files,
+                    source.coverage.conflicts,
+                    source.coverage.uncertain,
+                    source.coverage.excluded_usage
                 );
                 if let Some(error) = &source.error {
                     println!("  {error}");
                 }
             }
             println!(
-                "{} files / {} usage records / {} duplicate records",
+                "{} files / {} usage records / {} duplicate records / {} excluded usage records",
                 report.coverage.files,
                 scan.events.len(),
-                report.coverage.duplicates
+                report.coverage.duplicates,
+                report.coverage.excluded_usage
             );
             for message in &report.coverage.messages {
                 println!("{message}");
@@ -337,10 +384,27 @@ fn run(
         let Some(Command::Session { id }) = &cli.command else {
             unreachable!()
         };
-        let conversation = ui::load_conversation(cli, sources, id, &stopped, false)?;
+        // Conversation loading is independent of report dates. A bare ID can be
+        // resolved directly when the selection names a single agent; mixed
+        // selections require a qualified selector.
+        let selected_agents: std::collections::BTreeSet<_> =
+            sources.iter().map(|source| source.agent).collect();
+        let session = if id.contains(':') {
+            id.parse::<agent_usage::model::SessionKey>()
+                .map_err(|error| anyhow::anyhow!(error))?
+        } else if selected_agents.len() == 1 {
+            agent_usage::model::SessionKey::main(*selected_agents.first().unwrap(), id.clone())
+        } else {
+            report::Selection::resolve(cli, &scan)?.command.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Bare session {id:?} is ambiguous; use a qualified selector such as agent:session"
+                )
+            })?
+        };
+        let conversation = ui::load_conversation(cli, sources, &session, &stopped, false)?;
         return if format == Format::Json {
             export::conversation_json(&conversation, &report, io::stdout())
-        } else if ui::interactive() && cli.pager != codex_usage::cli::Pager::Never {
+        } else if ui::interactive() && cli.pager != agent_usage::cli::Pager::Never {
             conversation_ui::run(cli, conversation, &report, sources, stopped, true)?;
             Ok(())
         } else {

@@ -1,7 +1,14 @@
-//! Read-only rollout discovery, incremental parsing, and usage reconciliation.
+//! Read-only transcript discovery, incremental JSONL framing, and adaptation.
+//!
+//! File lifecycle and framing are shared. Parsing and reconciliation belong to
+//! the selected agent adapter; the reader only orchestrates and merges.
 use crate::{
+    agents::{
+        self, add_coverage, note, AgentScan, DiscoveredFile, ParsedFileSnapshot, ParserState,
+        RecordLocation,
+    },
     cancel,
-    model::{Coverage, Scan, Source, SourceStatus, Usage, UsageEvent},
+    model::{AgentKind, Coverage, QuotaCapability, Scan, Source, SourceKey, SourceStatus},
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -19,71 +26,98 @@ use std::{
 };
 use walkdir::WalkDir;
 
+type FileKey = (SourceKey, PathBuf);
+
 #[derive(Clone, Default)]
-struct Turn {
-    model: String,
-    project: Option<String>,
-    provider: String,
-    tier: Option<String>,
+pub struct JsonlCursor {
+    pub offset: u64,
+    pub line: u64,
+    pub pending: Vec<u8>,
 }
-#[derive(Clone)]
-struct Candidate {
-    event: UsageEvent,
-    file: PathBuf,
-    turn: Option<String>,
-    snapshot: Option<String>,
-    direct: bool,
+pub enum Frame<'a> {
+    Line(&'a [u8]),
+    MalformedFinal(&'a [u8]),
 }
-#[derive(Clone, Default)]
-struct Parser {
-    owner: String,
-    active_session: String,
-    owner_created: Option<DateTime<Utc>>,
-    parent: Option<String>,
-    current: Turn,
-    current_turn: Option<String>,
-    turns: HashMap<String, Turn>,
-    baselines: HashMap<String, Usage>,
-    baseline_models: HashMap<String, String>,
-    events: Vec<Candidate>,
-    quota_snapshots: Vec<crate::quota::QuotaSnapshot>,
-    coverage: Coverage,
-    offset: u64,
-    pending: Vec<u8>,
-    line: u64,
-    direct_responses: BTreeSet<String>,
-    compactions: BTreeSet<String>,
-    fallback_counts: HashMap<String, u64>,
-    recent_direct: HashMap<String, (Usage, DateTime<Utc>, bool)>,
-    thread_tiers: HashMap<String, Option<String>>,
+impl JsonlCursor {
+    /// Consume complete JSONL records. Complete JSON at EOF is consumed without a
+    /// trailing newline; an incomplete final record is retained for the next append.
+    pub fn consume(
+        &mut self,
+        mut reader: impl BufRead,
+        stopped: &AtomicBool,
+        mut on_line: impl FnMut(Frame<'_>, u64),
+    ) -> std::io::Result<()> {
+        loop {
+            if stopped.load(Ordering::Relaxed) {
+                return Err(std::io::Error::other(cancel::Cancelled));
+            }
+            let mut line = std::mem::take(&mut self.pending);
+            let read = reader.read_until(b'\n', &mut line)?;
+            if stopped.load(Ordering::Relaxed) {
+                return Err(std::io::Error::other(cancel::Cancelled));
+            }
+            self.offset += read as u64;
+            if read == 0 {
+                self.pending = line;
+                break;
+            }
+            if line.last() != Some(&b'\n') {
+                if !line.iter().all(u8::is_ascii_whitespace) {
+                    match serde_json::from_slice::<Value>(&line) {
+                        Ok(_) => {
+                            self.line += 1;
+                            let number = self.line;
+                            on_line(Frame::Line(&line), number);
+                        }
+                        Err(error) if error.is_eof() => self.pending = line,
+                        Err(_) => {
+                            self.line += 1;
+                            let number = self.line;
+                            on_line(Frame::MalformedFinal(&line), number);
+                        }
+                    }
+                }
+                break;
+            }
+            self.line += 1;
+            let number = self.line;
+            on_line(Frame::Line(&line), number);
+        }
+        Ok(())
+    }
 }
+
 #[derive(Clone)]
 struct CachedFile {
     len: u64,
     modified: Option<SystemTime>,
     identity: String,
     prefix: Vec<u8>,
-    parser: Parser,
+    cursor: JsonlCursor,
+    parser: ParserState,
+}
+impl CachedFile {
+    fn agent(&self) -> AgentKind {
+        self.parser.agent()
+    }
 }
 #[derive(Clone, Default)]
 struct SourceSnapshot {
-    candidates: Vec<Candidate>,
+    files: Vec<ParsedFileSnapshot>,
     quota_snapshots: Vec<crate::quota::QuotaSnapshot>,
     coverage: Coverage,
 }
-type ReconcileJob = (
-    (String, PathBuf),
-    std::thread::JoinHandle<Result<CachedFile>>,
-);
+type ReconcileJob = (FileKey, std::thread::JoinHandle<Result<CachedFile>>);
+
 #[derive(Default)]
 pub struct Reader {
     stopped: Arc<AtomicBool>,
-    files: HashMap<(String, PathBuf), CachedFile>,
-    sources: HashMap<String, (SourceSnapshot, DateTime<Utc>)>,
+    files: HashMap<FileKey, CachedFile>,
+    sources: HashMap<SourceKey, (SourceSnapshot, DateTime<Utc>)>,
     reconcile_at: Option<Instant>,
-    sweep: VecDeque<(String, PathBuf)>,
+    sweep: VecDeque<FileKey>,
     reconcile_job: Option<ReconcileJob>,
-    background_errors: BTreeMap<(String, PathBuf), String>,
+    background_errors: BTreeMap<FileKey, String>,
 }
 impl Reader {
     pub fn new() -> Self {
@@ -117,55 +151,66 @@ impl Reader {
         cancel::check(&self.stopped)?;
         self.service_reconciliation(sources, since)?;
         let mut scan = Scan::default();
-        let mut candidates = Vec::new();
+        let mut snapshots: Vec<(&Source, SourceSnapshot)> = Vec::new();
+        let mut status: Vec<SourceStatus> = Vec::new();
+        let mut file_coverage: BTreeMap<String, Coverage> = BTreeMap::new();
         for source in sources {
             cancel::check(&self.stopped)?;
+            let key = SourceKey::new(source);
             match self.read_source(source, since) {
                 Ok(snapshot) => {
                     let now = Utc::now();
+                    add_coverage(&mut scan.coverage, &snapshot.coverage);
                     scan.quota_snapshots
                         .extend(snapshot.quota_snapshots.clone());
-                    for candidate in &snapshot.candidates {
-                        cancel::check(&self.stopped)?;
-                        candidates.push(candidate.clone());
-                    }
-                    add_coverage(&mut scan.coverage, &snapshot.coverage);
-                    self.sources.insert(source.name.clone(), (snapshot, now));
-                    scan.sources.push(SourceStatus {
+                    file_coverage.insert(source.name.clone(), snapshot.coverage.clone());
+                    self.sources.insert(key.clone(), (snapshot.clone(), now));
+                    snapshots.push((source, snapshot));
+                    status.push(SourceStatus {
                         name: source.name.clone(),
+                        agent: source.agent,
                         root: source.root.clone(),
                         readable: true,
                         last_success: Some(now),
                         error: None,
+                        capability: capability(source.agent),
+                        coverage: Coverage::default(),
+                        pricing_provider: source.pricing_provider.clone(),
                     });
                 }
                 Err(error) => {
                     if cancel::is_cancelled(&error) {
                         return Err(error);
                     }
-                    let previous = self.sources.get(&source.name);
-                    if let Some((snapshot, _)) = previous {
+                    let previous = self.sources.get(&key).cloned();
+                    if let Some((snapshot, _)) = &previous {
+                        add_coverage(&mut scan.coverage, &snapshot.coverage);
                         scan.quota_snapshots
                             .extend(snapshot.quota_snapshots.clone());
-                        for candidate in &snapshot.candidates {
-                            cancel::check(&self.stopped)?;
-                            candidates.push(candidate.clone());
-                        }
-                        add_coverage(&mut scan.coverage, &snapshot.coverage);
+                        file_coverage.insert(source.name.clone(), snapshot.coverage.clone());
+                        snapshots.push((source, snapshot.clone()));
                     }
-                    scan.sources.push(SourceStatus {
+                    status.push(SourceStatus {
                         name: source.name.clone(),
+                        agent: source.agent,
                         root: source.root.clone(),
                         readable: false,
-                        last_success: previous.map(|(_, time)| *time),
+                        last_success: previous.as_ref().map(|(_, time)| *time),
                         error: Some(error.to_string()),
+                        capability: capability(source.agent),
+                        coverage: Coverage::default(),
+                        pricing_provider: source.pricing_provider.clone(),
                     });
                 }
             }
         }
-        for ((name, _), message) in &self.background_errors {
+        for (key, message) in &self.background_errors {
             cancel::check(&self.stopped)?;
-            if sources.iter().any(|source| source.name == *name) {
+            if sources.iter().any(|source| source.name == key.0.name) {
+                if let Some(coverage) = file_coverage.get_mut(&key.0.name) {
+                    coverage.uncertain += 1;
+                    note(coverage, message.clone());
+                }
                 scan.coverage.uncertain += 1;
                 note(&mut scan.coverage, message.clone());
             }
@@ -173,7 +218,47 @@ impl Reader {
         if self.reconcile_at.is_none() && self.sweep.is_empty() && self.reconcile_job.is_none() {
             self.reconcile_at = Some(Instant::now() + Duration::from_secs(60));
         }
-        scan.events = reconcile(candidates, &mut scan.coverage, &self.stopped)?;
+        // Reconcile each agent's files across all selected sources.
+        let agents: BTreeSet<AgentKind> = sources.iter().map(|source| source.agent).collect();
+        for agent in agents {
+            let files: Vec<ParsedFileSnapshot> = snapshots
+                .iter()
+                .filter(|(source, _)| source.agent == agent)
+                .flat_map(|(_, snapshot)| snapshot.files.iter().cloned())
+                .collect();
+            if files.is_empty() {
+                continue;
+            }
+            let AgentScan {
+                events,
+                observed_event_ids,
+                sessions,
+                coverage,
+                source_coverage,
+            } = agents::reconcile(agent, &files, &self.stopped)?;
+            add_coverage(&mut scan.coverage, &coverage);
+            scan.events.extend(events);
+            scan.observed_event_ids.extend(observed_event_ids);
+            for (key, info) in sessions {
+                scan.sessions
+                    .entry(key.clone())
+                    .or_insert_with(|| crate::model::SessionInfo::new(key))
+                    .merge(&info);
+            }
+            for (name, coverage) in source_coverage {
+                if let Some(file) = file_coverage.get_mut(&name) {
+                    add_coverage(file, &coverage);
+                }
+            }
+        }
+        for source in &mut status {
+            if let Some(coverage) = file_coverage.get(&source.name) {
+                source.coverage.clone_from(coverage);
+            }
+        }
+        scan.events
+            .sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then_with(|| a.id.cmp(&b.id)));
+        scan.sources = status;
         scan.sources.sort_by(|a, b| a.name.cmp(&b.name));
         cancel::check(&self.stopped)?;
         Ok(scan)
@@ -224,7 +309,7 @@ impl Reader {
             let mut keys: Vec<_> = self
                 .files
                 .keys()
-                .filter(|(name, _)| selected.iter().any(|source| source.name == *name))
+                .filter(|(key, _)| selected.iter().any(|source| SourceKey::new(source) == *key))
                 .cloned()
                 .collect();
             keys.sort();
@@ -235,7 +320,9 @@ impl Reader {
         // Recheck queued files as the monitor's date cutoff advances at midnight.
         let files = &self.files;
         self.sweep.retain(|key| {
-            selected.iter().any(|source| source.name == key.0)
+            selected
+                .iter()
+                .any(|source| SourceKey::new(source) == key.0)
                 && files
                     .get(key)
                     .is_some_and(|cached| eligible_modified(cached.modified, since))
@@ -244,11 +331,17 @@ impl Reader {
         if self.reconcile_job.is_none() {
             if let Some(key) = self.sweep.pop_front() {
                 let path = key.1.clone();
+                let source = selected
+                    .iter()
+                    .find(|source| SourceKey::new(source) == key.0)
+                    .cloned();
                 let stopped = Arc::clone(&self.stopped);
                 let job = std::thread::spawn(move || {
                     cancel::check(&stopped)?;
                     let metadata = fs::metadata(&path)?;
-                    parse_cached(&path, &metadata, None, &stopped)
+                    let source = source.context("Reconciliation source disappeared")?;
+                    let file = DiscoveredFile::codex(path.clone());
+                    parse_cached(&path, &metadata, None, &source, &file, &stopped)
                 });
                 self.reconcile_job = Some((key, job));
             }
@@ -261,14 +354,15 @@ impl Reader {
         source: &Source,
         since: Option<DateTime<Utc>>,
     ) -> Result<SourceSnapshot> {
-        let paths = discover(&source.root, &self.stopped)?;
+        let discovered = agents::discover(source, &self.stopped)?;
         // Inspect first, then parse only changed files in parallel. Unchanged monitor
         // refreshes do not start workers, and each file retains its own ordered parser.
-        let mut inspected = Vec::with_capacity(paths.len());
+        let mut inspected = Vec::with_capacity(discovered.len());
         let mut jobs = Vec::new();
-        for path in paths {
+        let source_key = SourceKey::new(source);
+        for file in discovered {
             cancel::check(&self.stopped)?;
-            let key = (source.name.clone(), path);
+            let key = (source_key.clone(), file.path.clone());
             let loaded = (|| -> Result<bool> {
                 let metadata = fs::metadata(&key.1)
                     .with_context(|| format!("Cannot inspect {}", key.1.display()))?;
@@ -280,14 +374,15 @@ impl Reader {
                     cached.len != metadata.len()
                         || cached.modified != metadata.modified().ok()
                         || cached.identity != identity(&metadata)
+                        || cached.agent() != source.agent
                 }) {
-                    jobs.push((inspected.len(), key.1.clone(), metadata, old));
+                    jobs.push((inspected.len(), file.clone(), metadata, old.cloned()));
                 }
                 Ok(true)
             })();
-            inspected.push((key, loaded));
+            inspected.push((key, file, loaded));
         }
-        let parsed = parse_files(&jobs, &self.stopped)?;
+        let parsed = parse_files(&jobs, source, &self.stopped)?;
         for (index, result) in parsed {
             match result {
                 Ok(parsed) => {
@@ -295,12 +390,12 @@ impl Reader {
                     self.files.insert(key.clone(), parsed);
                     self.background_errors.remove(key);
                 }
-                Err(error) => inspected[index].1 = Err(error),
+                Err(error) => inspected[index].2 = Err(error),
             }
         }
         let mut snapshot = SourceSnapshot::default();
         let mut present = BTreeSet::new();
-        for (key, loaded) in inspected {
+        for (key, _file, loaded) in inspected {
             cancel::check(&self.stopped)?;
             present.insert(key.clone());
             if matches!(loaded, Ok(false)) {
@@ -319,21 +414,14 @@ impl Reader {
             }
             let cached = self.files.get(&key).expect("file was parsed");
             snapshot.coverage.files += 1;
-            for quota in &cached.parser.quota_snapshots {
-                cancel::check(&self.stopped)?;
-                let mut quota = quota.clone();
-                quota.source.clone_from(&source.name);
-                snapshot.quota_snapshots.push(quota);
-            }
-            add_coverage(&mut snapshot.coverage, &cached.parser.coverage);
-            if !cached.parser.pending.is_empty() {
+            snapshot
+                .quota_snapshots
+                .extend(cached.parser.quota_snapshots().iter().cloned());
+            add_coverage(&mut snapshot.coverage, cached.parser.coverage());
+            if !cached.cursor.pending.is_empty() {
                 snapshot.coverage.pending += 1;
             }
-            let missing_compactions = cached
-                .parser
-                .compactions
-                .difference(&cached.parser.direct_responses)
-                .count();
+            let missing_compactions = cached.parser.missing_compactions();
             if missing_compactions > 0 {
                 snapshot.coverage.uncertain += missing_compactions;
                 note(
@@ -341,52 +429,47 @@ impl Reader {
                     "Compaction markers without recorded token usage",
                 );
             }
-            for candidate in &cached.parser.events {
-                cancel::check(&self.stopped)?;
-                let mut candidate = candidate.clone();
-                if let Some(turn) = candidate
-                    .turn
-                    .as_ref()
-                    .and_then(|id| cached.parser.turns.get(id))
-                {
-                    if candidate.event.model == "unknown" && !turn.model.is_empty() {
-                        candidate.event.model = turn.model.clone();
-                    }
-                    if candidate.event.provider == "unknown" && !turn.provider.is_empty() {
-                        candidate.event.provider = turn.provider.clone();
-                    }
-                    if candidate.event.project.is_none() && turn.project.is_some() {
-                        candidate.event.project.clone_from(&turn.project);
-                    }
-                }
-                candidate.event.source = source.name.clone();
-                candidate.event.origins.insert(source.name.clone());
-                snapshot.candidates.push(candidate);
-            }
+            snapshot.files.push(cached.parser.snapshot());
         }
         // A successful discovery removes contributions from deleted/moved/replaced files.
-        self.files.retain(|(name, path), _| {
-            name != &source.name || present.contains(&(name.clone(), path.clone()))
+        self.files.retain(|(source_key, path), _| {
+            *source_key != SourceKey::new(source)
+                || present.contains(&(source_key.clone(), path.clone()))
         });
-        self.background_errors.retain(|(name, path), _| {
-            name != &source.name || present.contains(&(name.clone(), path.clone()))
+        self.background_errors.retain(|(source_key, path), _| {
+            *source_key != SourceKey::new(source)
+                || present.contains(&(source_key.clone(), path.clone()))
         });
         cancel::check(&self.stopped)?;
         Ok(snapshot)
     }
 }
 
-type ParseJob<'a> = (usize, PathBuf, Metadata, Option<&'a CachedFile>);
+fn capability(agent: AgentKind) -> QuotaCapability {
+    match agent {
+        AgentKind::Codex => QuotaCapability::RecordedSnapshots,
+        AgentKind::ClaudeCode => QuotaCapability::Unsupported,
+    }
+}
+
+type ParseJob<'a> = (usize, DiscoveredFile, Metadata, Option<CachedFile>);
 type ParsedFile = (usize, Result<CachedFile>);
 
-fn parse_files(jobs: &[ParseJob<'_>], stopped: &Arc<AtomicBool>) -> Result<Vec<ParsedFile>> {
-    // Bound both disk pressure and peak memory from large rollout records.
+fn parse_files(
+    jobs: &[ParseJob<'_>],
+    source: &Source,
+    stopped: &Arc<AtomicBool>,
+) -> Result<Vec<ParsedFile>> {
+    // Bound both disk pressure and peak memory from large transcript records.
     let workers = std::thread::available_parallelism()
         .map_or(1, usize::from)
         .min(8)
         .min(jobs.len());
-    let parse = |(index, path, metadata, old): &ParseJob<'_>| {
-        (*index, parse_cached(path, metadata, *old, stopped))
+    let parse = |(index, file, metadata, old): &ParseJob<'_>| {
+        (
+            *index,
+            parse_cached(&file.path, metadata, old.as_ref(), source, file, stopped),
+        )
     };
     if workers <= 1 {
         return Ok(jobs.iter().map(parse).collect());
@@ -430,6 +513,8 @@ fn parse_cached(
     path: &Path,
     metadata: &Metadata,
     old: Option<&CachedFile>,
+    source: &Source,
+    file: &DiscoveredFile,
     stopped: &Arc<AtomicBool>,
 ) -> Result<CachedFile> {
     cancel::check(stopped)?;
@@ -442,40 +527,44 @@ fn parse_cached(
             metadata.len() > cached.len
                 && cached.identity == identity
                 && prefix.starts_with(&cached.prefix)
+                && cached.agent() == source.agent
         });
-    let mut parser = if append {
-        old.unwrap().parser.clone()
-    } else {
-        Parser::default()
+    let (mut cursor, mut parser) = match (append, old) {
+        (true, Some(cached)) => (cached.cursor.clone(), cached.parser.clone()),
+        _ => (
+            JsonlCursor::default(),
+            ParserState::new(source.agent, &source.name, file),
+        ),
     };
     cancel::check(stopped)?;
-    let file = File::open(path).with_context(|| format!("Cannot read {}", path.display()))?;
+    let mut file_handle =
+        File::open(path).with_context(|| format!("Cannot read {}", path.display()))?;
+    if append && !compressed {
+        file_handle.seek(SeekFrom::Start(cursor.offset))?;
+    }
+    let mut consume = |reader: &mut dyn BufRead| -> std::io::Result<()> {
+        cursor.consume(reader, stopped, |frame, line| {
+            let at = RecordLocation { path, line };
+            match frame {
+                Frame::Line(bytes) => parser.ingest(bytes, at),
+                Frame::MalformedFinal(_) => parser.malformed_final(at),
+            }
+        })
+    };
     if compressed {
-        let decoder = zstd::stream::read::Decoder::new(CancellableRead::new(file, stopped))
+        let decoder = zstd::stream::read::Decoder::new(CancellableRead::new(file_handle, stopped))
             .with_context(|| format!("Cannot decompress {}", path.display()))?;
-        if let Err(error) = parser.consume(
-            BufReader::new(CancellableRead::new(decoder, stopped)),
-            path,
-            stopped,
-        ) {
+        let mut reader = BufReader::new(CancellableRead::new(decoder, stopped));
+        if let Err(error) = consume(&mut reader) {
             if error.kind() == std::io::ErrorKind::UnexpectedEof {
-                parser.coverage.pending += 1;
+                parser.add_pending();
             } else {
                 return Err(error).with_context(|| format!("Cannot decompress {}", path.display()));
             }
         }
     } else {
-        let mut file = file;
-        if append {
-            file.seek(SeekFrom::Start(parser.offset))?;
-        }
-        parser
-            .consume(
-                BufReader::new(CancellableRead::new(file, stopped)),
-                path,
-                stopped,
-            )
-            .with_context(|| format!("Cannot read {}", path.display()))?;
+        let mut reader = BufReader::new(CancellableRead::new(file_handle, stopped));
+        consume(&mut reader).with_context(|| format!("Cannot read {}", path.display()))?;
     }
     cancel::check(stopped)?;
     Ok(CachedFile {
@@ -483,11 +572,13 @@ fn parse_cached(
         modified: metadata.modified().ok(),
         identity,
         prefix,
+        cursor,
         parser,
     })
 }
 
-fn discover(root: &Path, stopped: &AtomicBool) -> Result<Vec<PathBuf>> {
+/// Legacy Codex discovery entry point retained for read-only local smoke tests.
+pub fn discover(root: &Path, stopped: &AtomicBool) -> Result<Vec<PathBuf>> {
     cancel::check(stopped)?;
     fs::read_dir(root).with_context(|| format!("Cannot read source {}", root.display()))?;
     let directories: Vec<_> = [root.join("sessions"), root.join("archived_sessions")]
@@ -547,11 +638,11 @@ impl<'a, R> CancellableRead<'a, R> {
 }
 impl<R: Read> Read for CancellableRead<'_, R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if self.stopped.load(std::sync::atomic::Ordering::Relaxed) {
+        if self.stopped.load(Ordering::Relaxed) {
             return Err(std::io::Error::other(cancel::Cancelled));
         }
         let read = self.inner.read(buf)?;
-        if self.stopped.load(std::sync::atomic::Ordering::Relaxed) {
+        if self.stopped.load(Ordering::Relaxed) {
             return Err(std::io::Error::other(cancel::Cancelled));
         }
         Ok(read)
@@ -571,821 +662,27 @@ fn read_prefix(path: &Path, length: usize) -> Result<Vec<u8>> {
     File::open(path)?.read_exact(&mut buffer)?;
     Ok(buffer)
 }
-fn add_coverage(to: &mut Coverage, from: &Coverage) {
-    to.files += from.files;
-    to.malformed += from.malformed;
-    to.pending += from.pending;
-    to.duplicates += from.duplicates;
-    to.conflicts += from.conflicts;
-    to.uncertain += from.uncertain;
-    for message in &from.messages {
-        note(to, message);
-    }
-}
-fn note(coverage: &mut Coverage, message: impl Into<String>) {
-    if coverage.messages.len() < 32 {
-        coverage.messages.insert(message.into());
-    }
-}
-fn string(value: &Value, field: &str) -> Option<String> {
-    value.get(field)?.as_str().map(str::to_owned)
-}
-fn timestamp(value: &Value) -> Option<DateTime<Utc>> {
-    value
-        .get("timestamp")?
-        .as_str()?
-        .parse::<DateTime<Utc>>()
-        .ok()
-}
-
-impl Parser {
-    fn consume(
-        &mut self,
-        mut reader: impl BufRead,
-        path: &Path,
-        stopped: &AtomicBool,
-    ) -> std::io::Result<()> {
-        loop {
-            if stopped.load(std::sync::atomic::Ordering::Relaxed) {
-                return Err(std::io::Error::other(cancel::Cancelled));
-            }
-            let mut line = std::mem::take(&mut self.pending);
-            let read = reader.read_until(b'\n', &mut line)?;
-            if stopped.load(std::sync::atomic::Ordering::Relaxed) {
-                return Err(std::io::Error::other(cancel::Cancelled));
-            }
-            self.offset += read as u64;
-            if read == 0 {
-                self.pending = line;
-                break;
-            }
-            if line.last() != Some(&b'\n') {
-                if !line.iter().all(u8::is_ascii_whitespace) {
-                    match serde_json::from_slice::<Value>(&line) {
-                        Ok(_) => {
-                            self.line += 1;
-                            self.parse_line(&line, path);
-                        }
-                        Err(error) if error.is_eof() => self.pending = line,
-                        Err(_) => {
-                            self.line += 1;
-                            self.problem(path, "Malformed final JSON record", true);
-                        }
-                    }
-                }
-                break;
-            }
-            self.line += 1;
-            self.parse_line(&line, path);
-        }
-        Ok(())
-    }
-    fn problem(&mut self, path: &Path, message: &str, malformed: bool) {
-        if malformed {
-            self.coverage.malformed += 1;
-        } else {
-            self.coverage.uncertain += 1;
-        }
-        note(
-            &mut self.coverage,
-            format!("{}:{}: {message}", path.display(), self.line),
-        );
-    }
-    fn parse_line(&mut self, bytes: &[u8], path: &Path) {
-        if bytes.iter().all(u8::is_ascii_whitespace) {
-            return;
-        }
-        // Rollout bodies can contain megabytes of private text. Only deserialize usage/metadata.
-        if let Some(kind) = head_kind(bytes) {
-            if !matches!(
-                kind.as_str(),
-                "session_meta"
-                    | "turn_context"
-                    | "token_usage_record"
-                    | "event_msg"
-                    | "thread_settings_applied"
-                    | "compacted"
-            ) {
-                if kind.contains("usage") || kind.contains("token") {
-                    self.problem(path, "Unrecognized usage record type", false);
-                }
-                return;
-            }
-            if kind == "event_msg"
-                && !bytes.windows(13).any(|part| part == b"\"token_count\"")
-                && !bytes
-                    .windows(25)
-                    .any(|part| part == b"\"thread_settings_applied\"")
-            {
-                return;
-            }
-        }
-        let value: Value = match serde_json::from_slice(bytes) {
-            Ok(value) => value,
-            Err(_) => {
-                self.problem(path, "Malformed JSON record", true);
-                return;
-            }
-        };
-        let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
-        let payload = &value["payload"];
-        match kind {
-            "session_meta" => {
-                let session = string(payload, "id")
-                    .or_else(|| string(payload, "thread_id"))
-                    .or_else(|| string(payload, "session_id"))
-                    .unwrap_or_default();
-                if self.owner.is_empty() {
-                    self.owner = session.clone();
-                    self.owner_created = timestamp(payload).or_else(|| timestamp(&value));
-                    self.parent = string(payload, "forked_from_id")
-                        .or_else(|| string(payload, "parent_thread_id"));
-                }
-                if !session.is_empty() {
-                    self.active_session = session;
-                    self.current.tier = self
-                        .thread_tiers
-                        .get(&self.active_session)
-                        .cloned()
-                        .flatten();
-                }
-                self.current.provider =
-                    string(payload, "model_provider").unwrap_or_else(|| "unknown".into());
-                self.current.project = string(payload, "cwd");
-            }
-            "turn_context" => {
-                self.current_turn = string(payload, "turn_id");
-                if let (Some(parent), Some(created), Some(turn)) = (
-                    self.parent.as_ref(),
-                    self.owner_created,
-                    self.current_turn.as_deref().and_then(uuid_v7_millis),
-                ) {
-                    let session = if turn < created.timestamp_millis() {
-                        parent
-                    } else {
-                        &self.owner
-                    };
-                    if self.active_session != *session {
-                        self.active_session.clone_from(session);
-                        self.current.tier = self.thread_tiers.get(session).cloned().flatten();
-                    }
-                }
-                if let Some(model) = string(payload, "model") {
-                    self.current.model = model;
-                }
-                if let Some(provider) = string(payload, "model_provider") {
-                    self.current.provider = provider;
-                }
-                if let Some(project) = string(payload, "cwd") {
-                    self.current.project = Some(project);
-                }
-                if let Some(tier) = recorded_tier(payload) {
-                    self.current.tier = tier.clone();
-                    self.thread_tiers.insert(self.active_session.clone(), tier);
-                }
-                if let Some(id) = &self.current_turn {
-                    self.turns.insert(id.clone(), self.current.clone());
-                }
-            }
-            "thread_settings_applied" => self.settings(payload),
-            "compacted" => {
-                if let Some(response) = string(payload, "response_id") {
-                    self.compactions.insert(response);
-                }
-            }
-            "token_usage_record" => self.direct(&value, path),
-            "event_msg" if payload["type"] == "thread_settings_applied" => self.settings(payload),
-            "event_msg" if payload["type"] == "token_count" => {
-                if let Some(time) = timestamp(&value) {
-                    self.quota_snapshots
-                        .extend(crate::quota::QuotaSnapshot::parse(
-                            time,
-                            &payload["rate_limits"],
-                            "",
-                        ));
-                }
-                self.legacy(&value, path);
-            }
-            _ => {}
-        }
-    }
-    fn settings(&mut self, payload: &Value) {
-        let tier = recorded_tier(payload).unwrap_or(None);
-        let session = string(payload, "thread_id").unwrap_or_else(|| self.active_session.clone());
-        self.thread_tiers.insert(session.clone(), tier.clone());
-        if session == self.active_session {
-            self.current.tier = tier;
-            if let Some(id) = &self.current_turn {
-                if let Some(turn) = self.turns.get_mut(id) {
-                    turn.tier.clone_from(&self.current.tier);
-                }
-            }
-        }
-    }
-    fn event(
-        &self,
-        id: String,
-        time: DateTime<Utc>,
-        session: String,
-        usage: Usage,
-        payload: &Value,
-    ) -> UsageEvent {
-        UsageEvent {
-            id,
-            timestamp: time,
-            session,
-            model: if self.current.model.is_empty() {
-                "unknown".into()
-            } else {
-                self.current.model.clone()
-            },
-            provider: if self.current.provider.is_empty() {
-                "unknown".into()
-            } else {
-                self.current.provider.clone()
-            },
-            tier: recorded_tier(payload).unwrap_or_else(|| self.current.tier.clone()),
-            project: self.current.project.clone(),
-            usage,
-            source: String::new(),
-            origins: BTreeSet::new(),
-            context_tokens: payload.get("context_tokens").and_then(Value::as_u64),
-            cache_retention: string(payload, "cache_retention")
-                .or_else(|| string(payload, "prompt_cache_retention")),
-        }
-    }
-    fn direct(&mut self, value: &Value, path: &Path) {
-        let payload = &value["payload"];
-        let Some(time) = timestamp(value) else {
-            self.problem(path, "Usage record has no valid timestamp", true);
-            return;
-        };
-        let usage = match parse_usage(&payload["usage"]) {
-            Ok(usage) => usage,
-            Err(error) => {
-                self.problem(path, &error, true);
-                return;
-            }
-        };
-        let session = string(payload, "thread_id")
-            .or_else(|| string(payload, "session_id"))
-            .unwrap_or_else(|| self.active_session.clone());
-        if session.is_empty() {
-            self.problem(path, "Usage record has no session identity", false);
-            return;
-        }
-        if self.active_session != session {
-            self.current.tier = self.thread_tiers.get(&session).cloned().flatten();
-            self.active_session.clone_from(&session);
-        }
-        let response = string(payload, "response_id");
-        let id = if let Some(response) = &response {
-            self.direct_responses.insert(response.clone());
-            format!("response:{response}")
-        } else {
-            self.problem(
-                path,
-                "Per-response usage lacks stable response identity",
-                false,
-            );
-            let hash = blake3::hash(value.to_string().as_bytes())
-                .to_hex()
-                .to_string();
-            let occurrence = self.fallback_counts.entry(hash.clone()).or_default();
-            *occurrence += 1;
-            format!("record:{hash}:{occurrence}")
-        };
-        if payload.get("thread_id").is_none()
-            && payload.get("turn_id").is_none()
-            && payload.get("thread_token_usage").is_none()
-        {
-            self.problem(path, "Standalone usage lacks turn/counter evidence for compaction reconciliation; excluded", false);
-            return;
-        }
-        let cumulative = parse_usage(&payload["thread_token_usage"]).ok();
-        let snapshot = cumulative
-            .as_ref()
-            .map(|total| snapshot_key(&session, total));
-        if self.parent.is_some() && session != self.owner {
-            // The source explicitly records another thread: this is replayed parent history.
-            if let Some(total) = cumulative {
-                self.baselines.insert(session, total);
-            }
-            self.coverage.duplicates += 1;
-            return;
-        }
-        let turn = string(payload, "turn_id").or_else(|| self.current_turn.clone());
-        let mut event = self.event(id, time, session.clone(), usage, payload);
-        if turn != self.current_turn {
-            if let Some(context) = turn.as_ref().and_then(|id| self.turns.get(id)) {
-                event.model = if context.model.is_empty() {
-                    "unknown".into()
-                } else {
-                    context.model.clone()
-                };
-                event.project.clone_from(&context.project);
-                event.provider = if context.provider.is_empty() {
-                    "unknown".into()
-                } else {
-                    context.provider.clone()
-                };
-                event.tier.clone_from(&context.tier);
-            } else {
-                event.model = "unknown".into();
-            }
-        }
-        if let Some(tier) = recorded_tier(payload) {
-            // Per-response evidence wins over thread defaults or inferred active context.
-            event.tier = tier;
-        }
-        self.recent_direct
-            .insert(session, (event.usage.clone(), time, false));
-        self.events.push(Candidate {
-            event,
-            file: path.to_path_buf(),
-            turn,
-            snapshot,
-            direct: true,
-        });
-    }
-    fn legacy(&mut self, value: &Value, path: &Path) {
-        let payload = &value["payload"];
-        let info = &payload["info"];
-        if info.is_null() {
-            return;
-        }
-        let Some(time) = timestamp(value) else {
-            self.problem(path, "Token snapshot has no valid timestamp", true);
-            return;
-        };
-        let total = match parse_usage(&info["total_token_usage"]) {
-            Ok(total) => total,
-            Err(error) => {
-                self.problem(path, &error, true);
-                return;
-            }
-        };
-        if self.parent.is_some() && self.inherited_turn(time) {
-            // Replayed historical records may be re-timestamped during child creation.
-            // The stable UUIDv7 turn identity, not the copied record timestamp, locates them.
-            let parent = self.parent.clone().unwrap();
-            self.baselines.insert(parent.clone(), total);
-            self.baseline_models
-                .insert(parent, self.current.model.clone());
-            self.coverage.duplicates += 1;
-            return;
-        }
-        let session =
-            if self.parent.is_some() && self.owner_created.is_some_and(|created| time >= created) {
-                self.owner.clone()
-            } else if self.parent.is_some() && self.active_session == self.owner {
-                self.parent.clone().unwrap()
-            } else {
-                self.active_session.clone()
-            };
-        if session.is_empty() {
-            self.problem(path, "Token snapshot has no session identity", false);
-            return;
-        }
-        let latest = parse_usage(&info["last_token_usage"]).ok();
-        let legacy_delta = self
-            .baselines
-            .get(&session)
-            .and_then(|previous| subtract_usage(&total, previous));
-        if let Some((usage, observed, consumed)) = self.recent_direct.get_mut(&session) {
-            if !*consumed
-                && (latest.as_ref() == Some(usage) || legacy_delta.as_ref() == Some(usage))
-                && (time - *observed).num_milliseconds().unsigned_abs() <= 2000
-            {
-                *consumed = true;
-                // Compatibility counters can exclude compaction that the new counters include.
-                // Keep the two counter series separate; this request was already counted directly.
-                self.baselines.insert(session.clone(), total);
-                self.baseline_models
-                    .insert(session, self.current.model.clone());
-                self.coverage.duplicates += 1;
-                return;
-            }
-        }
-        let previous = self.baselines.get(&session).cloned().or_else(|| {
-            if session == self.owner {
-                self.parent
-                    .as_ref()
-                    .and_then(|parent| self.baselines.get(parent))
-                    .cloned()
-            } else {
-                None
-            }
-        });
-        let usage = if let Some(previous) = &previous {
-            match subtract_usage(&total, previous) {
-                Some(delta) => delta,
-                None => {
-                    self.baselines.insert(session, total);
-                    self.problem(path, "Cumulative counter decreased; baseline reset, ambiguous increment excluded", false);
-                    return;
-                }
-            }
-        } else {
-            total.clone()
-        };
-        self.baselines.insert(session.clone(), total.clone());
-        let previous_model = self
-            .baseline_models
-            .insert(session.clone(), self.current.model.clone());
-        if usage.total() == 0 {
-            return;
-        }
-        if let Err(error) = usage.validate() {
-            self.problem(path, &error.to_string(), true);
-            return;
-        }
-        let snapshot = snapshot_key(&session, &total);
-        let id = format!("legacy:{}:{}", time.timestamp_millis(), snapshot);
-        let mut event = self.event(id, time, session, usage, info);
-        let mixed_model = previous_model.is_some_and(|model| model != self.current.model)
-            && !parse_usage(&info["last_token_usage"]).is_ok_and(|last| last == event.usage);
-        if mixed_model {
-            event.model = "unknown".into();
-            self.problem(
-                path,
-                "Cumulative delta spans a model change; model attribution is unknown",
-                false,
-            );
-        }
-        self.events.push(Candidate {
-            event,
-            file: path.to_path_buf(),
-            turn: if mixed_model {
-                None
-            } else {
-                self.current_turn.clone()
-            },
-            snapshot: Some(snapshot),
-            direct: false,
-        });
-    }
-
-    fn inherited_turn(&self, record_time: DateTime<Utc>) -> bool {
-        let Some(created) = self.owner_created else {
-            return false;
-        };
-        if let Some(turn_time) = self.current_turn.as_deref().and_then(uuid_v7_millis) {
-            return turn_time < created.timestamp_millis();
-        }
-        record_time < created
-    }
-}
-
-fn uuid_v7_millis(id: &str) -> Option<i64> {
-    let bytes = id.as_bytes();
-    if bytes.len() != 36
-        || bytes[8] != b'-'
-        || bytes[13] != b'-'
-        || bytes[14] != b'7'
-        || bytes[18] != b'-'
-        || bytes[23] != b'-'
-    {
-        return None;
-    }
-    if bytes
-        .iter()
-        .enumerate()
-        .any(|(i, b)| ![8, 13, 18, 23].contains(&i) && !b.is_ascii_hexdigit())
-    {
-        return None;
-    }
-    i64::from_str_radix(&format!("{}{}", &id[..8], &id[9..13]), 16).ok()
-}
-
-fn recorded_tier(payload: &Value) -> Option<Option<String>> {
-    for record in [payload, &payload["settings"], &payload["thread_settings"]] {
-        if let Some(value) = record.get("service_tier") {
-            return Some(value.as_str().map(str::to_owned));
-        }
-    }
-    None
-}
-
-fn head_kind(bytes: &[u8]) -> Option<String> {
-    let prefix = bytes.get(..bytes.len().min(256))?;
-    let mut position = 0;
-    let mut depth = 0usize;
-    while position < prefix.len() {
-        match prefix[position] {
-            b'{' | b'[' => depth += 1,
-            b'}' | b']' => depth = depth.saturating_sub(1),
-            b'"' => {
-                let start = position;
-                position += 1;
-                while position < prefix.len() {
-                    if prefix[position] == b'\\' {
-                        position += 2;
-                        continue;
-                    }
-                    if prefix[position] == b'"' {
-                        break;
-                    }
-                    position += 1;
-                }
-                if depth == 1 && prefix.get(start..=position) == Some(b"\"type\"") {
-                    let mut rest = prefix.get(position + 1..)?;
-                    while rest.first().is_some_and(u8::is_ascii_whitespace) {
-                        rest = &rest[1..];
-                    }
-                    if rest.first() != Some(&b':') {
-                        return None;
-                    }
-                    rest = &rest[1..];
-                    while rest.first().is_some_and(u8::is_ascii_whitespace) {
-                        rest = &rest[1..];
-                    }
-                    if rest.first() != Some(&b'"') {
-                        return None;
-                    }
-                    let end = rest[1..].iter().position(|byte| *byte == b'"')?;
-                    return std::str::from_utf8(&rest[1..end + 1])
-                        .ok()
-                        .map(str::to_owned);
-                }
-            }
-            _ => {}
-        }
-        position += 1;
-    }
-    None
-}
-fn parse_usage(value: &Value) -> std::result::Result<Usage, String> {
-    let required = |key| {
-        value
-            .get(key)
-            .and_then(Value::as_u64)
-            .ok_or_else(|| format!("Missing or invalid {key}"))
-    };
-    let optional = |key| match value.get(key) {
-        None | Some(Value::Null) => Ok(None),
-        Some(value) => value
-            .as_u64()
-            .map(Some)
-            .ok_or_else(|| format!("Invalid {key}")),
-    };
-    let usage = Usage {
-        input: required("input_tokens")?,
-        output: required("output_tokens")?,
-        cached: optional("cached_input_tokens")?,
-        cache_write: optional("cache_write_input_tokens")?,
-        reasoning: optional("reasoning_output_tokens")?,
-    };
-    usage.validate().map_err(|error| error.to_string())?;
-    if let Some(reported) = value.get("total_tokens") {
-        if reported.as_u64() != Some(usage.total()) {
-            return Err("Reported total differs from input plus output".into());
-        }
-    }
-    Ok(usage)
-}
-fn subtract_usage(total: &Usage, previous: &Usage) -> Option<Usage> {
-    let subset = |a: Option<u64>, b: Option<u64>| match (a, b) {
-        (Some(a), Some(b)) => a.checked_sub(b).map(Some),
-        _ => Some(None),
-    };
-    Some(Usage {
-        input: total.input.checked_sub(previous.input)?,
-        output: total.output.checked_sub(previous.output)?,
-        cached: subset(total.cached, previous.cached)?,
-        cache_write: subset(total.cache_write, previous.cache_write)?,
-        reasoning: subset(total.reasoning, previous.reasoning)?,
-    })
-}
-fn snapshot_key(session: &str, usage: &Usage) -> String {
-    // Core counters identify mirrored snapshots even if an older format omitted subsets.
-    format!("{session}:{}:{}", usage.input, usage.output)
-}
-fn same_usage(a: &UsageEvent, b: &UsageEvent) -> bool {
-    a.usage.input == b.usage.input
-        && a.usage.output == b.usage.output
-        && compatible(a.usage.cached, b.usage.cached)
-        && compatible(a.usage.cache_write, b.usage.cache_write)
-        && compatible(a.usage.reasoning, b.usage.reasoning)
-}
-fn same_event(a: &UsageEvent, b: &UsageEvent) -> bool {
-    same_usage(a, b)
-        && a.session == b.session
-        && (a.model == "unknown" || b.model == "unknown" || a.model == b.model)
-        && (a.provider == "unknown" || b.provider == "unknown" || a.provider == b.provider)
-        && (a.tier.is_none()
-            || b.tier.is_none()
-            || a.tier == b.tier
-            || (a.mode() != "unknown" && a.mode() == b.mode()))
-        && compatible(a.context_tokens, b.context_tokens)
-        && (a.cache_retention.is_none()
-            || b.cache_retention.is_none()
-            || a.cache_retention.as_deref().map(retention)
-                == b.cache_retention.as_deref().map(retention))
-}
-fn retention(value: &str) -> &str {
-    match value {
-        "30min" => "30m",
-        value => value,
-    }
-}
-fn compatible(a: Option<u64>, b: Option<u64>) -> bool {
-    a.is_none() || b.is_none() || a == b
-}
-fn merge_event(existing: &mut UsageEvent, other: &UsageEvent) {
-    existing.origins.extend(other.origins.iter().cloned());
-    if existing.model == "unknown" && other.model != "unknown" {
-        existing.model.clone_from(&other.model);
-    }
-    if existing.provider == "unknown" && other.provider != "unknown" {
-        existing.provider.clone_from(&other.provider);
-    }
-    if existing.tier.is_none() {
-        existing.tier.clone_from(&other.tier);
-    }
-    if existing.usage.cached.is_none() {
-        existing.usage.cached = other.usage.cached;
-    }
-    if existing.usage.cache_write.is_none() {
-        existing.usage.cache_write = other.usage.cache_write;
-    }
-    if existing.usage.reasoning.is_none() {
-        existing.usage.reasoning = other.usage.reasoning;
-    }
-    if existing.context_tokens.is_none() {
-        existing.context_tokens = other.context_tokens;
-    }
-    if existing.cache_retention.is_none() {
-        existing.cache_retention.clone_from(&other.cache_retention);
-    }
-    if existing.project.is_none() {
-        existing.project.clone_from(&other.project);
-    }
-}
-fn merge_mirror(existing: &mut UsageEvent, mirror: &UsageEvent, coverage: &mut Coverage) {
-    if same_event(existing, mirror) {
-        merge_event(existing, mirror);
-        coverage.duplicates += 1;
-    } else {
-        coverage.uncertain += 1;
-        note(
-            coverage,
-            "Conflicting compatibility metadata excluded; identified per-response usage retained",
-        );
-    }
-}
-fn reconcile(
-    mut candidates: Vec<Candidate>,
-    coverage: &mut Coverage,
-    stopped: &AtomicBool,
-) -> Result<Vec<UsageEvent>> {
-    cancel::check(stopped)?;
-    // Prefer an identified response over its equivalent legacy snapshot from another copy.
-    candidates.sort_by(|a, b| {
-        b.direct
-            .cmp(&a.direct)
-            .then_with(|| a.event.source.cmp(&b.event.source))
-            .then_with(|| a.event.id.cmp(&b.event.id))
-    });
-    cancel::check(stopped)?;
-    let mut events: BTreeMap<String, UsageEvent> = BTreeMap::new();
-    let mut direct_snapshots = HashMap::<_, BTreeSet<(String, DateTime<Utc>)>>::new();
-    let mut direct_contexts = HashMap::<_, Vec<(String, PathBuf)>>::new();
-    let mut conflicts = BTreeSet::new();
-    let mut inconsistent_timestamps = BTreeSet::new();
-    for candidate in candidates {
-        cancel::check(stopped)?;
-        let mut event = candidate.event;
-        if candidate.direct {
-            if let Some(snapshot) = candidate.snapshot.as_ref() {
-                direct_snapshots
-                    .entry(snapshot.clone())
-                    .or_default()
-                    .insert((event.id.clone(), event.timestamp));
-            }
-            if let Some(turn) = candidate.turn.as_ref() {
-                direct_contexts
-                    .entry((event.session.clone(), turn.clone(), event.timestamp))
-                    .or_default()
-                    .push((event.id.clone(), candidate.file.clone()));
-            }
-        }
-        if !candidate.direct {
-            if let Some(ids) = candidate
-                .snapshot
-                .as_ref()
-                .and_then(|key| direct_snapshots.get(key))
-            {
-                let endpoints: BTreeSet<_> = ids
-                    .iter()
-                    .filter(|(id, original_timestamp)| {
-                        events.contains_key(id)
-                            && (*original_timestamp - event.timestamp)
-                                .num_milliseconds()
-                                .unsigned_abs()
-                                <= 2000
-                    })
-                    .map(|(id, _)| id.clone())
-                    .collect();
-                let matching: Vec<_> = endpoints
-                    .iter()
-                    .filter(|id| {
-                        events
-                            .get(*id)
-                            .is_some_and(|other| same_usage(other, &event))
-                    })
-                    .collect();
-                if matching.len() == 1 {
-                    if let Some(other) = events.get_mut(matching[0]) {
-                        merge_mirror(other, &event, coverage);
-                    }
-                    continue;
-                } else if !endpoints.is_empty() {
-                    coverage.uncertain += 1;
-                    note(coverage, "Overlapping or ambiguous cumulative compatibility increment excluded; identified per-response usage retained");
-                    continue;
-                }
-            }
-            // Older compatibility streams can omit compaction from their cumulative
-            // series. Different cumulative totals must not charge the same copied
-            // request twice. Require the same exact timestamp, session, turn and
-            // usage in a different file; near-time coincidences are insufficient.
-            if let Some(turn) = candidate.turn.as_ref() {
-                let matching: BTreeSet<_> = direct_contexts
-                    .get(&(event.session.clone(), turn.clone(), event.timestamp))
-                    .into_iter()
-                    .flatten()
-                    .filter(|(id, file)| {
-                        *file != candidate.file
-                            && events
-                                .get(id)
-                                .is_some_and(|other| same_usage(other, &event))
-                    })
-                    .map(|(id, _)| id.clone())
-                    .collect();
-                if matching.len() == 1 {
-                    if let Some(other) = events.get_mut(matching.first().unwrap()) {
-                        merge_mirror(other, &event, coverage);
-                    }
-                    continue;
-                } else if matching.len() > 1 {
-                    coverage.uncertain += 1;
-                    note(coverage, "Ambiguous copied compatibility record excluded: multiple direct responses match its session, turn, timestamp and usage");
-                    continue;
-                }
-            }
-        }
-        if conflicts.contains(&event.id) {
-            continue;
-        }
-        if let Some(existing) = events.get_mut(&event.id) {
-            if same_event(existing, &event) {
-                if existing.timestamp != event.timestamp {
-                    if inconsistent_timestamps.insert(event.id.clone()) {
-                        coverage.uncertain += 1;
-                        note(coverage, "Identified request copies have different timestamps; earliest recorded timestamp used for date attribution");
-                    }
-                    existing.timestamp = existing.timestamp.min(event.timestamp);
-                }
-                merge_event(existing, &event);
-                coverage.duplicates += 1;
-            } else {
-                coverage.conflicts += 1;
-                note(
-                    coverage,
-                    "Conflicting copies of an identified request were excluded",
-                );
-                conflicts.insert(event.id.clone());
-                events.remove(&event.id);
-            }
-        } else {
-            if event.origins.is_empty() {
-                event.origins.insert(event.source.clone());
-            }
-            events.insert(event.id.clone(), event);
-        }
-    }
-    let mut events: Vec<_> = events.into_values().collect();
-    cancel::check(stopped)?;
-    events.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then_with(|| a.id.cmp(&b.id)));
-    cancel::check(stopped)?;
-    Ok(events)
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use crate::model::{CacheWriteBreakdown, UsageEvent};
+    use serde_json::{json, Value};
     use std::io::Write;
     use tempfile::TempDir;
 
     fn source(root: &Path, name: &str) -> Source {
         Source {
             name: name.into(),
+            agent: AgentKind::Codex,
             kind: "linux".into(),
             root: root.into(),
             enabled: true,
+            pricing_provider: None,
         }
+    }
+    fn key(source: &Source) -> SourceKey {
+        SourceKey::new(source)
     }
     fn usage(input: u64, output: u64) -> Value {
         json!({"input_tokens":input,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":output,
@@ -1429,6 +726,12 @@ mod tests {
             .set_times(fs::FileTimes::new().set_modified(SystemTime::from(timestamp)))
             .unwrap();
     }
+    fn native(event: &UsageEvent) -> &str {
+        &event.id.native_id
+    }
+    fn session_of(event: &UsageEvent) -> &str {
+        &event.session.native_id
+    }
 
     struct StopDuringRead<R> {
         inner: R,
@@ -1470,12 +773,22 @@ mod tests {
                 reads: 0,
                 bytes: Arc::clone(&bytes),
             };
-            let mut parser = Parser::default();
-            let error = parser
+            let path = PathBuf::from("fixture.jsonl");
+            let mut parser = ParserState::new(
+                AgentKind::Codex,
+                "local",
+                &DiscoveredFile::codex(path.clone()),
+            );
+            let mut cursor = JsonlCursor::default();
+            let error = cursor
                 .consume(
                     BufReader::new(CancellableRead::new(trigger, &stopped)),
-                    Path::new("fixture.jsonl"),
                     &stopped,
+                    |frame, line| {
+                        if let Frame::Line(bytes) = frame {
+                            parser.ingest(bytes, RecordLocation { path: &path, line });
+                        }
+                    },
                 )
                 .unwrap_err();
             assert!(cancel::is_cancelled(&error.into()));
@@ -1483,9 +796,12 @@ mod tests {
                 bytes.load(Ordering::Relaxed) <= 16 * 1024,
                 "did not stop between chunks"
             );
-            assert!(parser.events.is_empty());
-            assert_eq!(parser.coverage.malformed, 0);
-            assert_eq!(parser.coverage.pending, 0);
+            let ParsedFileSnapshot::Codex(snapshot) = parser.snapshot() else {
+                panic!("codex parser");
+            };
+            assert!(snapshot.candidates.is_empty());
+            assert_eq!(parser.coverage().malformed, 0);
+            assert_eq!(parser.coverage().pending, 0);
         }
     }
 
@@ -1495,10 +811,11 @@ mod tests {
         let stopped = Arc::new(AtomicBool::new(true));
         // Cancellation wins over a missing source: it must not become a stale-source snapshot.
         assert!(cancel::is_cancelled(
-            &discover(Path::new("/missing-source"), &stopped).unwrap_err()
+            &agents::discover(&source(Path::new("/missing-source"), "local"), &stopped)
+                .unwrap_err()
         ));
         assert!(cancel::is_cancelled(
-            &reconcile(Vec::new(), &mut Coverage::default(), &stopped).unwrap_err()
+            &agents::reconcile(AgentKind::Codex, &[], &stopped).unwrap_err()
         ));
         let dir = TempDir::new().unwrap();
         write(
@@ -1516,7 +833,7 @@ mod tests {
         assert_eq!(complete.events[0].usage.total(), 11);
         stopped.store(true, Ordering::Relaxed);
         assert!(cancel::is_cancelled(&reader.scan(&sources).unwrap_err()));
-        assert_eq!(reader.sources["local"].0.candidates.len(), 1);
+        assert_eq!(reader.sources[&key(&sources[0])].0.files.len(), 1);
         assert!(reader.background_errors.is_empty());
     }
 
@@ -1553,7 +870,10 @@ mod tests {
         drop(file);
         modified_at(&boundary, next);
         let resumed = reader.scan_modified_since(&sources, Some(next)).unwrap();
-        assert!(resumed.events.iter().any(|event| event.id == "response:r2"));
+        assert!(resumed
+            .events
+            .iter()
+            .any(|event| native(event) == "response:r2"));
         assert_eq!(resumed.coverage.uncertain, 0);
     }
 
@@ -1678,7 +998,7 @@ mod tests {
         assert_eq!(
             scan.events
                 .iter()
-                .find(|e| e.id == "response:r2")
+                .find(|e| native(e) == "response:r2")
                 .unwrap()
                 .model,
             "beta"
@@ -1815,7 +1135,10 @@ mod tests {
         let scan = Reader::new().scan(&sources).unwrap();
         assert_eq!(scan.events.len(), 1);
         assert_eq!(scan.events[0].context_tokens, Some(300000));
-        assert_eq!(scan.events[0].cache_retention.as_deref(), Some("12h"));
+        assert_eq!(
+            scan.events[0].cache_writes,
+            Some(CacheWriteBreakdown::from_ttl(43_200, 0))
+        );
         assert_eq!(scan.coverage.conflicts, 0);
         first["payload"]["cache_retention"] = json!("30m");
         write(&path, &[metadata("s"), first.clone()]);
@@ -1921,8 +1244,8 @@ mod tests {
                 .messages
                 .iter()
                 .any(|message| message.contains("earliest recorded timestamp")));
-            let today = crate::cli::Cli::parse_from(["codex-usage", "models", "--today"]);
-            let all = crate::cli::Cli::parse_from(["codex-usage", "models", "--all"]);
+            let today = crate::cli::Cli::parse_from(["agent-usage", "models", "--today"]);
+            let all = crate::cli::Cli::parse_from(["agent-usage", "models", "--all"]);
             let now = "2026-11-04T12:00:00Z".parse().unwrap();
             assert_eq!(
                 crate::report::build(&today, chrono_tz::UTC, &scan, None, now)
@@ -2057,7 +1380,11 @@ mod tests {
             scan.events.iter().map(|e| e.usage.total()).sum::<u64>(),
             165
         );
-        let parent = scan.events.iter().find(|e| e.session == "parent").unwrap();
+        let parent = scan
+            .events
+            .iter()
+            .find(|e| session_of(e) == "parent")
+            .unwrap();
         assert_eq!(parent.origins.len(), 2);
         assert_eq!(scan.coverage.duplicates, 3);
     }
@@ -2245,12 +1572,12 @@ mod tests {
         let first = scan
             .events
             .iter()
-            .find(|event| event.id == "response:r1")
+            .find(|event| native(event) == "response:r1")
             .unwrap();
         let second = scan
             .events
             .iter()
-            .find(|event| event.id == "response:r2")
+            .find(|event| native(event) == "response:r2")
             .unwrap();
         assert_eq!(first.model, "alpha");
         assert_eq!(first.tier, None);
@@ -2289,7 +1616,7 @@ mod tests {
             .map(|id| {
                 scan.events
                     .iter()
-                    .find(|event| event.id == format!("response:{id}"))
+                    .find(|event| native(event) == format!("response:{id}"))
                     .unwrap()
                     .tier
                     .as_deref()
@@ -2509,8 +1836,11 @@ mod tests {
             let mut serial = Reader::new();
             for path in discover(dir.path(), &serial.stopped).unwrap() {
                 let metadata = fs::metadata(&path).unwrap();
-                if let Ok(parsed) = parse_cached(&path, &metadata, None, &serial.stopped) {
-                    serial.files.insert(("local".into(), path), parsed);
+                let file = DiscoveredFile::codex(path.clone());
+                if let Ok(parsed) =
+                    parse_cached(&path, &metadata, None, &sources[0], &file, &serial.stopped)
+                {
+                    serial.files.insert((key(&sources[0]), path), parsed);
                 }
             }
             let expected = serial.scan(&sources).unwrap();
@@ -2552,7 +1882,7 @@ mod tests {
         let rewritten = fs::metadata(&path).unwrap();
         let cached = reader
             .files
-            .get_mut(&("linux".into(), path.clone()))
+            .get_mut(&(key(&sources[0]), path.clone()))
             .unwrap();
         cached.modified = rewritten.modified().ok();
         cached.identity = identity(&rewritten);
@@ -2626,32 +1956,51 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "read-only local schema smoke: set CODEX_USAGE_TEST_ROLLOUT"]
+    #[ignore = "read-only local schema smoke: set AGENT_USAGE_TEST_ROLLOUT"]
     fn local_rollout_read_only_smoke() {
         let path =
-            PathBuf::from(std::env::var_os("CODEX_USAGE_TEST_ROLLOUT").expect("set rollout path"));
-        let mut parser = Parser::default();
-        parser
+            PathBuf::from(std::env::var_os("AGENT_USAGE_TEST_ROLLOUT").expect("set rollout path"));
+        let source = source(path.parent().unwrap_or(Path::new(".")), "local");
+        let file = DiscoveredFile::codex(path.clone());
+        let mut parser = ParserState::new(AgentKind::Codex, &source.name, &file);
+        let mut cursor = JsonlCursor::default();
+        let stopped = AtomicBool::new(false);
+        cursor
             .consume(
                 BufReader::new(File::open(&path).unwrap()),
-                &path,
-                &AtomicBool::new(false),
+                &stopped,
+                |frame, line| {
+                    if let Frame::Line(bytes) = frame {
+                        parser.ingest(bytes, RecordLocation { path: &path, line });
+                    }
+                },
             )
             .unwrap();
+        let ParsedFileSnapshot::Codex(snapshot) = parser.snapshot() else {
+            panic!("codex parser");
+        };
         assert_eq!(
-            parser.coverage.malformed, 0,
+            parser.coverage().malformed,
+            0,
             "{:?}",
-            parser.coverage.messages
+            parser.coverage().messages
         );
-        let mut coverage = Coverage::default();
-        let events = reconcile(parser.events, &mut coverage, &AtomicBool::new(false)).unwrap();
-        assert!(!events.is_empty());
-        assert_eq!(coverage.conflicts, 0);
+        let scan = crate::agents::reconcile(
+            AgentKind::Codex,
+            &[ParsedFileSnapshot::Codex(snapshot)],
+            &stopped,
+        )
+        .unwrap();
+        assert!(!scan.events.is_empty());
+        assert_eq!(scan.coverage.conflicts, 0);
         eprintln!(
             "Read-only local smoke: {} usage increments, {} total tokens; {} uncertain",
-            events.len(),
-            events.iter().map(|event| event.usage.total()).sum::<u64>(),
-            parser.coverage.uncertain
+            scan.events.len(),
+            scan.events
+                .iter()
+                .map(|event| event.usage.total())
+                .sum::<u64>(),
+            scan.coverage.uncertain
         );
     }
 }

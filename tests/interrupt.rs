@@ -17,10 +17,12 @@ fn ctrl_c_cancels_report_and_monitor_loading_without_a_partial_snapshot() {
     let path = root.join("sessions/large.jsonl");
     let config = dir.path().join("config.toml");
     let history = dir.path().join("config.toml.last-report.json");
-    let baseline = Command::new(env!("CARGO_BIN_EXE_codex-usage"))
+    let baseline = Command::new(env!("CARGO_BIN_EXE_agent-usage"))
         .args(["models", "--all", "--no-cost", "--format", "json"])
         .arg("--config")
         .arg(&config)
+        .arg("--agent")
+        .arg("codex")
         .arg("--root")
         .arg(&root)
         .output()
@@ -36,10 +38,12 @@ fn ctrl_c_cancels_report_and_monitor_loading_without_a_partial_snapshot() {
     file.set_len(2 * 1024 * 1024 * 1024).unwrap();
     drop(file);
     for (command, format) in [("daily", "json"), ("monitor", "jsonl")] {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_codex-usage"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_agent-usage"))
             .args([command, "--no-cost", "--format", format])
             .arg("--config")
             .arg(&config)
+            .arg("--agent")
+            .arg("codex")
             .arg("--root")
             .arg(&root)
             .stdout(Stdio::piped())

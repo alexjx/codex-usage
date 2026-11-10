@@ -1,7 +1,7 @@
 use crate::{
     cli::Cli,
-    model::Scan,
-    report::{self, MonitorInfo, Report},
+    model::{AgentKind, EventKey, Scan, SessionKey},
+    report::{self, AgentActivity, MonitorInfo, Report, Selection, SessionSpeed},
 };
 use chrono::Utc;
 use rust_decimal::Decimal;
@@ -55,9 +55,16 @@ struct Activity {
     output_per_second: f64,
     sample_seconds: f64,
 }
+#[derive(Default)]
+struct AgentChart {
+    speed: Speed,
+    started: Duration,
+    offset: Duration,
+    history: VecDeque<Option<f64>>,
+}
 pub struct Tracker {
     started: Instant,
-    seen: BTreeSet<String>,
+    seen: BTreeSet<EventKey>,
     readable: BTreeSet<String>,
     last_observed: chrono::DateTime<Utc>,
     previous_total: u64,
@@ -72,7 +79,12 @@ pub struct Tracker {
     interval: Duration,
     last_sample: Duration,
     activity: Activity,
-    session_speeds: BTreeMap<String, Speed>,
+    session_speeds: BTreeMap<SessionKey, Speed>,
+    agent_totals: BTreeMap<AgentKind, u64>,
+    agent_since_ready: BTreeMap<AgentKind, i128>,
+    agent_window: BTreeMap<AgentKind, i128>,
+    agent_rate: BTreeMap<AgentKind, f64>,
+    agent_charts: BTreeMap<AgentKind, AgentChart>,
     chart_speed: Speed,
     chart_started: Duration,
     chart_offset: Duration,
@@ -90,7 +102,14 @@ impl Tracker {
     ) -> Self {
         Self {
             started: Instant::now(),
-            seen: scan.events.iter().map(|e| e.id.clone()).collect(),
+            // Excluded but identified records are already observed; a later repair
+            // must change totals without masquerading as fresh activity.
+            seen: scan
+                .observed_event_ids
+                .iter()
+                .cloned()
+                .chain(scan.events.iter().map(|event| event.id.clone()))
+                .collect(),
             readable: scan
                 .sources
                 .iter()
@@ -114,6 +133,15 @@ impl Tracker {
                 ..Default::default()
             },
             session_speeds: BTreeMap::new(),
+            agent_totals: BTreeMap::new(),
+            agent_since_ready: scan
+                .sources
+                .iter()
+                .map(|source| (source.agent, 0))
+                .collect(),
+            agent_window: BTreeMap::new(),
+            agent_rate: BTreeMap::new(),
+            agent_charts: BTreeMap::new(),
             chart_speed: Speed::default(),
             chart_started: Duration::ZERO,
             chart_offset: Duration::ZERO,
@@ -133,25 +161,29 @@ impl Tracker {
         self.chart_started = Duration::ZERO;
         self.chart_speed = Speed::default();
         self.output_speed_history.clear();
+        let selection = Selection::resolve(cli, scan).unwrap_or_default();
         let mut events: Vec<_> = scan
             .events
             .iter()
             .filter(|e| {
                 e.timestamp >= origin
                     && e.timestamp <= end
-                    && self.readable.contains(&e.source)
-                    && report::matches(cli, &report.period, e)
+                    && (e.origins.is_empty() && self.readable.contains(&e.source)
+                        || e.origins
+                            .iter()
+                            .any(|origin| self.readable.contains(origin)))
+                    && report::matches(cli, &report.period, e, &selection)
             })
             .collect();
         events.sort_unstable_by_key(|e| e.timestamp);
-        let mut events = events.into_iter().peekable();
+        let mut stream = events.iter().copied().peekable();
         for index in (0..SPEED_HISTORY_CAPACITY as u32).rev() {
             let Some(point) = elapsed.checked_sub(self.interval * index) else {
                 continue;
             };
             let timestamp = origin + chrono::Duration::from_std(point).unwrap();
-            while events.peek().is_some_and(|e| e.timestamp <= timestamp) {
-                let e = events.next().unwrap();
+            while stream.peek().is_some_and(|e| e.timestamp <= timestamp) {
+                let e = stream.next().unwrap();
                 self.chart_speed
                     .record((e.timestamp - origin).to_std().unwrap(), e.usage.output);
             }
@@ -161,6 +193,43 @@ impl Tracker {
                 } else {
                     Some(self.chart_speed.rate_over(point, window))
                 });
+        }
+        // Reconstruct an independent chart for each selected agent.
+        self.agent_charts.clear();
+        let agents: BTreeSet<AgentKind> = scan.sources.iter().map(|source| source.agent).collect();
+        for agent in agents {
+            let has_sources = scan.sources.iter().any(|source| source.agent == agent);
+            let agent_readable = scan
+                .sources
+                .iter()
+                .any(|source| source.agent == agent && source.readable);
+            let mut chart = AgentChart {
+                offset: elapsed,
+                ..Default::default()
+            };
+            let mut stream = events
+                .iter()
+                .copied()
+                .filter(|e| e.id.agent == agent)
+                .peekable();
+            for index in (0..SPEED_HISTORY_CAPACITY as u32).rev() {
+                let Some(point) = elapsed.checked_sub(self.interval * index) else {
+                    continue;
+                };
+                let timestamp = origin + chrono::Duration::from_std(point).unwrap();
+                while stream.peek().is_some_and(|e| e.timestamp <= timestamp) {
+                    let e = stream.next().unwrap();
+                    chart
+                        .speed
+                        .record((e.timestamp - origin).to_std().unwrap(), e.usage.output);
+                }
+                chart.history.push_back(if has_sources && !agent_readable {
+                    None
+                } else {
+                    Some(chart.speed.rate_over(point, window))
+                });
+            }
+            self.agent_charts.insert(agent, chart);
         }
     }
     pub fn info(&mut self, scan_millis: u128) -> MonitorInfo {
@@ -176,23 +245,44 @@ impl Tracker {
                 window_cost_usd = None;
             }
         }
-        let mut session_output_tokens_per_second = BTreeMap::new();
+        let mut active_sessions = BTreeMap::new();
         self.session_speeds.retain(|session, speed| {
             let rate = speed.rate(now);
             if rate > 0.0 {
-                session_output_tokens_per_second.insert(session.clone(), rate);
+                active_sessions.insert(session.clone(), rate);
                 true
             } else {
                 false
             }
         });
-        let average_session_output_tokens_per_second =
-            if session_output_tokens_per_second.is_empty() {
-                0.0
-            } else {
-                session_output_tokens_per_second.values().sum::<f64>()
-                    / session_output_tokens_per_second.len() as f64
-            };
+        let average_session_output_tokens_per_second = if active_sessions.is_empty() {
+            0.0
+        } else {
+            active_sessions.values().sum::<f64>() / active_sessions.len() as f64
+        };
+        let session_output_tokens_per_second: Vec<SessionSpeed> = active_sessions
+            .into_iter()
+            .map(|(session, output_tokens_per_second)| SessionSpeed {
+                session,
+                output_tokens_per_second,
+            })
+            .collect();
+        let agent_activity: Vec<AgentActivity> = self
+            .agent_since_ready
+            .iter()
+            .map(|(agent, since_ready)| AgentActivity {
+                agent: *agent,
+                since_ready_tokens: *since_ready,
+                window_tokens: self.agent_window.get(agent).copied().unwrap_or_default(),
+                output_tokens_per_second: self.agent_rate.get(agent).copied().unwrap_or_default(),
+                output_speed_history: self
+                    .agent_charts
+                    .get(agent)
+                    .map(|chart| chart.history.iter().copied().collect())
+                    .unwrap_or_default(),
+                output_speed_window_seconds: CHART_SPEED_WINDOW_SECONDS,
+            })
+            .collect();
         MonitorInfo {
             sequence: self.sequence,
             final_snapshot: false,
@@ -209,6 +299,7 @@ impl Tracker {
             average_session_output_tokens_per_second,
             session_output_tokens_per_second,
             session_speed_window_seconds: SESSION_SPEED_WINDOW_SECONDS,
+            agent_activity,
             scan_millis,
         }
     }
@@ -224,31 +315,61 @@ impl Tracker {
         now: Duration,
     ) {
         self.interval = cli.interval();
+        let selection = Selection::resolve(cli, scan).unwrap_or_default();
         let current_readable: BTreeSet<_> = scan
             .sources
             .iter()
             .filter(|s| s.readable)
             .map(|s| s.name.clone())
             .collect();
+        let readable_agent: BTreeSet<AgentKind> = scan
+            .sources
+            .iter()
+            .filter(|s| s.readable)
+            .map(|s| s.agent)
+            .collect();
         let mut output = 0u64;
-        let mut session_output = BTreeMap::<String, u64>::new();
+        let mut session_output = BTreeMap::<SessionKey, u64>::new();
+        let mut agent_output = BTreeMap::<AgentKind, u64>::new();
+        let mut agent_totals = BTreeMap::<AgentKind, u64>::new();
         let mut late = 0;
         for e in &scan.events {
-            if self.seen.insert(e.id.clone()) && report::matches(cli, &report.period, e) {
-                if self.readable.contains(&e.source)
-                    && current_readable.contains(&e.source)
+            let new = self.seen.insert(e.id.clone());
+            if !report::matches(cli, &report.period, e, &selection) {
+                continue;
+            }
+            let total = agent_totals.entry(e.id.agent).or_default();
+            *total = total.saturating_add(e.usage.total());
+            if new {
+                // Fresh activity requires an origin readable both before and now.
+                let available = if e.origins.is_empty() {
+                    self.readable.contains(&e.source) && current_readable.contains(&e.source)
+                } else {
+                    e.origins.iter().any(|origin| {
+                        self.readable.contains(origin) && current_readable.contains(origin)
+                    })
+                };
+                if available
                     && e.timestamp
                         >= self.last_observed - chrono::Duration::seconds(TIMESTAMP_JITTER_SECONDS)
                     && e.timestamp
                         <= report.generated_at + chrono::Duration::seconds(TIMESTAMP_JITTER_SECONDS)
                 {
                     output = output.saturating_add(e.usage.output);
+                    *agent_output.entry(e.id.agent).or_default() += e.usage.output;
                     let tokens = session_output.entry(e.session.clone()).or_default();
                     *tokens = tokens.saturating_add(e.usage.output);
                 } else {
                     late += 1;
                 }
             }
+        }
+        // Remember every identified record, including excluded ones.
+        self.seen.extend(scan.observed_event_ids.iter().cloned());
+        let source_agents: BTreeSet<AgentKind> =
+            scan.sources.iter().map(|source| source.agent).collect();
+        for agent in &source_agents {
+            agent_totals.entry(*agent).or_default();
         }
         let rollover = report.period.label != self.previous_period;
         let current = report.totals.cost_usd.unwrap_or_default();
@@ -281,6 +402,11 @@ impl Tracker {
             self.output_speed_history.clear();
             self.chart_speed = Speed::default();
             self.chart_started = self.last_sample + self.chart_offset;
+            for chart in self.agent_charts.values_mut() {
+                chart.speed = Speed::default();
+                chart.started = self.last_sample + chart.offset;
+                chart.history.clear();
+            }
         } else {
             self.delta += report.totals.total as i128 - self.previous_total as i128;
             self.cost_delta = self.cost_delta.and_then(|delta| {
@@ -288,6 +414,29 @@ impl Tracker {
             });
         }
         let sample_seconds = now.saturating_sub(self.last_sample).as_secs_f64();
+        // Independent token deltas and rates per agent.
+        for (agent, total) in &agent_totals {
+            let delta = if rollover || !self.agent_totals.contains_key(agent) {
+                *total as i128
+            } else {
+                *total as i128 - self.agent_totals[agent] as i128
+            };
+            let since_ready = self.agent_since_ready.entry(*agent).or_default();
+            if rollover {
+                *since_ready = *total as i128;
+            } else {
+                *since_ready += delta;
+            }
+            self.agent_window.insert(*agent, delta);
+            self.agent_rate.insert(
+                *agent,
+                if sample_seconds > 0.0 {
+                    agent_output.get(agent).copied().unwrap_or_default() as f64 / sample_seconds
+                } else {
+                    0.0
+                },
+            );
+        }
         let cost_partial = self.cost_delta.is_some() && unpriced_changed;
         let known_cost = priced_changed || cost.is_some_and(|cost| !cost.is_zero());
         self.activity = Activity {
@@ -337,6 +486,39 @@ impl Tracker {
         while self.output_speed_history.len() > SPEED_HISTORY_CAPACITY {
             self.output_speed_history.pop_front();
         }
+        // Per-agent charts never borrow another agent's activity.
+        for agent in &source_agents {
+            let has_sources = scan.sources.iter().any(|source| source.agent == *agent);
+            let available = !has_sources || readable_agent.contains(agent);
+            let chart = self
+                .agent_charts
+                .entry(*agent)
+                .or_insert_with(|| AgentChart {
+                    offset: self.chart_offset,
+                    ..Default::default()
+                });
+            let rate = if !available {
+                chart.speed = Speed::default();
+                chart.started = now + chart.offset;
+                None
+            } else {
+                let elapsed = (now + chart.offset).saturating_sub(chart.started);
+                chart.speed.record(
+                    elapsed,
+                    agent_output.get(agent).copied().unwrap_or_default(),
+                );
+                Some(
+                    chart
+                        .speed
+                        .rate_over(elapsed, Duration::from_secs(CHART_SPEED_WINDOW_SECONDS)),
+                )
+            };
+            chart.history.push_back(rate);
+            while chart.history.len() > SPEED_HISTORY_CAPACITY {
+                chart.history.pop_front();
+            }
+        }
+        self.agent_totals = agent_totals;
         self.sequence += 1;
         report.monitor = Some(self.info_at(scan_millis, now));
         if late > 0 {
@@ -354,16 +536,20 @@ mod interval_tests {
     use clap::Parser;
 
     fn cli(interval: &str) -> Cli {
-        Cli::parse_from(["codex-usage", "monitor", "--interval", interval])
+        Cli::parse_from(["agent-usage", "monitor", "--interval", interval])
     }
     fn scan(readable: bool) -> Scan {
         Scan {
             sources: vec![SourceStatus {
                 name: "local".into(),
+                agent: AgentKind::Codex,
                 root: "/not-read".into(),
                 readable,
                 last_success: None,
                 error: None,
+                capability: crate::model::QuotaCapability::RecordedSnapshots,
+                coverage: Default::default(),
+                pricing_provider: None,
             }],
             ..Default::default()
         }
@@ -376,22 +562,23 @@ mod interval_tests {
     }
     fn event(id: &str, output: u64, time: chrono::DateTime<Utc>) -> UsageEvent {
         UsageEvent {
-            id: id.into(),
+            id: EventKey::new(AgentKind::Codex, id),
             timestamp: time,
-            session: "s".into(),
+            session: SessionKey::main(AgentKind::Codex, "s"),
             model: "test".into(),
             provider: "openai".into(),
             tier: Some("standard".into()),
+            mode: crate::model::UsageMode::Regular,
             project: None,
             usage: Usage {
                 input: 10,
                 output,
                 ..Default::default()
             },
+            cache_writes: None,
             source: "local".into(),
             origins: BTreeSet::new(),
             context_tokens: None,
-            cache_retention: None,
         }
     }
 
@@ -468,7 +655,7 @@ mod interval_tests {
 
     #[test]
     fn historical_chart_uses_filtered_windows_and_continues_without_recounting() {
-        let cli = Cli::parse_from(["codex-usage", "monitor", "--model", "test"]);
+        let cli = Cli::parse_from(["agent-usage", "monitor", "--model", "test"]);
         let mut scan = scan(true);
         let mut r = report("day1", 0, None);
         r.generated_at = "2026-11-04T12:00:00Z".parse().unwrap();
@@ -584,7 +771,7 @@ mod interval_tests {
             r.generated_at = base + chrono::Duration::seconds(second);
             for (index, tokens) in outputs.iter().enumerate() {
                 let mut e = event(&format!("{second}-{index}"), *tokens, r.generated_at);
-                e.session = format!("session-{index}");
+                e.session = SessionKey::main(AgentKind::Codex, format!("session-{index}"));
                 scan.events.push(e);
             }
             tracker.observe_at(
@@ -805,7 +992,7 @@ mod interval_tests {
         assert!(unknown.monitor.as_ref().unwrap().window_cost_partial);
         tracker
             .session_speeds
-            .entry("yesterday".into())
+            .entry(SessionKey::main(AgentKind::Codex, "yesterday"))
             .or_default()
             .record(Duration::from_secs(2), 300);
         let mut next_day = counts("day2", 15, 15, 0, Some(Decimal::new(1, 3)));
@@ -861,6 +1048,74 @@ mod interval_tests {
     }
 
     #[test]
+    fn codex_and_claude_activity_and_charts_are_measured_separately() {
+        let cli = cli("2s");
+        let status = |name: &str, agent: AgentKind| SourceStatus {
+            name: name.into(),
+            agent,
+            root: "/not-read".into(),
+            readable: true,
+            last_success: None,
+            error: None,
+            capability: crate::model::QuotaCapability::Unsupported,
+            coverage: Default::default(),
+            pricing_provider: None,
+        };
+        let mut scan = Scan {
+            sources: vec![
+                status("codex-root", AgentKind::Codex),
+                status("claude-root", AgentKind::ClaudeCode),
+            ],
+            ..Default::default()
+        };
+        let mut r = report("day1", 0, None);
+        let mut tracker = Tracker::new(&scan, &r, false);
+        let now = r.generated_at;
+        let mut codex = event("c", 5, now);
+        codex.source = "codex-root".into();
+        let mut claude = event("d", 7, now);
+        claude.id = EventKey::new(AgentKind::ClaudeCode, "d");
+        claude.session = SessionKey::main(AgentKind::ClaudeCode, "claude-session");
+        claude.model = "deepseek-flash".into();
+        claude.provider = "unknown".into();
+        claude.source = "claude-root".into();
+        scan.events = vec![codex, claude];
+        tracker.observe_at(&cli, &scan, &mut r, 0, Duration::from_secs(2));
+        let info = r.monitor.as_ref().unwrap();
+        assert_eq!(info.agent_activity.len(), 2);
+        let codex = info
+            .agent_activity
+            .iter()
+            .find(|agent| agent.agent == AgentKind::Codex)
+            .unwrap();
+        let claude = info
+            .agent_activity
+            .iter()
+            .find(|agent| agent.agent == AgentKind::ClaudeCode)
+            .unwrap();
+        assert_eq!(codex.window_tokens, 15);
+        assert_eq!(claude.window_tokens, 17);
+        assert_eq!(codex.output_tokens_per_second, 2.5);
+        assert_eq!(claude.output_tokens_per_second, 3.5);
+        assert_eq!(codex.output_speed_history.last(), Some(&Some(2.5)));
+        assert_eq!(claude.output_speed_history.last(), Some(&Some(3.5)));
+        // A later Codex-only burst leaves Claude's chart at zero, not Codex's rate.
+        r.generated_at = now + chrono::Duration::seconds(2);
+        let mut more = event("e", 10, r.generated_at);
+        more.source = "codex-root".into();
+        scan.events.push(more);
+        tracker.observe_at(&cli, &scan, &mut r, 0, Duration::from_secs(4));
+        let info = r.monitor.as_ref().unwrap();
+        let claude = info
+            .agent_activity
+            .iter()
+            .find(|agent| agent.agent == AgentKind::ClaudeCode)
+            .unwrap();
+        assert_eq!(claude.window_tokens, 0);
+        assert_eq!(claude.output_tokens_per_second, 0.0);
+    }
+
+    #[test]
     fn session_average_keeps_its_independent_sixty_second_window() {
         let mut s = Speed::default();
         assert_eq!(s.rate(Duration::ZERO), 0.0);
@@ -874,12 +1129,12 @@ mod interval_tests {
         let mut tracker = Tracker::new(&Scan::default(), &report("day1", 0, None), false);
         tracker
             .session_speeds
-            .entry("a".into())
+            .entry(SessionKey::main(AgentKind::Codex, "a"))
             .or_default()
             .record(Duration::from_secs(1), 300);
         tracker
             .session_speeds
-            .entry("b".into())
+            .entry(SessionKey::main(AgentKind::Codex, "b"))
             .or_default()
             .record(Duration::from_secs(10), 600);
         assert_eq!(
@@ -953,7 +1208,7 @@ mod regression_tests {
     }
     #[test]
     fn empty_start_and_empty_midnight_keep_cost_delta_available() {
-        let cli = Cli::parse_from(["codex-usage", "monitor"]);
+        let cli = Cli::parse_from(["agent-usage", "monitor"]);
         let scan = Scan::default();
         let mut tracker = Tracker::new(&scan, &report("day1", 0, None), true);
         let mut first = report("day1", 100, Some(Decimal::new(38, 2)));
@@ -965,7 +1220,7 @@ mod regression_tests {
         let mut midnight = report("day2", 0, None);
         tracker
             .session_speeds
-            .entry("yesterday".into())
+            .entry(SessionKey::main(AgentKind::Codex, "yesterday"))
             .or_default()
             .record(Duration::ZERO, 999);
         tracker.observe(&cli, &scan, &mut midnight, 0);
@@ -994,31 +1249,36 @@ mod regression_tests {
     }
     #[test]
     fn startup_history_same_id_corrections_and_recovery_do_not_inflate_speed() {
-        let cli = Cli::parse_from(["codex-usage", "monitor", "--no-cost"]);
+        let cli = Cli::parse_from(["agent-usage", "monitor", "--no-cost"]);
         let event = UsageEvent {
-            id: "request".into(),
+            id: EventKey::new(AgentKind::Codex, "request"),
             timestamp: Utc::now(),
-            session: "s".into(),
+            session: SessionKey::main(AgentKind::Codex, "s"),
             model: "test".into(),
             provider: "openai".into(),
             tier: None,
+            mode: crate::model::UsageMode::Unknown,
             project: None,
             usage: Usage {
                 input: 10,
                 output: 5,
                 ..Default::default()
             },
+            cache_writes: None,
             source: "local".into(),
             origins: BTreeSet::new(),
             context_tokens: None,
-            cache_retention: None,
         };
         let status = SourceStatus {
             name: "local".into(),
+            agent: AgentKind::Codex,
             root: "/not-read".into(),
             readable: false,
             last_success: None,
             error: None,
+            capability: crate::model::QuotaCapability::RecordedSnapshots,
+            coverage: Default::default(),
+            pricing_provider: None,
         };
         let mut scan = Scan {
             sources: vec![status],
@@ -1046,7 +1306,7 @@ mod regression_tests {
             .session_output_tokens_per_second
             .is_empty());
         let mut fresh = event;
-        fresh.id = "fresh".into();
+        fresh.id = EventKey::new(AgentKind::Codex, "fresh");
         scan.events.push(fresh);
         tracker.observe(&cli, &scan, &mut r, 0);
         assert!(r.monitor.as_ref().unwrap().output_tokens_per_second > 0.0);

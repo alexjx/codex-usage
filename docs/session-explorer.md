@@ -1,6 +1,6 @@
 # Session conversation explorer
 
-Status: implemented. The original approved interaction design is retained below.
+Status: implemented for Codex and Claude Code. The original approved interaction design is retained below.
 
 Implementation notes:
 
@@ -16,8 +16,8 @@ Find a session in `sessions`, press Enter, and read the conversation without lea
 
 ## Entry points
 
-- `codex-usage sessions`: selectable session rows in the terminal viewer. Enter opens the selected session. All model/mode rows belonging to that session open the same conversation.
-- `codex-usage session SESSION_ID --conversation`: open directly. Without `--conversation`, keep the existing usage report.
+- `agent-usage sessions`: selectable session rows in the terminal viewer. Enter opens the selected session. All model/mode rows belonging to that session open the same conversation.
+- `agent-usage session SELECTOR --conversation`: open directly. Without `--conversation`, keep the existing usage report.
 - `Esc` returns to the report with the selected row, scroll position, and filters intact. `q` exits the viewer; Ctrl+C also cancels loading and restores the terminal.
 - Sessions reports open the interactive viewer even when short, so Enter is available. `--pager never`, pipes, and ordinary report exports retain linear usage output.
 
@@ -28,7 +28,7 @@ Only opening the conversation triggers message parsing. Listing usage must not l
 Reuse the existing columns and totals. Add a selection indicator and highlighted selected row; avoid new diagnostic footer lines.
 
 ```text
-Codex Usage / Sessions · Last 7 days · Asia/Shanghai
+Agent Usage / Sessions · Last 7 days · Asia/Shanghai
 
 Session       Model         Mode       Input  Cached  Output  Est. USD
 › 019abc…     gpt-6.1-sol    Fast        1.2M    1.1M   8.2K   $1.2345
@@ -49,7 +49,7 @@ Use two header lines: session/project context, then date/source/turn position. C
 Wide terminal, at least 120 columns:
 
 ```text
-Codex Usage / Sessions / 019abc… · codex-usage
+Agent Usage / Sessions / 019abc… · agent-usage
 Nov 04, 2026 · Asia/Shanghai · WSL + Windows · All retained conversation
 
 Turns                        Conversation
@@ -105,7 +105,7 @@ Selected session → matching log files → message/tool blocks → conversation
 - The report retains its selected date/model/mode filters. The conversation opens all retained messages for the selected session and source scope, preserving context. The header explicitly labels `All retained conversation` so users do not confuse the two scopes.
 - A collapsed details panel, opened with `i`, shows full session ID, project, contributing sources/files, original report period, and usage totals for that period. Normal reader chrome stays compact.
 - Per-turn token/cost annotations are optional details and appear only where usage has a reliable matching turn ID. Leave unavailable values as `n/a`; do not divide a session estimate evenly across turns.
-- Reading a conversation or going Back preserves the current report and its options. Commands and options are not remembered across invocations; use `session ID --conversation` explicitly to open the reader. Navigation focus, search text, expansions, and scroll position remain transient.
+- Reading a conversation or going Back preserves the current report and its options. Commands and options are not remembered across invocations; use `session SELECTOR --conversation` explicitly to open the reader. Navigation focus, search text, expansions, and scroll position remain transient.
 
 ## Data loading and integrity
 
@@ -129,3 +129,10 @@ Observed locally on both WSL and Windows logs: `response_item` contains message 
 Prove the feature with synthetic conversation fixtures and actual terminal interaction before calling it complete. No user messages, logs, or local caches belong in the repository's published examples.
 
 Confidence: high that the inspected logs support a reader and that the layout can reuse existing terminal infrastructure; medium for reliable cross-version conversation reconstruction until parsing fixtures and terminal tests pass.
+
+## Multi-agent implementation notes
+
+- The shared conversation model carries a typed `SessionKey` and optional parent. The UI opens a typed target from the selected report row; it never reconstructs a selector from rendered text.
+- Codex discovery remains under `sessions/` and `archived_sessions/`. Claude Code discovery walks `projects/<project>/<session>.jsonl` and `projects/<project>/<session>/subagents/agent-<execution>.jsonl`; a qualified selector is required to open a subagent execution.
+- Claude records merge copies by UUID and execution, group assistant fragments by `message.id`, order by `parentUuid` when the graph is acyclic, join tool calls and results by call ID, and keep thinking/redacted content as collapsed notices. Conflicting copies are retained with a warning rather than silently chosen.
+- Explicit conversation loading is independent of report dates, but it still obeys the selected source scope. Conversation parsing never contributes tokens or cost.
