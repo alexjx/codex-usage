@@ -236,9 +236,9 @@ The screen places today's summary and live rates at the top, then the agent char
 | `codex … tok / … out tok/s` | Independent cumulative tokens and fresh output rate for that agent |
 | `… out tok/s` | Fresh output divided by the actual time since the previous refresh |
 | `(… tok/s)` | Mean output speed per active session over a **60-second** sliding window |
-| Chart: `30s avg` | Each agent's output over an independent **30-second** sliding window |
+| Chart: `2s average` | Each agent's output over an independent **2-second** sliding window |
 
-Charts open with up to **60 points** reconstructed from today's already-loaded records—about two minutes at the default 2s interval. Historical points use logged timestamps; live points use observed arrivals. Dots show zero; `?` marks unavailable data. Midnight resets totals and chart history.
+Charts open with up to **180 points** reconstructed from today's already-loaded records—about six minutes at the default 2s interval. Historical points use logged timestamps; live points use observed arrivals. Dots show zero; `?` marks unavailable data. Midnight resets totals and chart history.
 
 Logs can arrive in batches, so speeds describe observed throughput rather than exact streaming generation speed. Recovered backlog and corrections can change token/cost deltas but are excluded from fresh-output speed. A complete source outage creates a chart gap and restarts smoothing on recovery.
 

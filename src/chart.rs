@@ -59,7 +59,7 @@ pub fn agent_history(
 
 fn history(
     history: &[Option<f64>],
-    window_seconds: u64,
+    _window_seconds: u64,
     title_prefix: Option<&str>,
     style: &Style,
     width: usize,
@@ -90,7 +90,7 @@ fn history(
     let scale = peak.max(1.0);
     let separator = if ascii { " / " } else { " · " };
     let base = title_prefix.unwrap_or("Output tok/s");
-    let title = format!("{base}{separator}{window_seconds}s avg");
+    let title = base.to_string();
     let statistics = if valid == 0 {
         format!("avg n/a{separator}peak n/a")
     } else {

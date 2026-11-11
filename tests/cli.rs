@@ -1038,7 +1038,7 @@ fn monitor_activity_label_and_metadata_follow_the_configured_interval() {
                         .as_array()
                         .unwrap()
                         .len(),
-                    60
+                    180
                 );
             }
         }
@@ -1095,7 +1095,7 @@ fn monitor_reads_real_appends_and_defers_partial_records_without_counting_histor
             .as_array()
             .unwrap()
             .len(),
-        60
+        180
     );
     assert_eq!(
         baseline["monitor"]["average_session_output_tokens_per_second"],
@@ -1147,11 +1147,10 @@ fn monitor_reads_real_appends_and_defers_partial_records_without_counting_histor
     assert!(last["monitor"]["sample_seconds"].as_f64().unwrap() > 0.0);
     assert!(last["monitor"]["window_cost_usd"].is_null());
     let history = last["monitor"]["output_speed_history"].as_array().unwrap();
-    assert_eq!(history.len(), 60);
-    // The chart includes the historical 30 output tokens plus the fresh 5;
-    // live activity still counts only the fresh record.
-    assert!((history.last().unwrap().as_f64().unwrap() - 35.0 / 30.0).abs() < 1e-9);
-    assert_eq!(last["monitor"]["output_speed_window_seconds"], 30);
+    assert_eq!(history.len(), 180);
+    // Historical output has expired; the chart includes the fresh 5 tokens.
+    assert!((history.last().unwrap().as_f64().unwrap() - 5.0 / 2.0).abs() < 1e-9);
+    assert_eq!(last["monitor"]["output_speed_window_seconds"], 2);
     let monitor = &last["monitor"];
     assert_eq!(monitor["session_speed_window_seconds"], 60);
     assert!(

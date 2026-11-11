@@ -12,8 +12,8 @@ use std::{
 
 const TIMESTAMP_JITTER_SECONDS: i64 = 5;
 const SESSION_SPEED_WINDOW_SECONDS: u64 = 60;
-const CHART_SPEED_WINDOW_SECONDS: u64 = 30;
-const SPEED_HISTORY_CAPACITY: usize = 60;
+const CHART_SPEED_WINDOW_SECONDS: u64 = 2;
+const SPEED_HISTORY_CAPACITY: usize = 180;
 
 #[derive(Default)]
 /// Time-weighted output rate over a rolling window, including idle time.
@@ -729,7 +729,11 @@ mod interval_tests {
             );
             assert_eq!(
                 info.output_speed_history[2],
-                Some(120.0 / (actual * 3).as_secs_f64())
+                Some(if actual.as_secs_f64() < 2.0 {
+                    15.0
+                } else {
+                    0.0
+                })
             );
         }
     }
@@ -763,13 +767,13 @@ mod interval_tests {
         let mut tracker = Tracker::new(&scan, &r, false);
         tracker.seed_chart(&cli, &scan, &r);
         let info = tracker.info_at(0, Duration::ZERO);
-        assert_eq!(info.output_speed_history.len(), 60);
-        assert_eq!(info.output_speed_history.first(), Some(&Some(4.0)));
-        assert_eq!(info.output_speed_history.last(), Some(&Some(2.0)));
+        assert_eq!(info.output_speed_history.len(), 180);
+        assert_eq!(info.output_speed_history.first(), Some(&Some(0.0)));
+        assert_eq!(info.output_speed_history.last(), Some(&Some(0.0)));
         assert_eq!(info.window_tokens, 0);
         assert_eq!(info.output_tokens_per_second, 0.0);
         assert_eq!(info.average_session_output_tokens_per_second, 0.0);
-        for (second, expected) in [(2, 3.0), (20, 1.0), (32, 0.0)] {
+        for (second, expected) in [(2, 15.0), (20, 0.0), (32, 0.0)] {
             r.generated_at = base + chrono::Duration::seconds(second);
             if second == 2 {
                 scan.events.push(event("live", 30, r.generated_at));
@@ -777,7 +781,7 @@ mod interval_tests {
             }
             tracker.observe_at(&cli, &scan, &mut r, 0, Duration::from_secs(second as u64));
             let info = r.monitor.as_ref().unwrap();
-            assert_eq!(info.output_speed_history.len(), 60);
+            assert_eq!(info.output_speed_history.len(), 180);
             assert_eq!(info.output_speed_history.last(), Some(&Some(expected)));
             assert_eq!(info.since_ready_tokens, 40);
             if second == 2 {
@@ -814,7 +818,7 @@ mod interval_tests {
         tracker.seed_chart(&cli, &scan, &r);
         assert_eq!(
             tracker.info_at(0, Duration::ZERO).output_speed_history,
-            vec![Some(100.0), Some(130.0 / 3.0), Some(26.0)]
+            vec![Some(100.0), Some(15.0), Some(0.0)]
         );
         scan.sources[0].readable = false;
         let mut tracker = Tracker::new(&scan, &r, false);
@@ -834,19 +838,19 @@ mod interval_tests {
     }
 
     #[test]
-    fn chart_smooths_parallel_bursts_and_expires_at_thirty_seconds_independently_of_sessions() {
+    fn chart_uses_two_second_average_independently_of_sessions() {
         let mut scan = scan(true);
         let mut r = report("day1", 0, None);
         let base = r.generated_at;
         let mut tracker = Tracker::new(&scan, &r, false);
         for (second, outputs, expected) in [
             (2, vec![120, 60], 90.0),
-            (4, vec![], 45.0),
-            (10, vec![120], 30.0),
-            (30, vec![], 10.0),
-            (31, vec![], 10.0),
-            (32, vec![], 4.0),
-            (39, vec![], 4.0),
+            (4, vec![], 0.0),
+            (10, vec![120], 60.0),
+            (30, vec![], 0.0),
+            (31, vec![], 0.0),
+            (32, vec![], 0.0),
+            (39, vec![], 0.0),
             (40, vec![], 0.0),
         ] {
             r.generated_at = base + chrono::Duration::seconds(second);
@@ -877,7 +881,7 @@ mod interval_tests {
             if second == 2 {
                 assert_eq!(info.average_session_output_tokens_per_second, 45.0);
             }
-            assert_eq!(info.output_speed_window_seconds, 30);
+            assert_eq!(info.output_speed_window_seconds, 2);
             assert_eq!(info.session_speed_window_seconds, 60);
             if second == 40 {
                 assert!(info.average_session_output_tokens_per_second > 0.0);
@@ -904,21 +908,21 @@ mod interval_tests {
         tracker.observe_at(&cli("2s"), &scan, &mut r, 0, Duration::from_secs(4));
         assert_eq!(
             r.monitor.as_ref().unwrap().output_speed_history,
-            vec![Some(20.0), Some(10.0)]
+            vec![Some(20.0), Some(0.0)]
         );
         scan.sources[0].readable = false;
         r.generated_at = base + chrono::Duration::seconds(6);
         tracker.observe_at(&cli("2s"), &scan, &mut r, 0, Duration::from_secs(6));
         assert_eq!(
             r.monitor.as_ref().unwrap().output_speed_history,
-            vec![Some(20.0), Some(10.0), None]
+            vec![Some(20.0), Some(0.0), None]
         );
         scan.sources[0].readable = true;
         r.generated_at = base + chrono::Duration::seconds(8);
         scan.events.push(event("recovered", 30, r.generated_at));
         r.totals.total += 40;
         tracker.observe_at(&cli("2s"), &scan, &mut r, 0, Duration::from_secs(8));
-        let expected = vec![Some(20.0), Some(10.0), None, Some(0.0)];
+        let expected = vec![Some(20.0), Some(0.0), None, Some(0.0)];
         assert_eq!(r.monitor.as_ref().unwrap().output_speed_history, expected);
         // Reading metadata/finalizing an already completed frame must not invent points.
         for second in [8, 9, 30] {
@@ -937,7 +941,7 @@ mod interval_tests {
         let mut r = report("day1", 0, None);
         let base = r.generated_at;
         let mut tracker = Tracker::new(&scan, &r, false);
-        for second in 1..=65 {
+        for second in 1..=185 {
             r.generated_at = base + chrono::Duration::seconds(second);
             scan.events
                 .push(event(&format!("r-{second}"), second as u64, r.generated_at));
@@ -952,13 +956,19 @@ mod interval_tests {
         }
         let history = &r.monitor.as_ref().unwrap().output_speed_history;
         assert_eq!(history.len(), SPEED_HISTORY_CAPACITY);
-        assert_eq!(history.first(), Some(&Some(3.5)));
-        assert_eq!(history.last(), Some(&Some(50.5)));
+        assert_eq!(history.first(), Some(&Some(5.5)));
+        assert_eq!(history.last(), Some(&Some(184.5)));
         let mut next_day = report("day2", 30, None);
-        next_day.generated_at = base + chrono::Duration::seconds(66);
+        next_day.generated_at = base + chrono::Duration::seconds(186);
         scan.events
             .push(event("new-day", 20, next_day.generated_at));
-        tracker.observe_at(&cli("1s"), &scan, &mut next_day, 0, Duration::from_secs(66));
+        tracker.observe_at(
+            &cli("1s"),
+            &scan,
+            &mut next_day,
+            0,
+            Duration::from_secs(186),
+        );
         assert_eq!(
             next_day.monitor.as_ref().unwrap().output_speed_history,
             vec![Some(20.0)]

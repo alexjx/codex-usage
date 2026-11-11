@@ -754,7 +754,7 @@ pub fn view(cli: &Cli, report: &Report, style: &Style, width: usize, help: bool)
         }
         if cli.monitor() {
             details.push("Monitor range: today's local midnight through the displayed snapshot time, in the title's timezone. Cost includes today's loaded history. Stale sources or partial data can omit usage.".into());
-            details.push("c toggles the output-speed chart. It shows up to 60 chart points, newest on the right; dots mark zero and ? marks unavailable data. The chart starts with recent logged history and continues with 30s rolling aggregate output (including idle time), sampled each refresh; the parenthesized rate averages per session. The chart hides when space is limited.".into());
+            details.push("c toggles the output-speed chart. It shows up to 180 chart points, newest on the right; dots mark zero and ? marks unavailable data. The chart starts with recent logged history and continues with 2s rolling aggregate output (including idle time), sampled each refresh; the parenthesized rate averages per session. The chart hides when space is limited.".into());
         }
         if filtered {
             details.push(format!(
