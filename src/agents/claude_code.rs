@@ -421,8 +421,9 @@ impl Parser {
             .filter(|model| !model.is_empty() && *model != "<synthetic>")
             .unwrap_or("unknown")
             .to_owned();
-        // Synthetic placeholders carry no billable usage or model attribution.
-        if model == "unknown" && usage.total() == 0 {
+        let mode = mode(usage_record);
+        // Empty placeholders must not create unknown model or mode rows.
+        if usage.total() == 0 && (model == "unknown" || mode == UsageMode::Unknown) {
             return;
         }
         let event = UsageEvent {
@@ -432,7 +433,7 @@ impl Parser {
             model,
             provider: "unknown".into(),
             tier: None,
-            mode: mode(usage_record),
+            mode,
             project: record.cwd.clone(),
             usage,
             cache_writes: Some(breakdown),
@@ -816,7 +817,7 @@ mod tests {
         ));
         fixture.write("projects/p/session-1.jsonl", &records);
         let events = fixture.events();
-        assert_eq!(events.len(), 5);
+        assert_eq!(events.len(), 4);
         assert_eq!(
             events
                 .iter()
@@ -828,6 +829,30 @@ mod tests {
             events.iter().map(|event| event.usage.total()).sum::<u64>(),
             4
         );
+    }
+
+    #[test]
+    fn zero_usage_unknown_mode_is_ignored_but_known_mode_and_real_usage_are_retained() {
+        let fixture = Fixture::new();
+        let placeholder = assistant(
+            "placeholder",
+            "session-1",
+            "2026-11-01T10:00:00Z",
+            0,
+            0,
+            0,
+            0,
+        );
+        let mut regular = assistant("regular", "session-1", "2026-11-01T10:00:00Z", 0, 0, 0, 0);
+        regular["message"]["usage"]["speed"] = serde_json::json!("standard");
+        let used = assistant("used", "session-1", "2026-11-01T10:00:00Z", 0, 1, 0, 0);
+        fixture.write("projects/p/session-1.jsonl", &[placeholder, regular, used]);
+        let events = fixture.events();
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().any(|event| event.mode == UsageMode::Regular));
+        assert!(events
+            .iter()
+            .any(|event| event.mode == UsageMode::Unknown && event.usage.total() == 1));
     }
 
     #[test]
