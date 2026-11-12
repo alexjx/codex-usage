@@ -1285,6 +1285,7 @@ mod regression_tests {
             },
             rows: Vec::new(),
             subtotals: Vec::new(),
+            agent_totals: Default::default(),
             totals: Counts {
                 total,
                 cost_usd: cost,

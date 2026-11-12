@@ -345,6 +345,7 @@ pub struct Report {
     pub rows: Vec<Row>,
     /// Outer date-section totals, separate from data rows to avoid additive exports.
     pub subtotals: Vec<Row>,
+    pub agent_totals: BTreeMap<String, Counts>,
     pub totals: Counts,
     pub sources: Vec<SourceStatus>,
     pub coverage: Coverage,
@@ -518,6 +519,7 @@ pub fn build_cancellable(
     let mut grouped: BTreeMap<Vec<String>, (Row, BTreeSet<SessionKey>)> = BTreeMap::new();
     let mut dated: BTreeMap<String, (Row, BTreeSet<SessionKey>)> = BTreeMap::new();
     let mut total = Counts::default();
+    let mut agent_totals: BTreeMap<String, Counts> = BTreeMap::new();
     let mut sessions = BTreeSet::new();
     for event in &scan.events {
         crate::cancel::check(stopped)?;
@@ -581,9 +583,19 @@ pub fn build_cancellable(
             date_sessions.insert(event.session.clone());
         }
         total.add(event, estimate.as_ref())?;
+        agent_totals
+            .entry(event.id.agent.to_string())
+            .or_default()
+            .add(event, estimate.as_ref())?;
         sessions.insert(event.session.clone());
     }
     total.sessions = sessions.len();
+    for session in &sessions {
+        agent_totals
+            .get_mut(&session.agent.to_string())
+            .unwrap()
+            .sessions += 1;
+    }
     if total.events == 0 {
         total.pricing_status = if pricer.is_some() {
             "priced"
@@ -636,6 +648,7 @@ pub fn build_cancellable(
         period,
         rows,
         subtotals,
+        agent_totals,
         totals: total,
         sources: scan.sources.clone(),
         coverage: scan.coverage.clone(),
@@ -1125,6 +1138,62 @@ mod tests {
         assert!(text.lines().nth(1).unwrap().starts_with("2,"));
         assert!(text.contains("\"[\"\"codex\"\"]\""));
         assert!(text.contains("claude-code:shared"));
+    }
+
+    #[test]
+    fn agent_totals_span_dates_and_models_with_distinct_sessions_and_filters() {
+        let mut scan = cross_agent_scan();
+        let mut second = scan.events[0].clone();
+        second.id = EventKey::new(AgentKind::Codex, "second");
+        second.timestamp = "2026-11-02T00:00:00Z".parse().unwrap();
+        second.model = "gpt-5.6-sol".into();
+        scan.events.push(second);
+        let pricer = Pricer::load_current(None).unwrap();
+        for command in ["daily", "monthly", "models", "sessions"] {
+            // Omitting agent from grouping must still retain agent totals.
+            let cli = Cli::parse_from([
+                "agent-usage",
+                command,
+                "--all",
+                "--group-by",
+                "model",
+                "--color",
+                "never",
+            ]);
+            let report = build(&cli, chrono_tz::UTC, &scan, Some(&pricer), Utc::now()).unwrap();
+            let codex = &report.agent_totals["codex"];
+            let claude = &report.agent_totals["claude-code"];
+            assert_eq!((codex.total, codex.events, codex.sessions), (240, 2, 1));
+            assert_eq!((claude.total, claude.events, claude.sessions), (120, 1, 1));
+            assert_eq!(codex.cost_usd, report.totals.cost_usd);
+            assert_eq!(claude.unpriced_tokens, 120);
+            assert_eq!(codex.total + claude.total, report.totals.total);
+            for width in [25, 80, 160] {
+                let output = crate::render::linear(&cli, &report, width, false).join("\n");
+                let codex_pos = output.rfind("\n  Codex").unwrap();
+                let claude_pos = output.rfind("\n  Claude").unwrap();
+                let total_pos = output.rfind("\nTotal").unwrap();
+                assert!(total_pos < codex_pos && codex_pos < claude_pos, "{output}");
+            }
+        }
+        let cli = Cli::parse_from([
+            "agent-usage",
+            "daily",
+            "--all",
+            "--model",
+            "gpt-5.6-sol",
+            "--no-cost",
+        ]);
+        let report = build(&cli, chrono_tz::UTC, &scan, None, Utc::now()).unwrap();
+        assert_eq!(report.agent_totals.len(), 1);
+        assert_eq!(report.agent_totals["codex"].total, 120);
+        assert_eq!(report.agent_totals["codex"].cost_usd, None);
+        let output = crate::render::linear(&cli, &report, 160, false).join("\n");
+        assert!(
+            !output[output.rfind("\nTotal").unwrap()..].contains("Codex"),
+            "{output}"
+        );
+        assert!(output.contains("\nTotal"), "{output}");
     }
 
     #[test]

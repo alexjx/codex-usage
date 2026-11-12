@@ -2054,6 +2054,10 @@ fn human_date_subtotals_follow_each_period_and_keep_wide_alignment_and_csv_rows(
         );
         let total = text.lines().last().unwrap();
         assert!(total.starts_with("Total "), "{text}");
+        assert!(
+            !text[text.rfind("\nTotal").unwrap()..].contains("Codex"),
+            "{text}"
+        );
         assert_eq!(
             total.split_whitespace().collect::<Vec<_>>(),
             ["Total", "315,000", "166,000", "31,800", "15,900", "0", "2", "346,800", "$0.9551*"],

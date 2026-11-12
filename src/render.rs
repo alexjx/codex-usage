@@ -667,10 +667,21 @@ pub fn view(cli: &Cli, report: &Report, style: &Style, width: usize, help: bool)
             "Group"
         }]
     };
+    let mut agent_totals: Vec<_> = report
+        .agent_totals
+        .iter()
+        .filter(|_| report.agent_totals.len() > 1)
+        .collect();
+    agent_totals.sort_by_key(|(agent, _)| (agent.as_str() != "codex", agent.as_str()));
     let id_width = report
         .rows
         .iter()
         .map(|r| row_label(r, agent_sections).width())
+        .chain(
+            agent_totals
+                .iter()
+                .map(|(agent, _)| format!("  {}", agent_name(agent)).width()),
+        )
         .max()
         .unwrap_or(16)
         .max(labels[0].len());
@@ -702,6 +713,7 @@ pub fn view(cli: &Cli, report: &Report, style: &Style, width: usize, help: bool)
             .iter()
             .map(|r| &r.counts)
             .chain(report.subtotals.iter().map(|row| &row.counts))
+            .chain(report.agent_totals.values())
             .chain(std::iter::once(&report.totals))
         {
             for (i, v) in values(row, cli, detailed).iter().enumerate() {
@@ -1046,6 +1058,16 @@ pub fn view(cli: &Cli, report: &Report, style: &Style, width: usize, help: bool)
             &totals,
             &summary_layout,
         ));
+        for (agent, counts) in agent_totals {
+            let mut cells = values(counts, cli, detailed);
+            cells[0].clear();
+            total_footer.extend(summary_lines(
+                &format!("  {}", agent_name(agent)),
+                counts,
+                &cells,
+                &summary_layout,
+            ));
+        }
     }
     View {
         header: h,
