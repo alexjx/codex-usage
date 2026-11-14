@@ -83,7 +83,7 @@ fn every_help_path_has_examples_and_action_specific_options() {
         "1000ms",
         "initial baseline",
         "jsonl when redirected",
-        "60s per-session",
+        "Current speed uses actual elapsed time",
     ] {
         assert!(monitor.contains(description), "{monitor}");
     }

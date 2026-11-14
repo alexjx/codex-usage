@@ -227,16 +227,13 @@ Monitor always summarizes **today**, in the selected timezone. It measures **Cod
 - The model table separates agents and providers.
 - The per-session 60-second average remains independent.
 
-The screen places today's summary and live rates at the top, then the agent charts, then model sections headed Codex and Claude. Model names have no added agent or provider prefix. A shared `Interval (2s):` heading introduces two-space-indented per-agent token/cost deltas and speeds; the duration follows `--interval`. The full-selection total and controls stay at the bottom. Charts shrink or hide on small terminals; scrolling does not pause updates.
+The screen places today's summary and live rates at the top, then the agent charts, then model sections headed Codex and Claude. Model names have no added agent or provider prefix. A shared `Interval (2s):` heading introduces two-space-indented per-agent token/cost deltas; the duration follows `--interval`. Interval token counts use K/M/G abbreviations from 1,000 tokens (for example, `+1.2K` or `-3.4M`); `--exact` shows full counts. The full-selection total and controls stay at the bottom. Charts shrink or hide on small terminals; scrolling does not pause updates.
 
 | Indicator | What it measures |
 | --- | --- |
 | `Today 00:00:00–HH:MM:SS` | Tokens and estimated cost from local midnight through the latest snapshot |
 | `2s: +… tokens / +… USD` | Net changes since the previous refresh; `2s` follows `--interval` |
-| `codex … tok / … out tok/s` | Independent cumulative tokens and fresh output rate for that agent |
-| `… out tok/s` | Fresh output divided by the actual time since the previous refresh |
-| `(… tok/s)` | Mean output speed per active session over a **60-second** sliding window |
-| Chart: `2s average` | Each agent's output over an independent **2-second** sliding window |
+| Chart output | Each agent's output over an independent **2-second** sliding window |
 
 Charts open with up to **180 points** reconstructed from today's already-loaded records—about six minutes at the default 2s interval. Historical points use logged timestamps; live points use observed arrivals. Dots show zero; `?` marks unavailable data. Midnight resets totals and chart history.
 

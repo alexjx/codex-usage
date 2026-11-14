@@ -120,6 +120,20 @@ pub fn number(n: u64, exact: bool) -> String {
     };
     format!("{:.1}{suffix}", n as f64 / scale as f64)
 }
+fn token_delta(n: i128, exact: bool) -> String {
+    let magnitude = n.unsigned_abs();
+    if exact || magnitude < 1_000 {
+        return format!("{n:+}");
+    }
+    let (scale, suffix) = if magnitude >= 1_000_000_000 {
+        (1_000_000_000, "G")
+    } else if magnitude >= 1_000_000 {
+        (1_000_000, "M")
+    } else {
+        (1_000, "K")
+    };
+    format!("{:+.1}{suffix}", n as f64 / scale as f64)
+}
 pub fn money(n: Option<Decimal>) -> String {
     match n {
         None => "n/a".into(),
@@ -554,7 +568,7 @@ pub fn view(cli: &Cli, report: &Report, style: &Style, width: usize, help: bool)
             width,
         );
         if m.agent_activity.is_empty() {
-            let mut delta = format!("  {:+} tokens", m.window_tokens);
+            let mut delta = format!("  {} tokens", token_delta(m.window_tokens, cli.exact));
             if !cli.no_cost {
                 delta.push_str(
                     &m.window_cost_usd
@@ -567,16 +581,12 @@ pub fn view(cli: &Cli, report: &Report, style: &Style, width: usize, help: bool)
                         .unwrap_or(" / n/a USD".into()),
                 );
             }
-            delta.push_str(&format!(
-                " / {:.0} out tok/s ({:.1} tok/s)",
-                m.output_tokens_per_second, m.average_session_output_tokens_per_second
-            ));
             text(&mut h, style, "accent", &delta, width);
         }
         let token_width = m
             .agent_activity
             .iter()
-            .map(|a| format!("{:+}", a.window_tokens).len())
+            .map(|a| token_delta(a.window_tokens, cli.exact).len())
             .max()
             .unwrap_or(1);
         for agent in &m.agent_activity {
@@ -588,7 +598,10 @@ pub fn view(cli: &Cli, report: &Report, style: &Style, width: usize, help: bool)
                     .iter()
                     .filter(|s| s.agent == agent.agent)
                     .all(|s| !s.readable);
-            let mut metrics = vec![format!("{:+token_width$} tokens", agent.window_tokens)];
+            let mut metrics = vec![format!(
+                "{:>token_width$} tokens",
+                token_delta(agent.window_tokens, cli.exact)
+            )];
             if !cli.no_cost {
                 metrics.push(
                     agent
@@ -605,14 +618,6 @@ pub fn view(cli: &Cli, report: &Report, style: &Style, width: usize, help: bool)
                         .unwrap_or("n/a USD".into()),
                 );
             }
-            metrics.push(if unavailable {
-                "n/a out tok/s (n/a tok/s)".into()
-            } else {
-                format!(
-                    "{:.0} out tok/s ({:.1} tok/s)",
-                    agent.output_tokens_per_second, agent.average_session_output_tokens_per_second
-                )
-            });
             let prefix = format!("  {name:<6}  ");
             let available = width.saturating_sub(prefix.len()).max(1);
             for (index, line) in wrap(&metrics.join(" / "), available).iter().enumerate() {
@@ -745,7 +750,7 @@ pub fn view(cli: &Cli, report: &Report, style: &Style, width: usize, help: bool)
             "Summary covers the full selection. Cached is part of input; reasoning is part of output. * marks incomplete coverage or assumed estimates; n/a means unavailable.".into(),
             "Speed: newly observed output tokens since the previous snapshot divided by actual elapsed seconds; delayed backlog and corrections are excluded.".into(),
             "Token/cost deltas: changes since the previous snapshot, including corrections and recovered records. The prefix follows --interval (default 2s). Cost uses the known priced subtotal. Idle refreshes show zero; today's summary stays cumulative. Slow collection can extend the actual sample time, available as sample_seconds in JSONL.".into(),
-            "Speed in parentheses: mean output rate per active session over 60s (shorter since startup). Idle sessions drop out. Logs arrive in batches; this is observed throughput, not streaming generation speed. Individual rates are available in JSONL.".into(),
+            "Output speed: Logs arrive in batches; this is observed throughput, not streaming generation speed. Individual rates are available in JSONL.".into(),
             format!("Unpriced: {} tokens",number(report.totals.unpriced_tokens,cli.exact)),
             format!("Data warnings: {} / Pending: {}",report.coverage.malformed+report.coverage.conflicts+report.coverage.uncertain,report.coverage.pending),
             format!("Pricing assumptions: {}",report.totals.assumed_events)];
@@ -766,7 +771,7 @@ pub fn view(cli: &Cli, report: &Report, style: &Style, width: usize, help: bool)
         }
         if cli.monitor() {
             details.push("Monitor range: today's local midnight through the displayed snapshot time, in the title's timezone. Cost includes today's loaded history. Stale sources or partial data can omit usage.".into());
-            details.push("c toggles the output-speed chart. It shows up to 180 chart points, newest on the right; dots mark zero and ? marks unavailable data. The chart starts with recent logged history and continues with 2s rolling aggregate output (including idle time), sampled each refresh; the parenthesized rate averages per session. The chart hides when space is limited.".into());
+            details.push("c toggles the output-speed chart. It shows up to 180 chart points, newest on the right; dots mark zero and ? marks unavailable data. The chart starts with recent logged history and continues with 2s rolling aggregate output (including idle time), sampled each refresh. The chart hides when space is limited.".into());
         }
         if filtered {
             details.push(format!(
@@ -1090,6 +1095,27 @@ mod tests {
     use super::*;
     use clap::Parser;
 
+    #[test]
+    fn token_deltas_abbreviate_signed_thousands_millions_and_billions() {
+        for (value, expected) in [
+            (0, "+0"),
+            (999, "+999"),
+            (1_000, "+1.0K"),
+            (12_345, "+12.3K"),
+            (1_000_000, "+1.0M"),
+            (12_345_678, "+12.3M"),
+            (1_000_000_000, "+1.0G"),
+            (12_345_678_901, "+12.3G"),
+        ] {
+            assert_eq!(token_delta(value, false), expected);
+            assert_eq!(token_delta(value, true), format!("{value:+}"));
+            if value > 0 {
+                assert_eq!(token_delta(-value, false), expected.replacen('+', "-", 1));
+                assert_eq!(token_delta(-value, true), format!("-{value}"));
+            }
+        }
+    }
+
     fn quota_report() -> (Cli, Report) {
         let cli = Cli::parse_from(["agent-usage", "daily", "--no-cost", "--color", "never"]);
         let now = "2026-11-05T00:40:33Z".parse().unwrap();
@@ -1280,7 +1306,7 @@ mod regression_tests {
 
     #[test]
     fn monitor_line_uses_rolling_deltas_instead_of_since_ready_totals() {
-        let cli = Cli::parse_from(["agent-usage", "monitor", "--color", "never"]);
+        let mut cli = Cli::parse_from(["agent-usage", "monitor", "--color", "never"]);
         let mut report = report::build(
             &cli,
             chrono_tz::UTC,
@@ -1308,12 +1334,28 @@ mod regression_tests {
             agent_activity: Vec::new(),
             scan_millis: 0,
         });
-        let output = linear(&cli, &report, 140, false).join("\n");
-        assert!(
-            output.contains("+100 tokens / +0.0100 USD / 270 out tok/s (33.0 tok/s)"),
-            "{output}"
-        );
-        assert!(!output.contains("1543980") && !output.contains("+0.4369"));
+        for (tokens, compact) in [
+            (100, "+100"),
+            (12_345, "+12.3K"),
+            (12_345_678, "+12.3M"),
+            (-1_234_567_890, "-1.2G"),
+        ] {
+            report.monitor.as_mut().unwrap().window_tokens = tokens;
+            for exact in [false, true] {
+                cli.exact = exact;
+                let expected = if exact {
+                    format!("{tokens:+}")
+                } else {
+                    compact.into()
+                };
+                let output = linear(&cli, &report, 140, false).join("\n");
+                assert!(
+                    output.contains(&format!("{expected} tokens / +0.0100 USD")),
+                    "{output}"
+                );
+                assert!(!output.contains("1543980") && !output.contains("+0.4369"));
+            }
+        }
     }
 
     #[test]
@@ -1496,7 +1538,7 @@ mod regression_tests {
             output.contains("LIVE FILTERED")
                 && output.contains("Interval (2s):")
                 && output.contains("+0 tokens / +0.0200 USD*")
-                && output.contains("(33.0 tok/s)"),
+                && !output.contains("(33.0 tok/s)"),
             "{output}"
         );
         let help = view(&cli, &report, &Style::new(&cli, false), 140, true)
@@ -1636,7 +1678,7 @@ mod agent_layout_tests {
     use clap::Parser;
     #[test]
     fn monitor_groups_models_and_indents_independent_activity() {
-        let cli = Cli::parse_from(["agent-usage", "monitor", "--no-cost", "--color", "never"]);
+        let mut cli = Cli::parse_from(["agent-usage", "monitor", "--no-cost", "--color", "never"]);
         let mut report = crate::report::build(
             &cli,
             chrono_tz::UTC,
@@ -1682,14 +1724,44 @@ mod agent_layout_tests {
         }
         report.totals.total = 2100;
         report.monitor = Some(info);
-        for width in [60, 100, 160] {
-            let output = linear(&cli, &report, width, false).join("\n");
-            assert!(output.contains("Interval (2s):"), "{output}");
-            assert!(output.contains("  Codex   +1240 tokens"), "{output}");
-            assert!(output.contains("  Claude   +860 tokens"), "{output}");
-            assert!(!output.contains("unknown /"));
-            assert!(!output.contains(" USD"));
-            assert!(output.find("gpt-example").unwrap() < output.find("claude-example").unwrap());
+        for (exact, codex, claude, codex_line, claude_line) in [
+            (
+                false,
+                1240,
+                860,
+                "  Codex   +1.2K tokens",
+                "  Claude   +860 tokens",
+            ),
+            (
+                false,
+                12_345_678,
+                -1_234_567_890,
+                "  Codex   +12.3M tokens",
+                "  Claude   -1.2G tokens",
+            ),
+            (
+                true,
+                12_345_678,
+                -1_234_567_890,
+                "  Codex     +12345678 tokens",
+                "  Claude  -1234567890 tokens",
+            ),
+        ] {
+            cli.exact = exact;
+            let activity = &mut report.monitor.as_mut().unwrap().agent_activity;
+            activity[0].window_tokens = codex;
+            activity[1].window_tokens = claude;
+            for width in [60, 100, 160] {
+                let output = linear(&cli, &report, width, false).join("\n");
+                assert!(output.contains("Interval (2s):"), "{output}");
+                assert!(output.contains(codex_line), "{output}");
+                assert!(output.contains(claude_line), "{output}");
+                assert!(!output.contains("unknown /"));
+                assert!(!output.contains(" USD"));
+                assert!(
+                    output.find("gpt-example").unwrap() < output.find("claude-example").unwrap()
+                );
+            }
         }
     }
 }

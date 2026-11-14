@@ -91,11 +91,23 @@ fn history(
     let separator = if ascii { " / " } else { " · " };
     let base = title_prefix.unwrap_or("Output tok/s");
     let title = base.to_string();
-    let statistics = if valid == 0 {
+    let mut statistics = if valid == 0 {
         format!("avg n/a{separator}peak n/a")
     } else {
         format!("avg {}{separator}peak {}", label(average), label(peak))
     };
+    let last = history
+        .iter()
+        .rev()
+        .copied()
+        .flatten()
+        .find(|rate| rate.is_finite() && *rate > 0.0)
+        .map(label)
+        .unwrap_or_else(|| "n/a".into());
+    let latest = format!("{separator}last {last}");
+    if "tok/s".width() + 1 + statistics.width() + latest.width() <= width {
+        statistics.push_str(&latest);
+    }
     let title = if title.width() + statistics.width() + 2 <= width {
         title.as_str()
     } else if base.len() + statistics.width() + 2 <= width {
@@ -116,7 +128,8 @@ fn history(
     };
     let mut lines = vec![heading];
     for row in 0..rows {
-        let tick = label(scale * ((rows - row) as f64 / rows as f64));
+        // Bottom-aligned dots share the bar origin in the zero row.
+        let tick = label(scale * ((rows - row - 1) as f64 / (rows - 1) as f64));
         let mut line = style.paint("meta", format!("{tick:>axis_width$}  "));
         for column in 0..if count == 0 { 0 } else { plot_width } {
             let index = column * count / plot_width;
@@ -131,7 +144,7 @@ fn history(
                         if ascii {
                             '.'
                         } else {
-                            '·'
+                            '⣀'
                         }
                     } else {
                         ' '
@@ -168,7 +181,7 @@ fn history(
     let gap = plot_width.saturating_sub(left.width() + "latest".len());
     lines.push(style.paint(
         "meta",
-        format!("{:>axis_width$}  {left}{}latest", "0", " ".repeat(gap)),
+        format!("{:>axis_width$}  {left}{}latest", "", " ".repeat(gap)),
     ));
     lines
 }
@@ -200,13 +213,20 @@ mod tests {
         let lines = speed_history(&info, &style, 33, 4, false);
         assert_eq!(lines.len(), 6);
         assert!(lines[0].contains("avg 5.0") && lines[0].contains("peak 10"));
-        assert!(lines[4].ends_with("······████████████??????"), "{lines:?}");
+        assert!(lines[4].ends_with("⣀⣀⣀⣀⣀⣀████████████??????"), "{lines:?}");
         assert!(lines[5].contains("4 points") && lines[5].ends_with("latest"));
         let (empty, style) = fixture(Vec::new());
         let output = speed_history(&empty, &style, 60, 4, false).join("\n");
         assert!(output.contains("Waiting for samples") && output.contains("0 points"));
         assert!(output.contains("avg n/a") && output.contains("peak n/a"));
         assert!(!output.contains('█'));
+        assert!(output.contains("peak n/a · last n/a"));
+        let (info, style) = fixture(vec![Some(10.0), Some(2.0), Some(0.0), Some(0.0)]);
+        let heading = &speed_history(&info, &style, 80, 4, false)[0];
+        assert!(heading.contains("peak 10 · last 2.0"), "{heading}");
+        let (info, style) = fixture(vec![Some(10.0), None]);
+        let heading = &speed_history(&info, &style, 80, 4, false)[0];
+        assert!(heading.contains("peak 10 · last 10"), "{heading}");
     }
 
     #[test]
