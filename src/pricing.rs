@@ -792,6 +792,43 @@ mod tests {
     }
 
     #[test]
+    fn gpt_6_2_snapshot_prices_published_tiers_and_contexts() {
+        let pricer = Pricer::load_current(None).unwrap();
+        let mut event = event();
+        event.tier = None;
+        event.usage.cache_write = Some(15_000);
+        event.cache_writes = Some(CacheWriteBreakdown {
+            by_ttl_seconds: [(1800, 10_000), (43_200, 5_000)].into(),
+            unknown_ttl: 0,
+        });
+        // Each request has 60k cached input, 10k 30-minute writes, 5k 12-hour writes,
+        // and 20k output tokens. Long-context rates apply to the entire request.
+        for (model, mode, short_cost, long_cost) in [
+            ("gpt-6.2-astra", UsageMode::Regular, "2.6", "4.800016"),
+            ("gpt-6.2-astra", UsageMode::Batch, "1.3", "2.400008"),
+            ("gpt-6.2-astra", UsageMode::Fast, "5.2", "9.600032"),
+            ("gpt-6.2-astra", UsageMode::Ultrafast, "7.8", "14.400048"),
+            ("gpt-6.2-sol", UsageMode::Regular, "0.65", "1.200004"),
+            ("gpt-6.2-sol", UsageMode::Batch, "0.325", "0.600002"),
+            ("gpt-6.2-sol", UsageMode::Fast, "1.3", "2.400008"),
+            ("gpt-6.2-sol", UsageMode::Ultrafast, "1.95", "3.600012"),
+        ] {
+            event.model = model.into();
+            event.mode = mode;
+            for (input, expected) in [(272_000, short_cost), (272_001, long_cost)] {
+                event.usage.input = input;
+                let estimate = pricer.estimate(&event);
+                assert_eq!(
+                    estimate.cost.map(|cost| cost.to_string()).as_deref(),
+                    Some(expected),
+                    "{model} {mode:?}, {input} input tokens: {estimate:?}",
+                );
+                assert_eq!(estimate.status, "priced");
+            }
+        }
+    }
+
+    #[test]
     fn claude_mixed_ttl_costs_and_missing_metadata_are_explicit() {
         let p = custom("[[rates]]\nmodel='claude-test'\nprovider='anthropic'\ninput='2'\ncached='0.2'\noutput='10'\ncache_write_mode='subset'\n[rates.cache_write_rates]\n\"300\"='2.5'\n\"3600\"='4'\n");
         let estimate = p.estimate_scenario(&claude_event(), Some("anthropic"));

@@ -1238,6 +1238,251 @@ min_input = 272001
 "1800" = "30.00"
 "43200" = "60.00"
 
+# GPT-6.2 launch rates verified on 2026-11-17 against the OpenAI API pricing page.
+# These entries use the bundle's snapshot date. The Ultrafast promotion runs
+# through 2027-02-28 (Pacific time).
+# Cache-write tokens are a subset of input:
+# https://developers.openai.com/api/docs/guides/prompt-caching
+[[rates]]
+id = "openai-2026-11-04:gpt-6.2-astra:standard:short"
+model = "gpt-6.2-astra"
+tier = "standard"
+from = "2026-11-04"
+until = "2026-11-04"
+input = "8.00"
+output = "40.00"
+cached = "0.40"
+max_input = 272000
+cache_write_mode = "subset"
+[rates.cache_write_rates]
+"1800" = "10.00"
+"43200" = "20.00"
+
+[[rates]]
+id = "openai-2026-11-04:gpt-6.2-astra:standard:long"
+model = "gpt-6.2-astra"
+tier = "standard"
+from = "2026-11-04"
+until = "2026-11-04"
+input = "16.00"
+output = "60.00"
+cached = "0.80"
+min_input = 272001
+cache_write_mode = "subset"
+[rates.cache_write_rates]
+"1800" = "20.00"
+"43200" = "40.00"
+
+[[rates]]
+id = "openai-2026-11-04:gpt-6.2-sol:standard:short"
+model = "gpt-6.2-sol"
+tier = "standard"
+from = "2026-11-04"
+until = "2026-11-04"
+input = "2.00"
+output = "10.00"
+cached = "0.10"
+max_input = 272000
+cache_write_mode = "subset"
+[rates.cache_write_rates]
+"1800" = "2.50"
+"43200" = "5.00"
+
+[[rates]]
+id = "openai-2026-11-04:gpt-6.2-sol:standard:long"
+model = "gpt-6.2-sol"
+tier = "standard"
+from = "2026-11-04"
+until = "2026-11-04"
+input = "4.00"
+output = "15.00"
+cached = "0.20"
+min_input = 272001
+cache_write_mode = "subset"
+[rates.cache_write_rates]
+"1800" = "5.00"
+"43200" = "10.00"
+
+[[rates]]
+id = "openai-2026-11-04:gpt-6.2-astra:batch:short"
+model = "gpt-6.2-astra"
+tier = "batch"
+from = "2026-11-04"
+until = "2026-11-04"
+input = "4.00"
+output = "20.00"
+cached = "0.20"
+max_input = 272000
+cache_write_mode = "subset"
+[rates.cache_write_rates]
+"1800" = "5.00"
+"43200" = "10.00"
+
+[[rates]]
+id = "openai-2026-11-04:gpt-6.2-astra:batch:long"
+model = "gpt-6.2-astra"
+tier = "batch"
+from = "2026-11-04"
+until = "2026-11-04"
+input = "8.00"
+output = "30.00"
+cached = "0.40"
+min_input = 272001
+cache_write_mode = "subset"
+[rates.cache_write_rates]
+"1800" = "10.00"
+"43200" = "20.00"
+
+[[rates]]
+id = "openai-2026-11-04:gpt-6.2-sol:batch:short"
+model = "gpt-6.2-sol"
+tier = "batch"
+from = "2026-11-04"
+until = "2026-11-04"
+input = "1.00"
+output = "5.00"
+cached = "0.05"
+max_input = 272000
+cache_write_mode = "subset"
+[rates.cache_write_rates]
+"1800" = "1.25"
+"43200" = "2.50"
+
+[[rates]]
+id = "openai-2026-11-04:gpt-6.2-sol:batch:long"
+model = "gpt-6.2-sol"
+tier = "batch"
+from = "2026-11-04"
+until = "2026-11-04"
+input = "2.00"
+output = "7.50"
+cached = "0.10"
+min_input = 272001
+cache_write_mode = "subset"
+[rates.cache_write_rates]
+"1800" = "2.50"
+"43200" = "5.00"
+
+[[rates]]
+id = "openai-2026-11-04:gpt-6.2-astra:fast:short"
+model = "gpt-6.2-astra"
+tier = "fast"
+from = "2026-11-04"
+until = "2026-11-04"
+input = "16.00"
+output = "80.00"
+cached = "0.80"
+max_input = 272000
+cache_write_mode = "subset"
+[rates.cache_write_rates]
+"1800" = "20.00"
+"43200" = "40.00"
+
+[[rates]]
+id = "openai-2026-11-04:gpt-6.2-astra:fast:long"
+model = "gpt-6.2-astra"
+tier = "fast"
+from = "2026-11-04"
+until = "2026-11-04"
+input = "32.00"
+output = "120.00"
+cached = "1.60"
+min_input = 272001
+cache_write_mode = "subset"
+[rates.cache_write_rates]
+"1800" = "40.00"
+"43200" = "80.00"
+
+[[rates]]
+id = "openai-2026-11-04:gpt-6.2-sol:fast:short"
+model = "gpt-6.2-sol"
+tier = "fast"
+from = "2026-11-04"
+until = "2026-11-04"
+input = "4.00"
+output = "20.00"
+cached = "0.20"
+max_input = 272000
+cache_write_mode = "subset"
+[rates.cache_write_rates]
+"1800" = "5.00"
+"43200" = "10.00"
+
+[[rates]]
+id = "openai-2026-11-04:gpt-6.2-sol:fast:long"
+model = "gpt-6.2-sol"
+tier = "fast"
+from = "2026-11-04"
+until = "2026-11-04"
+input = "8.00"
+output = "30.00"
+cached = "0.40"
+min_input = 272001
+cache_write_mode = "subset"
+[rates.cache_write_rates]
+"1800" = "10.00"
+"43200" = "20.00"
+
+[[rates]]
+id = "openai-2026-11-04:gpt-6.2-astra:ultrafast:short"
+model = "gpt-6.2-astra"
+tier = "ultrafast"
+from = "2026-11-04"
+until = "2026-11-04"
+input = "24.00"
+output = "120.00"
+cached = "1.20"
+max_input = 272000
+cache_write_mode = "subset"
+[rates.cache_write_rates]
+"1800" = "30.00"
+"43200" = "60.00"
+
+[[rates]]
+id = "openai-2026-11-04:gpt-6.2-astra:ultrafast:long"
+model = "gpt-6.2-astra"
+tier = "ultrafast"
+from = "2026-11-04"
+until = "2026-11-04"
+input = "48.00"
+output = "180.00"
+cached = "2.40"
+min_input = 272001
+cache_write_mode = "subset"
+[rates.cache_write_rates]
+"1800" = "60.00"
+"43200" = "120.00"
+
+[[rates]]
+id = "openai-2026-11-04:gpt-6.2-sol:ultrafast:short"
+model = "gpt-6.2-sol"
+tier = "ultrafast"
+from = "2026-11-04"
+until = "2026-11-04"
+input = "6.00"
+output = "30.00"
+cached = "0.30"
+max_input = 272000
+cache_write_mode = "subset"
+[rates.cache_write_rates]
+"1800" = "7.50"
+"43200" = "15.00"
+
+[[rates]]
+id = "openai-2026-11-04:gpt-6.2-sol:ultrafast:long"
+model = "gpt-6.2-sol"
+tier = "ultrafast"
+from = "2026-11-04"
+until = "2026-11-04"
+input = "12.00"
+output = "45.00"
+cached = "0.60"
+min_input = 272001
+cache_write_mode = "subset"
+[rates.cache_write_rates]
+"1800" = "15.00"
+"43200" = "30.00"
+
 # Anthropic rates verified 2026-11-10 at
 # https://platform.claude.com/docs/en/about-claude/pricing and the prompt-caching
 # price table. Pinned to this bundle's snapshot date like the OpenAI entries.
