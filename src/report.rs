@@ -1,6 +1,6 @@
 use crate::{
     cli::{Cli, Command, Group, Sort},
-    model::{AgentKind, Coverage, Scan, SessionKey, SourceStatus, UsageEvent},
+    model::{AgentKind, Coverage, MessageTiming, Scan, SessionKey, SourceStatus, UsageEvent},
     pricing::{Estimate, Pricer},
 };
 use anyhow::{anyhow, bail, Context, Result};
@@ -302,16 +302,30 @@ pub struct SessionSpeed {
     pub session: SessionKey,
     pub output_tokens_per_second: f64,
 }
+/// An estimate from the most recent completed message with recorded timing.
+#[derive(Debug, Clone, Serialize)]
+pub struct MessageSpeed {
+    pub completed_at: DateTime<Utc>,
+    pub tokens_per_second: f64,
+}
 /// Per-agent throughput and rolling chart history. Agents are measured
 /// independently; their token deltas are never added to each other's series.
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentActivity {
     pub agent: AgentKind,
+    pub last_message_speed: Option<MessageSpeed>,
+    /// Rate estimated from overlapping completed outputs in each refresh-width bin.
+    pub estimated_output_speed_history: Vec<Option<f64>>,
+    /// Logged output throughput for bins where no timing estimate is available.
+    pub fallback_output_speed_history: Vec<Option<f64>>,
+    /// Output tokens at their recorded timestamps on the same time grid as the estimates.
+    pub logged_output_tokens_history: Vec<u64>,
     pub window_cost_usd: Option<Decimal>,
     pub cost_partial: bool,
     pub average_session_output_tokens_per_second: f64,
     pub since_ready_tokens: i128,
     pub window_tokens: i128,
+    pub window_output_tokens: i128,
     pub output_tokens_per_second: f64,
     pub output_speed_history: Vec<Option<f64>>,
     pub output_speed_window_seconds: u64,
@@ -423,13 +437,46 @@ impl Selection {
 }
 pub fn matches(cli: &Cli, period: &Period, event: &UsageEvent, selection: &Selection) -> bool {
     period.includes(event.timestamp)
-        && (cli.models.is_empty() || cli.models.contains(&event.model))
-        && cli.mode.is_none_or(|mode| mode.as_str() == event.mode())
-        && (!selection.sessions_requested || selection.sessions.contains(&event.session))
-        && (!selection.command_requested || selection.command.as_ref() == Some(&event.session))
+        && matches_activity(
+            cli,
+            selection,
+            &event.session,
+            &event.model,
+            event.mode(),
+            event.project.as_deref(),
+        )
+}
+pub(crate) fn matches_message(
+    cli: &Cli,
+    period: &Period,
+    message: &MessageTiming,
+    selection: &Selection,
+) -> bool {
+    period.includes(message.completed_at)
+        && matches_activity(
+            cli,
+            selection,
+            &message.session,
+            &message.model,
+            message.mode.as_str(),
+            message.project.as_deref(),
+        )
+}
+fn matches_activity(
+    cli: &Cli,
+    selection: &Selection,
+    session: &SessionKey,
+    model: &str,
+    mode: &str,
+    project: Option<&str>,
+) -> bool {
+    (cli.models.is_empty() || cli.models.iter().any(|m| m == model))
+        && cli.mode.is_none_or(|selected| selected.as_str() == mode)
+        && (!selection.sessions_requested || selection.sessions.contains(session))
+        && (!selection.command_requested || selection.command.as_ref() == Some(session))
         && (cli.projects.is_empty()
             || cli.projects.iter().any(|p| {
-                event.project.as_ref().is_some_and(|path| {
+                project.is_some_and(|path| {
                     let normalized = path.replace('\\', "/");
                     normalized == p.replace('\\', "/")
                         || normalized.trim_end_matches('/').rsplit('/').next() == Some(p.as_str())

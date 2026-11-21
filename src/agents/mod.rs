@@ -7,7 +7,9 @@ pub mod codex_conversation;
 
 use crate::{
     cancel,
-    model::{AgentKind, Coverage, EventKey, SessionInfo, SessionKey, Source, UsageEvent},
+    model::{
+        AgentKind, Coverage, EventKey, MessageTiming, SessionInfo, SessionKey, Source, UsageEvent,
+    },
 };
 use anyhow::Result;
 use std::{
@@ -118,6 +120,7 @@ pub enum ParsedFileSnapshot {
 #[derive(Debug)]
 pub struct AgentScan {
     pub events: Vec<UsageEvent>,
+    pub message_timings: Vec<MessageTiming>,
     pub observed_event_ids: BTreeSet<EventKey>,
     pub sessions: BTreeMap<SessionKey, SessionInfo>,
     pub coverage: Coverage,

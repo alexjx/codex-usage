@@ -223,7 +223,7 @@ agent-usage monitor --agent claude-code
 
 Monitor always summarizes **today**, in the selected timezone. It measures **Codex and Claude Code separately**:
 
-- Each selected agent gets its own output-throughput chart, chart history, current speed, and token delta.
+- Each selected agent gets its own estimated output-speed chart and token delta.
 - The model table separates agents and providers.
 - The per-session 60-second average remains independent.
 
@@ -232,12 +232,13 @@ The screen places today's summary and live rates at the top, then the agent char
 | Indicator | What it measures |
 | --- | --- |
 | `Today 00:00:00–HH:MM:SS` | Tokens and estimated cost from local midnight through the latest snapshot |
-| `2s: +… tokens / +… USD` | Net changes since the previous refresh; `2s` follows `--interval` |
-| Chart output | Each agent's output over an independent **2-second** sliding window |
+| `2s: +… tokens / +… output / +… USD` | Net changes in total tokens, output tokens, and estimated cost since the previous refresh; `2s` follows `--interval` |
+| `Codex ~output tok/s` | Output tokens divided by elapsed time from a logged turn start, matched tool results, or recorded inter-agent input to recorded response usage. Visible-text timing supplies estimates when only a message's duration is available. |
+| `Claude ~request tok/s` | Output tokens divided by the elapsed time from the matching API request to its last recorded assistant block, including first-output latency |
 
-Charts open with up to **180 points** reconstructed from today's already-loaded records—about six minutes at the default 2s interval. Historical points use logged timestamps; live points use observed arrivals. Dots show zero; `?` marks unavailable data. Midnight resets totals and chart history.
+Charts show up to **180 time bins** reconstructed from today's records, about six minutes at the default 2s interval. The horizontal labels show elapsed time up to `now` for the bins visible at the current terminal width. A completed output fills the bins it overlaps at the rate estimated from its own duration. Each bin averages concurrent outputs by their active time. When a bin has logged output and lacks a timed estimate, its bar shows observed output throughput over the trailing 10 seconds or one bin, whichever is longer. Newly completed outputs can fill earlier bins. Bars sit above a continuous zero line. Midnight resets totals and chart history.
 
-Logs can arrive in batches, so speeds describe observed throughput rather than exact streaming generation speed. Recovered backlog and corrections can change token/cost deltas but are excluded from fresh-output speed. A complete source outage creates a chart gap and restarts smoothing on recovery.
+JSONL exposes the timing-based rates, fallback throughput, and logged counts in `monitor.agent_activity[].estimated_output_speed_history`, `fallback_output_speed_history`, and `logged_output_tokens_history`. A `null` rate means that series has no value for the bin. `monitor.window_seconds` is the bin width and `window_output_tokens` gives each agent's signed output delta. The Codex `last_message_speed` field gives the latest visible-text estimate and completion timestamp.
 
 The default refresh is `2s`; `--interval` accepts seconds or milliseconds from `1s` to `3600s`. Historical date options such as `--last` belong to reports and are rejected by monitor.
 

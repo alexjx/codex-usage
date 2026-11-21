@@ -11,8 +11,8 @@ use super::{note, AgentScan, DiscoveredFile, FileHint, ParsedFileSnapshot, Recor
 use crate::{
     cancel,
     model::{
-        AgentKind, CacheWriteBreakdown, Coverage, EventKey, SessionFile, SessionInfo, SessionKey,
-        Usage, UsageEvent, UsageMode,
+        AgentKind, CacheWriteBreakdown, Coverage, EventKey, MessageTiming, SessionFile,
+        SessionInfo, SessionKey, Usage, UsageEvent, UsageMode,
     },
 };
 use anyhow::{Context, Result};
@@ -32,6 +32,8 @@ use walkdir::WalkDir;
 struct Record {
     #[serde(rename = "type")]
     kind: Option<String>,
+    id: Option<Value>,
+    request_ref: Option<Value>,
     session_id: Option<String>,
     agent_id: Option<String>,
     timestamp: Option<String>,
@@ -66,6 +68,13 @@ pub(crate) struct Candidate {
     pub(crate) file: PathBuf,
     pub(crate) session: SessionKey,
     owner_conflict: bool,
+    request: Option<RequestTiming>,
+}
+
+#[derive(Clone)]
+struct RequestTiming {
+    id: String,
+    started_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone)]
@@ -76,6 +85,7 @@ pub(crate) struct Parser {
     execution: Option<String>,
     pub(crate) coverage: Coverage,
     candidates: Vec<Candidate>,
+    request_starts: BTreeMap<String, Option<DateTime<Utc>>>,
     sessions: BTreeMap<SessionKey, SessionInfo>,
     inferred_owner_reported: bool,
 }
@@ -266,6 +276,7 @@ impl Parser {
             execution,
             coverage: Coverage::default(),
             candidates: Vec::new(),
+            request_starts: BTreeMap::new(),
             sessions,
             inferred_owner_reported: false,
         }
@@ -314,6 +325,23 @@ impl Parser {
                 return;
             }
         };
+        if record.kind.as_deref() == Some("api-request") {
+            if let (Some(id), Some(timestamp)) = (as_string(record.id.as_ref()), record.timestamp())
+            {
+                if !id.is_empty() {
+                    // A request ID with contradictory starts cannot supply a duration.
+                    self.request_starts
+                        .entry(id)
+                        .and_modify(|start| {
+                            if *start != Some(timestamp) {
+                                *start = None;
+                            }
+                        })
+                        .or_insert(Some(timestamp));
+                }
+            }
+            return;
+        }
         if record.kind.as_deref() != Some("assistant") {
             return;
         }
@@ -373,6 +401,7 @@ impl Parser {
                 file: self.path.clone(),
                 session,
                 owner_conflict,
+                request: None,
             });
             self.problem(at, "Assistant usage lacks message.usage", false);
             return;
@@ -385,6 +414,7 @@ impl Parser {
                 file: self.path.clone(),
                 session,
                 owner_conflict,
+                request: None,
             });
             self.problem(
                 at,
@@ -400,17 +430,14 @@ impl Parser {
                 false,
             );
         }
-        let Some(timestamp) = record
-            .timestamp
-            .as_deref()
-            .and_then(|text| text.parse::<DateTime<Utc>>().ok())
-        else {
+        let Some(timestamp) = record.timestamp() else {
             self.candidates.push(Candidate {
                 id: Some(key),
                 event: None,
                 file: self.path.clone(),
                 session,
                 owner_conflict,
+                request: None,
             });
             self.problem(at, "Assistant usage record has no valid timestamp", false);
             return;
@@ -453,6 +480,12 @@ impl Parser {
             file: self.path.clone(),
             session,
             owner_conflict,
+            request: as_string(record.request_ref.as_ref())
+                .filter(|id| !id.is_empty())
+                .map(|id| RequestTiming {
+                    id,
+                    started_at: None,
+                }),
         });
     }
 
@@ -468,10 +501,22 @@ impl Parser {
     }
 
     pub(crate) fn snapshot(&self) -> Snapshot {
+        let mut candidates = self.candidates.clone();
+        for candidate in &mut candidates {
+            if let Some(request) = &mut candidate.request {
+                request.started_at = self.request_starts.get(&request.id).copied().flatten();
+            }
+        }
         Snapshot {
-            candidates: self.candidates.clone(),
+            candidates,
             sessions: self.sessions.clone(),
         }
+    }
+}
+
+impl Record {
+    fn timestamp(&self) -> Option<DateTime<Utc>> {
+        self.timestamp.as_deref()?.parse().ok()
     }
 }
 
@@ -506,6 +551,73 @@ impl Diagnostics {
             touch(self.per_source.entry(source.clone()).or_default());
         }
         note(&mut self.global, message);
+    }
+}
+
+fn append_message_timings(
+    timings: &mut Vec<MessageTiming>,
+    message: &UsageEvent,
+    fragments: &[&Candidate],
+) {
+    if message.usage.output == 0 {
+        return;
+    }
+
+    struct RequestWindow<'a> {
+        id: &'a str,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    }
+
+    let mut by_source = BTreeMap::new();
+    for fragment in fragments {
+        let Some(request) = &fragment.request else {
+            continue;
+        };
+        let Some(start) = request.started_at else {
+            continue;
+        };
+        let event = fragment
+            .event
+            .as_ref()
+            .expect("usable fragment has an event");
+        if event.timestamp <= start {
+            continue;
+        }
+        let window = by_source.entry(event.source.as_str()).or_insert_with(|| {
+            Some(RequestWindow {
+                id: request.id.as_str(),
+                start,
+                end: event.timestamp,
+            })
+        });
+        if let Some(current) = window {
+            if current.id == request.id && current.start == start {
+                current.end = current.end.max(event.timestamp);
+            } else {
+                // Copies can improve the end time only when they establish the same request.
+                *window = None;
+            }
+        }
+    }
+
+    for (source, window) in by_source {
+        let Some(window) = window else { continue };
+        let duration_ms = (window.end - window.start).num_milliseconds() as u64;
+        if duration_ms > 0 {
+            timings.push(MessageTiming {
+                id: Some(message.id.native_id.clone()),
+                basis: crate::model::TimingBasis::Request,
+                session: message.session.clone(),
+                completed_at: window.end,
+                duration_ms,
+                content_tokens: message.usage.output,
+                model: message.model.clone(),
+                mode: message.mode,
+                project: message.project.clone(),
+                source: source.to_owned(),
+            });
+        }
     }
 }
 
@@ -574,6 +686,7 @@ pub(crate) fn reconcile(
         }
     }
     let mut events = Vec::new();
+    let mut message_timings = Vec::new();
     for (id, group) in groups {
         cancel::check(stopped)?;
         let origins: BTreeSet<String> = group
@@ -691,11 +804,13 @@ pub(crate) fn reconcile(
         }
         merged.origins.insert(merged.source.clone());
         diagnostics.duplicate(&origins, usable.len().saturating_sub(1));
+        append_message_timings(&mut message_timings, &merged, &usable);
         events.push(merged);
     }
     events.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then_with(|| a.id.cmp(&b.id)));
     Ok(AgentScan {
         events,
+        message_timings,
         observed_event_ids,
         sessions,
         coverage: diagnostics.global,
@@ -768,6 +883,104 @@ mod tests {
                 "cache_creation_input_tokens":write,"output_tokens":output
             }}
         })
+    }
+
+    fn request_record(id: &str, timestamp: &str) -> Value {
+        serde_json::json!({"type":"api-request", "id":id, "timestamp":timestamp})
+    }
+
+    fn request_fragment(id: &str, request: &str, timestamp: &str, output: u64) -> Value {
+        let mut record = assistant(id, "session-1", timestamp, 10, 0, 0, output);
+        record["requestRef"] = serde_json::json!(request);
+        record
+    }
+
+    fn request_parser(source: &str) -> Parser {
+        Parser::new(
+            source,
+            &DiscoveredFile {
+                path: "project/session-1.jsonl".into(),
+                hint: FileHint::ClaudeMain {
+                    session_id: "session-1".into(),
+                },
+            },
+        )
+    }
+
+    fn ingest_requests(parser: &mut Parser, records: &[Value]) {
+        let path = parser.path.clone();
+        for (index, record) in records.iter().enumerate() {
+            parser.ingest(
+                record.to_string().as_bytes(),
+                RecordLocation {
+                    path: &path,
+                    line: index as u64 + 1,
+                },
+            );
+        }
+    }
+
+    fn reconcile_requests(parsers: &[&Parser]) -> AgentScan {
+        let snapshots: Vec<_> = parsers
+            .iter()
+            .map(|parser| ParsedFileSnapshot::ClaudeCode(Box::new(parser.snapshot())))
+            .collect();
+        reconcile(&snapshots, &AtomicBool::new(false)).unwrap()
+    }
+
+    #[test]
+    fn request_rate_uses_one_token_count_and_last_fragment_for_each_source() {
+        let mut local = request_parser("local");
+        let start = request_record("req-a", "2026-11-01T10:00:00Z");
+        let first = request_fragment("msg-a", "req-a", "2026-11-01T10:00:01Z", 100);
+        let last = request_fragment("msg-a", "req-a", "2026-11-01T10:00:04Z", 100);
+        // Out-of-order records converge once both parts of the join are present.
+        ingest_requests(&mut local, &[first.clone()]);
+        assert!(reconcile_requests(&[&local]).message_timings.is_empty());
+        ingest_requests(&mut local, &[start.clone(), last]);
+
+        let mut mirror = request_parser("mirror");
+        ingest_requests(&mut mirror, &[start, first]);
+        let scan = reconcile_requests(&[&local, &mirror, &local]);
+        assert_eq!(scan.events.len(), 1);
+        assert_eq!(scan.events[0].usage.output, 100);
+        assert_eq!(
+            scan.events[0].timestamp,
+            "2026-11-01T10:00:01Z".parse::<DateTime<Utc>>().unwrap()
+        );
+        assert_eq!(scan.message_timings.len(), 2);
+        for (timing, source, duration_ms) in [
+            (&scan.message_timings[0], "local", 4_000),
+            (&scan.message_timings[1], "mirror", 1_000),
+        ] {
+            assert_eq!(timing.id.as_deref(), Some("message:msg-a"));
+            assert_eq!(timing.source, source);
+            assert_eq!(timing.duration_ms, duration_ms);
+            assert_eq!(timing.content_tokens, 100);
+        }
+    }
+
+    #[test]
+    fn unverified_request_timing_keeps_usage_without_creating_a_speed_sample() {
+        let mut parser = request_parser("local");
+        let mut old = assistant("msg-old", "session-1", "2026-11-01T10:00:03Z", 10, 0, 0, 10);
+        old["requestRef"] = serde_json::json!({"legacy":true});
+        ingest_requests(
+            &mut parser,
+            &[
+                old,
+                request_record("req-conflict", "2026-11-01T10:00:00Z"),
+                request_record("req-conflict", "2026-11-01T10:00:01Z"),
+                request_fragment("msg-conflict", "req-conflict", "2026-11-01T10:00:02Z", 10),
+                request_record("req-inverted", "2026-11-01T10:00:04Z"),
+                request_fragment("msg-inverted", "req-inverted", "2026-11-01T10:00:03Z", 10),
+                request_fragment("msg-missing", "req-missing", "2026-11-01T10:00:03Z", 10),
+            ],
+        );
+        let scan = reconcile_requests(&[&parser]);
+        assert_eq!(scan.events.len(), 4);
+        assert!(scan.message_timings.is_empty());
+        assert_eq!(scan.coverage.malformed, 0);
     }
 
     #[test]

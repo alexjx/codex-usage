@@ -1026,13 +1026,17 @@ fn monitor_activity_label_and_metadata_follow_the_configured_interval() {
                     "{text}"
                 );
                 assert!(
-                    !text.contains("Output tok/s"),
+                    !text.contains("tok/s"),
                     "Linear snapshots should not contain a fullscreen chart"
                 );
             } else {
                 let report: Value = serde_json::from_slice(&output.stdout).unwrap();
                 assert_eq!(report["monitor"]["window_seconds"], seconds);
                 assert_eq!(report["monitor"]["sample_seconds"], 0.0);
+                assert_eq!(
+                    report["monitor"]["agent_activity"][0]["last_message_speed"],
+                    Value::Null
+                );
                 assert_eq!(
                     report["monitor"]["output_speed_history"]
                         .as_array()
@@ -1048,16 +1052,26 @@ fn monitor_activity_label_and_metadata_follow_the_configured_interval() {
 #[test]
 fn monitor_reads_real_appends_and_defers_partial_records_without_counting_history_as_speed() {
     let f = Fixture::new();
+    let message = |id: &str, completed: chrono::DateTime<Utc>, tokens: u64| {
+        json!({"type":"event_msg","timestamp":completed.to_rfc3339(),"payload":{
+            "type":"item_completed","thread_id":"live-session","turn_id":"live-turn",
+            "item":{"type":"AgentMessage","id":id},"content_token_count":tokens,
+            "started_at_ms":completed.timestamp_millis() - 2500,
+            "completed_at_ms":completed.timestamp_millis()
+        }})
+    };
+    let initial_completion = Utc::now();
     let file = f.write(
         "live",
         vec![
             metadata("live-session"),
             context("live-turn", "alpha"),
+            message("old-message", initial_completion, 100),
             usage(
                 "live-session",
                 "live-turn",
                 "old-response",
-                &Utc::now().to_rfc3339(),
+                &initial_completion.to_rfc3339(),
                 100,
                 20,
                 30,
@@ -1072,7 +1086,7 @@ fn monitor_reads_real_appends_and_defers_partial_records_without_counting_histor
             "--format",
             "jsonl",
             "--frames",
-            "3",
+            "4",
             "--interval",
             "1s",
         ])
@@ -1088,6 +1102,8 @@ fn monitor_reads_real_appends_and_defers_partial_records_without_counting_histor
     let mut line = String::new();
     reader.read_line(&mut line).unwrap();
     let baseline: Value = serde_json::from_str(&line).unwrap();
+    let baseline_speed = &baseline["monitor"]["agent_activity"][0]["last_message_speed"];
+    assert_eq!(baseline_speed["tokens_per_second"], 40.0);
     assert_eq!(baseline["totals"]["total"], 130);
     assert_eq!(baseline["monitor"]["output_tokens_per_second"], 0.0);
     assert_eq!(
@@ -1105,17 +1121,20 @@ fn monitor_reads_real_appends_and_defers_partial_records_without_counting_histor
         baseline["monitor"]["session_output_tokens_per_second"],
         json!([])
     );
-    let append = usage(
+    let new_completion = Utc::now();
+    let completed_message = message("new-message", new_completion, 105).to_string();
+    let new_usage = usage(
         "live-session",
         "live-turn",
         "new-response",
-        &Utc::now().to_rfc3339(),
+        &new_completion.to_rfc3339(),
         20,
         0,
         5,
     )
     .to_string();
-    let middle = append.len() / 2;
+    let middle = completed_message.len() / 2;
+    let append = format!("{completed_message}\n{new_usage}");
     let mut writer = OpenOptions::new().append(true).open(&file).unwrap();
     writer.write_all(&append.as_bytes()[..middle]).unwrap();
     writer.flush().unwrap();
@@ -1123,6 +1142,14 @@ fn monitor_reads_real_appends_and_defers_partial_records_without_counting_histor
     reader.read_line(&mut line).unwrap();
     let partial: Value = serde_json::from_str(&line).unwrap();
     assert_eq!(partial["totals"]["total"], 130);
+    let partial_agent = &partial["monitor"]["agent_activity"][0];
+    assert_eq!(partial_agent["window_tokens"], 0);
+    assert_eq!(partial_agent["window_output_tokens"], 0);
+    assert_eq!(partial_agent["since_ready_tokens"], 0);
+    assert_eq!(
+        &partial["monitor"]["agent_activity"][0]["last_message_speed"],
+        baseline_speed
+    );
     assert!(partial["coverage"]["pending"].as_u64().unwrap() > 0);
     assert_eq!(
         partial["monitor"]["average_session_output_tokens_per_second"],
@@ -1139,7 +1166,7 @@ fn monitor_reads_real_appends_and_defers_partial_records_without_counting_histor
     }
     let output = child.wait_with_output().unwrap();
     success(&output);
-    let last = snapshots.last().unwrap();
+    let last = &snapshots[2];
     assert_eq!(last["totals"]["total"], 155);
     assert_eq!(last["monitor"]["since_ready_tokens"], 25);
     assert_eq!(last["monitor"]["window_tokens"], 25);
@@ -1152,6 +1179,29 @@ fn monitor_reads_real_appends_and_defers_partial_records_without_counting_histor
     assert!((history.last().unwrap().as_f64().unwrap() - 5.0 / 2.0).abs() < 1e-9);
     assert_eq!(last["monitor"]["output_speed_window_seconds"], 2);
     let monitor = &last["monitor"];
+    let codex = &monitor["agent_activity"][0];
+    assert_eq!(codex["since_ready_tokens"], 25);
+    assert_eq!(codex["window_tokens"], 25);
+    assert_eq!(codex["window_output_tokens"], 5);
+    let logged: u64 = codex["logged_output_tokens_history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|bin| bin.as_u64().unwrap())
+        .sum();
+    assert_eq!(logged, 35);
+    let speed = &monitor["agent_activity"][0]["last_message_speed"];
+    assert_eq!(speed["tokens_per_second"], 42.0);
+    assert_eq!(
+        speed["completed_at"],
+        json!(
+            chrono::DateTime::<Utc>::from_timestamp_millis(new_completion.timestamp_millis())
+                .unwrap()
+        )
+    );
+    let idle = &snapshots[3]["monitor"];
+    assert_eq!(idle["output_tokens_per_second"], 0.0);
+    assert_eq!(&idle["agent_activity"][0]["last_message_speed"], speed);
     assert_eq!(monitor["session_speed_window_seconds"], 60);
     assert!(
         monitor["average_session_output_tokens_per_second"]
@@ -1181,6 +1231,254 @@ fn monitor_reads_real_appends_and_defers_partial_records_without_counting_histor
         .unwrap()
         > 0.0));
     assert_eq!(f.json(&["models"])["totals"]["total"], 155);
+}
+
+#[test]
+fn monitor_plots_logged_throughput_when_legacy_codex_output_has_no_timing() {
+    let f = Fixture::new();
+    let path = f.write("live", vec![metadata("session"), context("turn", "alpha")]);
+    let mut child = f
+        .command()
+        .args([
+            "monitor",
+            "--agent",
+            "codex",
+            "--no-cost",
+            "--format",
+            "jsonl",
+            "--frames",
+            "2",
+            "--interval",
+            "1s",
+            "--root",
+        ])
+        .arg(&f.root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let baseline: Value = serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
+    assert_eq!(baseline["totals"]["output"], 0);
+
+    let usage_record = legacy(&Utc::now().to_rfc3339(), 395_583, 717);
+    let mut writer = OpenOptions::new().append(true).open(path).unwrap();
+    writeln!(writer, "{usage_record}").unwrap();
+    writer.flush().unwrap();
+
+    let refresh: Value = serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
+    success(&child.wait_with_output().unwrap());
+    let codex = &refresh["monitor"]["agent_activity"][0];
+    assert_eq!(codex["window_tokens"], 396_300);
+    assert_eq!(codex["window_output_tokens"], 717);
+    assert!(codex["estimated_output_speed_history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(Value::is_null));
+    let plotted: Vec<_> = codex["fallback_output_speed_history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_f64)
+        .collect();
+    assert_eq!(plotted, [71.7]);
+}
+
+#[test]
+fn monitor_does_not_count_a_delayed_codex_compatibility_record_as_new_output() {
+    let f = Fixture::new();
+    let now = Utc::now();
+    let request_completed = now - chrono::Duration::seconds(5);
+    let mut request = usage(
+        "session",
+        "turn",
+        "response",
+        &request_completed.to_rfc3339(),
+        273_655,
+        270_336,
+        371,
+    );
+    let counters = request["payload"]["usage"].clone();
+    request["payload"]["thread_token_usage"] = counters.clone();
+    let path = f.write(
+        "live",
+        vec![metadata("session"), context("turn", "alpha"), request],
+    );
+    let seconds_today =
+        (now - now.date_naive().and_hms_opt(0, 0, 0).unwrap().and_utc()).num_seconds();
+    let timezone = if (10..86_390).contains(&seconds_today) {
+        "UTC"
+    } else {
+        "Pacific/Honolulu"
+    };
+    let mut child = f
+        .command()
+        .args([
+            "monitor",
+            "--agent",
+            "codex",
+            "--no-cost",
+            "--format",
+            "jsonl",
+            "--frames",
+            "2",
+            "--interval",
+            "1s",
+            "--timezone",
+            timezone,
+            "--root",
+        ])
+        .arg(&f.root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let baseline: Value = serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
+    assert_eq!(baseline["totals"]["output"], 371);
+
+    let compatibility = json!({"type":"event_msg","timestamp":Utc::now().to_rfc3339(),
+    "payload":{"type":"token_count","info":{
+        "total_token_usage":counters,"last_token_usage":counters
+    }}});
+    let mut writer = OpenOptions::new().append(true).open(path).unwrap();
+    writeln!(writer, "{compatibility}").unwrap();
+    writer.flush().unwrap();
+
+    let refresh: Value = serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
+    success(&child.wait_with_output().unwrap());
+    assert_eq!(refresh["totals"]["output"], 371);
+    assert_eq!(refresh["monitor"]["window_tokens"], 0);
+    let codex = &refresh["monitor"]["agent_activity"][0];
+    assert_eq!(codex["window_output_tokens"], 0);
+    assert_eq!(codex["output_tokens_per_second"], 0.0);
+}
+
+#[test]
+fn monitor_estimates_speed_charts_for_both_agents_from_their_logs() {
+    let f = Fixture::new();
+    let now = Utc::now();
+    let completed = now - chrono::Duration::seconds(1);
+    let started = completed - chrono::Duration::seconds(10);
+    let first_response = started + chrono::Duration::seconds(4);
+    let visible_completed = first_response - chrono::Duration::seconds(1);
+    let next_input = first_response + chrono::Duration::seconds(1);
+    f.write(
+        "codex-session",
+        vec![
+            metadata("codex-session"),
+            json!({"type":"event_msg","timestamp":started.to_rfc3339(),"payload":{
+                "type":"task_started","turn_id":"turn","started_at":started.timestamp()
+            }}),
+            context("turn", "alpha"),
+            json!({"type":"event_msg","timestamp":visible_completed.to_rfc3339(),"payload":{
+                "type":"item_completed","thread_id":"codex-session","turn_id":"turn",
+                "item":{"type":"AgentMessage","id":"message"},"content_token_count":100,
+                "started_at_ms":visible_completed.timestamp_millis() - 1000,
+                "completed_at_ms":visible_completed.timestamp_millis()
+            }}),
+            usage(
+                "codex-session",
+                "turn",
+                "response",
+                &first_response.to_rfc3339(),
+                100,
+                0,
+                160,
+            ),
+            json!({"type":"inter_agent_communication_metadata","timestamp":next_input.to_rfc3339(),"payload":{
+                "trigger_turn":false
+            }}),
+            json!({"type":"response_item","timestamp":next_input.to_rfc3339(),"payload":{
+                "type":"agent_message","author":"/root/worker","recipient":"/root",
+                "internal_chat_message_metadata_passthrough":{"turn_id":"turn"}
+            }}),
+            usage(
+                "codex-session",
+                "turn",
+                "continuation",
+                &completed.to_rfc3339(),
+                100,
+                0,
+                200,
+            ),
+        ],
+    );
+    let claude = f._dir.path().join("claude");
+    fs::create_dir_all(claude.join("projects/p")).unwrap();
+    let assistant = |timestamp: chrono::DateTime<Utc>| {
+        json!({"type":"assistant","sessionId":"claude-session","requestRef":"request",
+            "timestamp":timestamp.to_rfc3339(),"message":{"id":"message","model":"beta",
+                "usage":{"input_tokens":10,"cache_read_input_tokens":0,
+                    "cache_creation_input_tokens":0,"output_tokens":700}}})
+    };
+    let request = json!({"type":"api-request","sessionId":"claude-session","id":"request",
+        "timestamp":started.to_rfc3339()});
+    let first = assistant(started + chrono::Duration::seconds(4));
+    let last = assistant(completed);
+    fs::write(
+        claude.join("projects/p/claude-session.jsonl"),
+        format!("{request}\n{first}\n{last}\n"),
+    )
+    .unwrap();
+    fs::create_dir_all(f.config.parent().unwrap()).unwrap();
+    fs::write(
+        &f.config,
+        format!(
+            "version=2\n[[sources]]\nname='codex'\nagent='codex'\nkind='linux'\nroot='{}'\n[[sources]]\nname='claude'\nagent='claude-code'\nkind='linux'\nroot='{}'\n",
+            f.root.display(),
+            claude.display()
+        ),
+    )
+    .unwrap();
+    let timezone =
+        if (now - now.date_naive().and_hms_opt(0, 0, 0).unwrap().and_utc()).num_seconds() < 20 {
+            "Pacific/Honolulu"
+        } else {
+            "UTC"
+        };
+    let output = f.run(&[
+        "monitor",
+        "--source",
+        "codex",
+        "--source",
+        "claude",
+        "--timezone",
+        timezone,
+        "--no-cost",
+        "--format",
+        "jsonl",
+        "--frames",
+        "1",
+    ]);
+    success(&output);
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let agents = report["monitor"]["agent_activity"].as_array().unwrap();
+    assert_eq!(agents.len(), 2);
+    for (name, rate) in [("codex", 40.0), ("claude-code", 70.0)] {
+        let agent = agents.iter().find(|agent| agent["agent"] == name).unwrap();
+        let history = agent["estimated_output_speed_history"].as_array().unwrap();
+        let plotted: Vec<_> = history.iter().filter_map(Value::as_f64).collect();
+        assert!(plotted.len() >= 5, "{name}: {plotted:?}");
+        assert!(
+            plotted.iter().all(|value| (value - rate).abs() < 1e-9),
+            "{name}: {plotted:?}"
+        );
+        assert_eq!(agent["output_tokens_per_second"], 0.0);
+    }
+    assert_eq!(report["totals"]["output"], 1060);
+    let continuation_bin = agents[0]["logged_output_tokens_history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|bin| *bin == 200)
+        .unwrap();
+    let rate = agents[0]["estimated_output_speed_history"][continuation_bin]
+        .as_f64()
+        .unwrap();
+    assert!((rate - 40.0).abs() < 1e-9);
+    assert_eq!(agents[0]["last_message_speed"]["tokens_per_second"], 100.0);
 }
 
 fn recorded_mode(time: &str, tier: Option<&str>) -> Value {

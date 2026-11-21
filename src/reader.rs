@@ -232,6 +232,7 @@ impl Reader {
             }
             let AgentScan {
                 events,
+                message_timings,
                 observed_event_ids,
                 sessions,
                 coverage,
@@ -239,6 +240,7 @@ impl Reader {
             } = agents::reconcile(agent, &files, &self.stopped)?;
             add_coverage(&mut scan.coverage, &coverage);
             scan.events.extend(events);
+            scan.message_timings.extend(message_timings);
             scan.observed_event_ids.extend(observed_event_ids);
             for (key, info) in sessions {
                 scan.sessions

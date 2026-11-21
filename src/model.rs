@@ -372,6 +372,40 @@ impl UsageEvent {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TimingBasis {
+    #[default]
+    VisibleText,
+    Request,
+}
+
+/// A completed assistant output with a token count and a log-derived time span.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageTiming {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub basis: TimingBasis,
+    pub session: SessionKey,
+    pub completed_at: DateTime<Utc>,
+    pub duration_ms: u64,
+    pub content_tokens: u64,
+    pub model: String,
+    pub mode: UsageMode,
+    pub project: Option<String>,
+    pub source: String,
+}
+impl MessageTiming {
+    pub fn started_at(&self) -> DateTime<Utc> {
+        self.completed_at - chrono::Duration::milliseconds(self.duration_ms as i64)
+    }
+
+    pub fn tokens_per_second(&self) -> f64 {
+        self.content_tokens as f64 * 1000.0 / self.duration_ms as f64
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Coverage {
     pub files: usize,
@@ -476,6 +510,8 @@ impl SessionInfo {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Scan {
     pub events: Vec<UsageEvent>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub message_timings: Vec<MessageTiming>,
     #[serde(default)]
     pub quota_snapshots: Vec<crate::quota::QuotaSnapshot>,
     pub coverage: Coverage,

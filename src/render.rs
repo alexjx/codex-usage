@@ -598,10 +598,16 @@ pub fn view(cli: &Cli, report: &Report, style: &Style, width: usize, help: bool)
                     .iter()
                     .filter(|s| s.agent == agent.agent)
                     .all(|s| !s.readable);
-            let mut metrics = vec![format!(
-                "{:>token_width$} tokens",
-                token_delta(agent.window_tokens, cli.exact)
-            )];
+            let mut metrics = vec![
+                format!(
+                    "{:>token_width$} tokens",
+                    token_delta(agent.window_tokens, cli.exact)
+                ),
+                format!(
+                    "{} output",
+                    token_delta(agent.window_output_tokens, cli.exact)
+                ),
+            ];
             if !cli.no_cost {
                 metrics.push(
                     agent
@@ -748,9 +754,7 @@ pub fn view(cli: &Cli, report: &Report, style: &Style, width: usize, help: bool)
         text(&mut h, style, "meta", "Help", width);
         let mut details=vec!["Arrows/j/k Scroll | PgUp/PgDn Page | Home/End | q Quit | ? Back".into(),
             "Summary covers the full selection. Cached is part of input; reasoning is part of output. * marks incomplete coverage or assumed estimates; n/a means unavailable.".into(),
-            "Speed: newly observed output tokens since the previous snapshot divided by actual elapsed seconds; delayed backlog and corrections are excluded.".into(),
             "Token/cost deltas: changes since the previous snapshot, including corrections and recovered records. The prefix follows --interval (default 2s). Cost uses the known priced subtotal. Idle refreshes show zero; today's summary stays cumulative. Slow collection can extend the actual sample time, available as sample_seconds in JSONL.".into(),
-            "Output speed: Logs arrive in batches; this is observed throughput, not streaming generation speed. Individual rates are available in JSONL.".into(),
             format!("Unpriced: {} tokens",number(report.totals.unpriced_tokens,cli.exact)),
             format!("Data warnings: {} / Pending: {}",report.coverage.malformed+report.coverage.conflicts+report.coverage.uncertain,report.coverage.pending),
             format!("Pricing assumptions: {}",report.totals.assumed_events)];
@@ -771,7 +775,12 @@ pub fn view(cli: &Cli, report: &Report, style: &Style, width: usize, help: bool)
         }
         if cli.monitor() {
             details.push("Monitor range: today's local midnight through the displayed snapshot time, in the title's timezone. Cost includes today's loaded history. Stale sources or partial data can omit usage.".into());
-            details.push("c toggles the output-speed chart. It shows up to 180 chart points, newest on the right; dots mark zero and ? marks unavailable data. The chart starts with recent logged history and continues with 2s rolling aggregate output (including idle time), sampled each refresh. The chart hides when space is limited.".into());
+            details.push("Codex estimates output speed from a logged turn start, matched tool results, or recorded inter-agent input through recorded response usage. It uses visible-text timing when only the message has a known span.".into());
+            details.push("Claude estimates speed from API request start through the last assistant block. Request-based rates include time before the first output.".into());
+            details.push("When timing is missing, bars show logged output per second over a rolling window of at least 10 seconds.".into());
+            details.push("The horizontal line marks zero. Charts show up to 180 refresh intervals, newest on the right. Press c to toggle them when space allows.".into());
+            details.push("The interval row shows input plus output tokens and lists the output count separately.".into());
+            details.push("JSONL also includes the newly observed output tokens per elapsed second for each refresh. Delayed backlog and corrections are excluded.".into());
         }
         if filtered {
             details.push(format!(
@@ -1713,6 +1722,11 @@ mod agent_layout_tests {
             info.agent_activity.push(crate::report::AgentActivity {
                 agent,
                 window_tokens: tokens,
+                window_output_tokens: if agent == crate::model::AgentKind::Codex {
+                    34
+                } else {
+                    -1234
+                },
                 since_ready_tokens: 0,
                 window_cost_usd: None,
                 cost_partial: false,
@@ -1720,6 +1734,10 @@ mod agent_layout_tests {
                 output_tokens_per_second: 85.0,
                 output_speed_history: vec![],
                 output_speed_window_seconds: 30,
+                last_message_speed: None,
+                estimated_output_speed_history: vec![],
+                fallback_output_speed_history: vec![],
+                logged_output_tokens_history: vec![],
             });
         }
         report.totals.total = 2100;
@@ -1729,22 +1747,22 @@ mod agent_layout_tests {
                 false,
                 1240,
                 860,
-                "  Codex   +1.2K tokens",
-                "  Claude   +860 tokens",
+                "  Codex   +1.2K tokens / +34 output",
+                "  Claude   +860 tokens / -1.2K output",
             ),
             (
                 false,
                 12_345_678,
                 -1_234_567_890,
-                "  Codex   +12.3M tokens",
-                "  Claude   -1.2G tokens",
+                "  Codex   +12.3M tokens / +34 output",
+                "  Claude   -1.2G tokens / -1.2K output",
             ),
             (
                 true,
                 12_345_678,
                 -1_234_567_890,
-                "  Codex     +12345678 tokens",
-                "  Claude  -1234567890 tokens",
+                "  Codex     +12345678 tokens / +34 output",
+                "  Claude  -1234567890 tokens / -1234 output",
             ),
         ] {
             cli.exact = exact;
@@ -1763,6 +1781,16 @@ mod agent_layout_tests {
                 );
             }
         }
+        let help = view(&cli, &report, &Style::new(&cli, false), 240, true)
+            .body
+            .join("\n");
+        assert!(help.contains("Codex estimates output speed"));
+        assert!(help.contains("Claude estimates speed from API request start"));
+        assert!(
+            help.contains("logged output per second over a rolling window of at least 10 seconds")
+        );
+        assert!(help.contains("The horizontal line marks zero"));
+        assert!(help.contains("input plus output tokens and lists the output count separately"));
     }
 }
 

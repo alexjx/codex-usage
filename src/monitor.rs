@@ -1,7 +1,7 @@
 use crate::{
     cli::Cli,
-    model::{AgentKind, EventKey, Scan, SessionKey},
-    report::{self, AgentActivity, MonitorInfo, Report, Selection, SessionSpeed},
+    model::{AgentKind, EventKey, MessageTiming, Scan, SessionKey, TimingBasis, UsageEvent},
+    report::{self, AgentActivity, MessageSpeed, MonitorInfo, Report, Selection, SessionSpeed},
 };
 use chrono::Utc;
 use rust_decimal::Decimal;
@@ -13,6 +13,7 @@ use std::{
 const TIMESTAMP_JITTER_SECONDS: i64 = 5;
 const SESSION_SPEED_WINDOW_SECONDS: u64 = 60;
 const CHART_SPEED_WINDOW_SECONDS: u64 = 2;
+const MIN_LOGGED_SPEED_WINDOW: Duration = Duration::from_secs(10);
 const SPEED_HISTORY_CAPACITY: usize = 180;
 
 #[derive(Default)]
@@ -62,6 +63,19 @@ struct AgentChart {
     offset: Duration,
     history: VecDeque<Option<f64>>,
 }
+
+#[derive(Clone, Copy, Default)]
+struct AgentTokens {
+    total: u64,
+    output: u64,
+}
+
+#[derive(Default)]
+struct AgentTokenDelta {
+    total: i128,
+    output: i128,
+}
+
 fn agent_costs(report: &Report) -> BTreeMap<AgentKind, Decimal> {
     let mut costs: BTreeMap<_, _> = report
         .sources
@@ -82,6 +96,223 @@ fn agent_costs(report: &Report) -> BTreeMap<AgentKind, Decimal> {
     }
     costs
 }
+
+fn has_readable_origin(event: &UsageEvent, readable: &BTreeSet<String>) -> bool {
+    if event.origins.is_empty() {
+        readable.contains(&event.source)
+    } else {
+        event.origins.iter().any(|origin| readable.contains(origin))
+    }
+}
+
+#[derive(Default)]
+struct OutputEstimates {
+    last_message: BTreeMap<AgentKind, MessageSpeed>,
+    history: BTreeMap<AgentKind, OutputHistory>,
+}
+
+struct OutputHistory {
+    estimated_speed: Vec<Option<f64>>,
+    fallback_speed: Vec<Option<f64>>,
+    logged_tokens: Vec<u64>,
+}
+
+impl OutputHistory {
+    fn record_output_ahead_of_clock(&mut self, output: u64, elapsed: Duration) {
+        if output == 0
+            || elapsed.is_zero()
+            || self.estimated_speed.last().is_some_and(Option::is_some)
+        {
+            return;
+        }
+        if let Some(fallback) = self.fallback_speed.last_mut() {
+            fallback.get_or_insert_with(|| {
+                output as f64 / elapsed.max(MIN_LOGGED_SPEED_WINDOW).as_secs_f64()
+            });
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct EstimateBin {
+    weighted_rate: f64,
+    active_ns: f64,
+    logged_tokens: u64,
+}
+
+fn estimate_output(
+    cli: &Cli,
+    scan: &Scan,
+    report: &Report,
+    selection: &Selection,
+    readable: &BTreeSet<String>,
+    interval: Duration,
+) -> OutputEstimates {
+    let end = report.generated_at;
+    let logged_window = interval.max(MIN_LOGGED_SPEED_WINDOW);
+    let interval = chrono::Duration::from_std(interval.max(Duration::from_millis(1))).unwrap();
+    let interval_ns = interval.num_nanoseconds().unwrap() as u64;
+    let earliest = end - interval * SPEED_HISTORY_CAPACITY as i32;
+    let start = earliest
+        .max(report.period.start.unwrap_or(earliest))
+        .min(end);
+    let count = ((end - start).num_nanoseconds().unwrap() as u64).div_ceil(interval_ns) as usize;
+    let origin = end - interval * count as i32;
+    let logged_origin = origin - chrono::Duration::from_std(logged_window).unwrap();
+    let mut estimates = OutputEstimates::default();
+    let mut bins: BTreeMap<_, _> = scan
+        .sources
+        .iter()
+        .map(|source| source.agent)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|agent| (agent, vec![EstimateBin::default(); count]))
+        .collect();
+    let mut logged_events: BTreeMap<AgentKind, Vec<(Duration, u64)>> = BTreeMap::new();
+    for event in &scan.events {
+        if event.usage.output == 0
+            || event.timestamp <= logged_origin
+            || event.timestamp > end
+            || !has_readable_origin(event, readable)
+            || !report::matches(cli, &report.period, event, selection)
+        {
+            continue;
+        }
+        logged_events.entry(event.id.agent).or_default().push((
+            (event.timestamp - logged_origin).to_std().unwrap(),
+            event.usage.output,
+        ));
+        if event.timestamp < start {
+            continue;
+        }
+        let position = (event.timestamp - origin).num_nanoseconds().unwrap() as u64;
+        let index = position.div_ceil(interval_ns).saturating_sub(1) as usize;
+        if let Some(bin) = bins
+            .get_mut(&event.id.agent)
+            .and_then(|agent_bins| agent_bins.get_mut(index))
+        {
+            bin.logged_tokens = bin.logged_tokens.saturating_add(event.usage.output);
+        }
+    }
+    let mut timings = BTreeMap::<_, &MessageTiming>::new();
+    for message in &scan.message_timings {
+        if !readable.contains(&message.source)
+            || message.completed_at > end
+            || !report::matches_message(cli, &report.period, message, selection)
+        {
+            continue;
+        }
+        let agent = message.session.agent;
+        if agent == AgentKind::Codex
+            && message.basis == TimingBasis::VisibleText
+            && estimates
+                .last_message
+                .get(&agent)
+                .is_none_or(|speed| speed.completed_at < message.completed_at)
+        {
+            estimates.last_message.insert(
+                agent,
+                MessageSpeed {
+                    completed_at: message.completed_at,
+                    tokens_per_second: message.tokens_per_second(),
+                },
+            );
+        }
+        if message.completed_at <= start {
+            continue;
+        }
+        let key = (
+            &message.session,
+            message.basis,
+            &message.id,
+            message.id.is_none().then_some((
+                message.completed_at,
+                message.duration_ms,
+                message.content_tokens,
+            )),
+        );
+        timings
+            .entry(key)
+            .and_modify(|existing| {
+                if (message.completed_at, message.duration_ms)
+                    > (existing.completed_at, existing.duration_ms)
+                {
+                    *existing = message;
+                }
+            })
+            .or_insert(message);
+    }
+    let mut request_windows = BTreeMap::<&SessionKey, Vec<_>>::new();
+    for message in timings
+        .values()
+        .filter(|message| message.basis == TimingBasis::Request)
+    {
+        request_windows
+            .entry(&message.session)
+            .or_default()
+            .push((message.started_at(), message.completed_at));
+    }
+    for message in timings.into_values() {
+        let Some(agent_bins) = bins.get_mut(&message.session.agent) else {
+            continue;
+        };
+        let started = message.started_at();
+        // A request's token count already includes any visible text it generated.
+        if message.basis == TimingBasis::VisibleText
+            && request_windows
+                .get(&message.session)
+                .is_some_and(|windows| {
+                    windows
+                        .iter()
+                        .any(|&(from, to)| from <= started && to >= message.completed_at)
+                })
+        {
+            continue;
+        }
+        let from = (started.max(start) - origin).num_nanoseconds().unwrap() as u64;
+        let to = (message.completed_at - origin).num_nanoseconds().unwrap() as u64;
+        let rate = message.tokens_per_second();
+        // Weight concurrent responses by observed active time. Partial bins
+        // retain the response's rate rather than averaging in idle seconds.
+        for index in from / interval_ns..to.div_ceil(interval_ns) {
+            let overlap =
+                (to.min((index + 1) * interval_ns) - from.max(index * interval_ns)) as f64;
+            let bin = &mut agent_bins[index as usize];
+            bin.weighted_rate += rate * overlap;
+            bin.active_ns += overlap;
+        }
+    }
+    estimates.history = bins
+        .into_iter()
+        .map(|(agent, bins)| {
+            let mut events = logged_events.remove(&agent).unwrap_or_default();
+            events.sort_unstable_by_key(|&(timestamp, _)| timestamp);
+            let mut events = events.into_iter().peekable();
+            let mut observed = Speed::default();
+            let mut history = OutputHistory {
+                estimated_speed: Vec::with_capacity(bins.len()),
+                fallback_speed: Vec::with_capacity(bins.len()),
+                logged_tokens: Vec::with_capacity(bins.len()),
+            };
+            for (index, bin) in bins.into_iter().enumerate() {
+                let elapsed = logged_window + (interval * (index + 1) as i32).to_std().unwrap();
+                while events.peek().is_some_and(|&(at, _)| at <= elapsed) {
+                    let (at, output) = events.next().unwrap();
+                    observed.record(at, output);
+                }
+                let estimate = (bin.active_ns > 0.0).then(|| bin.weighted_rate / bin.active_ns);
+                let fallback = (estimate.is_none() && bin.logged_tokens > 0)
+                    .then(|| observed.rate_over(elapsed, logged_window));
+                history.estimated_speed.push(estimate);
+                history.fallback_speed.push(fallback);
+                history.logged_tokens.push(bin.logged_tokens);
+            }
+            (agent, history)
+        })
+        .collect();
+    estimates
+}
+
 pub struct Tracker {
     started: Instant,
     seen: BTreeSet<EventKey>,
@@ -100,9 +331,10 @@ pub struct Tracker {
     last_sample: Duration,
     activity: Activity,
     session_speeds: BTreeMap<SessionKey, Speed>,
-    agent_totals: BTreeMap<AgentKind, u64>,
+    output_estimates: OutputEstimates,
+    agent_totals: BTreeMap<AgentKind, AgentTokens>,
     agent_since_ready: BTreeMap<AgentKind, i128>,
-    agent_window: BTreeMap<AgentKind, i128>,
+    agent_window: BTreeMap<AgentKind, AgentTokenDelta>,
     agent_rate: BTreeMap<AgentKind, f64>,
     agent_cost: BTreeMap<AgentKind, Decimal>,
     agent_partial: BTreeSet<AgentKind>,
@@ -156,7 +388,21 @@ impl Tracker {
                 ..Default::default()
             },
             session_speeds: BTreeMap::new(),
-            agent_totals: BTreeMap::new(),
+            output_estimates: OutputEstimates::default(),
+            agent_totals: scan
+                .sources
+                .iter()
+                .filter_map(|source| {
+                    let counts = report.agent_totals.get(source.agent.as_str())?;
+                    Some((
+                        source.agent,
+                        AgentTokens {
+                            total: counts.total,
+                            output: counts.output,
+                        },
+                    ))
+                })
+                .collect(),
             agent_since_ready: scan
                 .sources
                 .iter()
@@ -174,7 +420,7 @@ impl Tracker {
             output_speed_history: VecDeque::new(),
         }
     }
-    /// Reconstruct the chart from reconciled records already loaded at startup.
+    /// Reconstruct chart histories from the records loaded at startup.
     /// Historical tokens remain in `seen`, so they cannot become fresh activity.
     pub fn seed_chart(&mut self, cli: &Cli, scan: &Scan, report: &Report) {
         let end = report.generated_at;
@@ -188,16 +434,15 @@ impl Tracker {
         self.chart_speed = Speed::default();
         self.output_speed_history.clear();
         let selection = Selection::resolve(cli, scan).unwrap_or_default();
+        self.output_estimates =
+            estimate_output(cli, scan, report, &selection, &self.readable, self.interval);
         let mut events: Vec<_> = scan
             .events
             .iter()
             .filter(|e| {
                 e.timestamp >= origin
                     && e.timestamp <= end
-                    && (e.origins.is_empty() && self.readable.contains(&e.source)
-                        || e.origins
-                            .iter()
-                            .any(|origin| self.readable.contains(origin)))
+                    && has_readable_origin(e, &self.readable)
                     && report::matches(cli, &report.period, e, &selection)
             })
             .collect();
@@ -298,6 +543,25 @@ impl Tracker {
             .iter()
             .map(|(agent, since_ready)| AgentActivity {
                 agent: *agent,
+                last_message_speed: self.output_estimates.last_message.get(agent).cloned(),
+                estimated_output_speed_history: self
+                    .output_estimates
+                    .history
+                    .get(agent)
+                    .map(|history| history.estimated_speed.clone())
+                    .unwrap_or_default(),
+                fallback_output_speed_history: self
+                    .output_estimates
+                    .history
+                    .get(agent)
+                    .map(|history| history.fallback_speed.clone())
+                    .unwrap_or_default(),
+                logged_output_tokens_history: self
+                    .output_estimates
+                    .history
+                    .get(agent)
+                    .map(|history| history.logged_tokens.clone())
+                    .unwrap_or_default(),
                 window_cost_usd: self
                     .agent_cost_window
                     .get(agent)
@@ -317,7 +581,8 @@ impl Tracker {
                     }
                 },
                 since_ready_tokens: *since_ready,
-                window_tokens: self.agent_window.get(agent).copied().unwrap_or_default(),
+                window_tokens: self.agent_window.get(agent).map_or(0, |delta| delta.total),
+                window_output_tokens: self.agent_window.get(agent).map_or(0, |delta| delta.output),
                 output_tokens_per_second: self.agent_rate.get(agent).copied().unwrap_or_default(),
                 output_speed_history: self
                     .agent_charts
@@ -366,6 +631,14 @@ impl Tracker {
             .filter(|s| s.readable)
             .map(|s| s.name.clone())
             .collect();
+        self.output_estimates = estimate_output(
+            cli,
+            scan,
+            report,
+            &selection,
+            &current_readable,
+            self.interval,
+        );
         let readable_agent: BTreeSet<AgentKind> = scan
             .sources
             .iter()
@@ -375,7 +648,8 @@ impl Tracker {
         let mut output = 0u64;
         let mut session_output = BTreeMap::<SessionKey, u64>::new();
         let mut agent_output = BTreeMap::<AgentKind, u64>::new();
-        let mut agent_totals = BTreeMap::<AgentKind, u64>::new();
+        let mut output_ahead_of_clock = BTreeMap::<AgentKind, u64>::new();
+        let mut agent_totals = BTreeMap::<AgentKind, AgentTokens>::new();
         let mut late = 0;
         for e in &scan.events {
             let new = self.seen.insert(e.id.clone());
@@ -383,7 +657,8 @@ impl Tracker {
                 continue;
             }
             let total = agent_totals.entry(e.id.agent).or_default();
-            *total = total.saturating_add(e.usage.total());
+            total.total = total.total.saturating_add(e.usage.total());
+            total.output = total.output.saturating_add(e.usage.output);
             if new {
                 // Fresh activity requires an origin readable both before and now.
                 let available = if e.origins.is_empty() {
@@ -401,6 +676,11 @@ impl Tracker {
                 {
                     output = output.saturating_add(e.usage.output);
                     *agent_output.entry(e.id.agent).or_default() += e.usage.output;
+                    if e.timestamp > report.generated_at {
+                        // Plot newly observed output until the clock reaches its recorded bin.
+                        let ahead = output_ahead_of_clock.entry(e.id.agent).or_default();
+                        *ahead = ahead.saturating_add(e.usage.output);
+                    }
                     let tokens = session_output.entry(e.session.clone()).or_default();
                     *tokens = tokens.saturating_add(e.usage.output);
                 } else {
@@ -457,25 +737,40 @@ impl Tracker {
                 delta.checked_add(current.checked_sub(self.previous_cost.unwrap_or_default())?)
             });
         }
-        let sample_seconds = now.saturating_sub(self.last_sample).as_secs_f64();
+        let elapsed = now.saturating_sub(self.last_sample);
+        let sample_seconds = elapsed.as_secs_f64();
         // Independent token deltas and rates per agent.
         for (agent, total) in &agent_totals {
-            let delta = if rollover || !self.agent_totals.contains_key(agent) {
-                *total as i128
+            let fresh_output = agent_output.get(agent).copied().unwrap_or_default();
+            if let Some(history) = self.output_estimates.history.get_mut(agent) {
+                history.record_output_ahead_of_clock(
+                    output_ahead_of_clock
+                        .get(agent)
+                        .copied()
+                        .unwrap_or_default(),
+                    elapsed,
+                );
+            }
+            let previous = if rollover {
+                AgentTokens::default()
             } else {
-                *total as i128 - self.agent_totals[agent] as i128
+                self.agent_totals.get(agent).copied().unwrap_or_default()
+            };
+            let delta = AgentTokenDelta {
+                total: total.total as i128 - previous.total as i128,
+                output: total.output as i128 - previous.output as i128,
             };
             let since_ready = self.agent_since_ready.entry(*agent).or_default();
             if rollover {
-                *since_ready = *total as i128;
+                *since_ready = total.total as i128;
             } else {
-                *since_ready += delta;
+                *since_ready += delta.total;
             }
             self.agent_window.insert(*agent, delta);
             self.agent_rate.insert(
                 *agent,
                 if sample_seconds > 0.0 {
-                    agent_output.get(agent).copied().unwrap_or_default() as f64 / sample_seconds
+                    fresh_output as f64 / sample_seconds
                 } else {
                     0.0
                 },
@@ -661,6 +956,276 @@ mod interval_tests {
             origins: BTreeSet::new(),
             context_tokens: None,
         }
+    }
+
+    #[test]
+    fn untimed_output_uses_logged_throughput_over_a_fixed_window() {
+        let mut scan = scan(true);
+        let report = report("today", 0, None);
+        let now = report.generated_at;
+        scan.events = vec![
+            event("expired", 400, now - chrono::Duration::seconds(11)),
+            event("earlier", 83, now - chrono::Duration::seconds(6)),
+            event("recent", 717, now - chrono::Duration::milliseconds(500)),
+        ];
+        for interval in ["2s", "5s"] {
+            let cli = cli(interval);
+            let mut tracker = Tracker::with_interval(&scan, &report, false, cli.interval());
+            tracker.seed_chart(&cli, &scan, &report);
+            let info = tracker.info(0);
+            let codex = &info.agent_activity[0];
+            assert_eq!(codex.estimated_output_speed_history.last(), Some(&None));
+            assert_eq!(codex.logged_output_tokens_history.last(), Some(&717));
+            assert_eq!(
+                codex.fallback_output_speed_history.last(),
+                Some(&Some(80.0))
+            );
+        }
+    }
+
+    #[test]
+    fn fresh_output_with_a_slightly_future_timestamp_has_a_receipt_fallback() {
+        let cli = cli("2s");
+        let mut scan = scan(true);
+        let mut report = report("today", 0, None);
+        let mut tracker = Tracker::new(&scan, &report, false);
+        report.generated_at += chrono::Duration::seconds(2);
+        scan.events.push(event(
+            "clock-skew",
+            717,
+            report.generated_at + chrono::Duration::milliseconds(500),
+        ));
+        tracker.observe_at(&cli, &scan, &mut report, 0, Duration::from_secs(2));
+        let codex = &report.monitor.unwrap().agent_activity[0];
+        assert_eq!(codex.window_output_tokens, 717);
+        assert_eq!(codex.logged_output_tokens_history.last(), Some(&0));
+        assert_eq!(codex.estimated_output_speed_history.last(), Some(&None));
+        assert_eq!(
+            codex.fallback_output_speed_history.last(),
+            Some(&Some(71.7))
+        );
+    }
+
+    #[test]
+    fn fresh_output_already_on_the_timeline_only_fills_its_recorded_bin() {
+        let cli = cli("2s");
+        let mut scan = scan(true);
+        let mut report = report("today", 0, None);
+        let mut tracker = Tracker::new(&scan, &report, false);
+        report.generated_at += chrono::Duration::seconds(2);
+        scan.events.push(event(
+            "recent-output",
+            717,
+            report.generated_at - chrono::Duration::seconds(3),
+        ));
+        tracker.observe_at(&cli, &scan, &mut report, 0, Duration::from_secs(2));
+        let codex = &report.monitor.unwrap().agent_activity[0];
+        assert_eq!(codex.window_output_tokens, 717);
+        assert_eq!(codex.fallback_output_speed_history.last(), Some(&None));
+        let plotted: Vec<_> = codex
+            .fallback_output_speed_history
+            .iter()
+            .flatten()
+            .copied()
+            .collect();
+        assert_eq!(plotted, [71.7]);
+    }
+
+    #[test]
+    fn estimated_charts_backfill_response_spans_and_average_parallel_work() {
+        let cli = cli("2s");
+        let day = "2026-11-21T00:00:00Z"
+            .parse::<chrono::DateTime<Utc>>()
+            .unwrap();
+        let mut report = report("today", 0, None);
+        report.period.start = Some(day);
+        report.generated_at = day + chrono::Duration::seconds(10);
+        let mut scan = scan(true);
+        scan.sources.push(SourceStatus {
+            name: "claude".into(),
+            agent: AgentKind::ClaudeCode,
+            readable: true,
+            ..Default::default()
+        });
+        let mut tracker = Tracker::new(&scan, &report, false);
+        tracker.seed_chart(&cli, &scan, &report);
+        let startup = tracker.info(0);
+        assert!(startup
+            .agent_activity
+            .iter()
+            .all(|agent| { agent.estimated_output_speed_history == vec![None; 5] }));
+
+        let message = MessageTiming {
+            id: Some("original".into()),
+            basis: TimingBasis::Request,
+            session: SessionKey::main(AgentKind::Codex, "s"),
+            completed_at: day + chrono::Duration::seconds(10),
+            duration_ms: 10_000,
+            content_tokens: 400,
+            model: "test".into(),
+            mode: crate::model::UsageMode::Regular,
+            project: None,
+            source: "local".into(),
+        };
+        scan.message_timings = vec![
+            MessageTiming {
+                id: Some("covered-text".into()),
+                basis: TimingBasis::VisibleText,
+                completed_at: day + chrono::Duration::seconds(2),
+                duration_ms: 1_000,
+                content_tokens: 200,
+                ..message.clone()
+            },
+            MessageTiming {
+                id: Some("parallel".into()),
+                basis: TimingBasis::VisibleText,
+                session: SessionKey::main(AgentKind::Codex, "other"),
+                completed_at: day + chrono::Duration::seconds(6),
+                duration_ms: 2_000,
+                content_tokens: 120,
+                ..message.clone()
+            },
+            MessageTiming {
+                id: Some("short".into()),
+                basis: TimingBasis::VisibleText,
+                completed_at: day + chrono::Duration::seconds(11),
+                duration_ms: 500,
+                content_tokens: 30,
+                ..message.clone()
+            },
+            MessageTiming {
+                session: SessionKey::main(AgentKind::ClaudeCode, "s"),
+                basis: TimingBasis::Request,
+                completed_at: day + chrono::Duration::seconds(8),
+                duration_ms: 4_000,
+                content_tokens: 320,
+                source: "claude".into(),
+                ..message.clone()
+            },
+            message.clone(),
+            message,
+        ];
+        report.generated_at = day + chrono::Duration::seconds(12);
+        tracker.observe_at(&cli, &scan, &mut report, 0, Duration::from_secs(2));
+        let agents = &report.monitor.unwrap().agent_activity;
+        assert_eq!(
+            agents[0].estimated_output_speed_history,
+            [
+                Some(40.0),
+                Some(40.0),
+                Some(50.0),
+                Some(40.0),
+                Some(40.0),
+                Some(60.0)
+            ]
+        );
+        assert_eq!(
+            agents[1].estimated_output_speed_history,
+            [None, None, Some(80.0), Some(80.0), None, None]
+        );
+        assert!(agents
+            .iter()
+            .all(|agent| agent.output_tokens_per_second == 0.0));
+    }
+
+    #[test]
+    fn last_message_rate_uses_recorded_time_and_respects_the_monitor_selection() {
+        let cli = Cli::parse_from([
+            "agent-usage",
+            "monitor",
+            "--interval",
+            "1s",
+            "--model",
+            "test",
+            "--mode",
+            "regular",
+            "--project",
+            "demo",
+            "--session",
+            "codex:s",
+        ]);
+        let day_start = "2026-11-21T00:00:00Z"
+            .parse::<chrono::DateTime<Utc>>()
+            .unwrap();
+        let completed = day_start + chrono::Duration::seconds(10);
+        let mut report = report("day1", 0, None);
+        report.period.start = Some(day_start);
+        report.generated_at = completed + chrono::Duration::seconds(2);
+        let mut scan = scan(true);
+        let matching = crate::model::MessageTiming {
+            id: None,
+            basis: TimingBasis::VisibleText,
+            session: SessionKey::main(AgentKind::Codex, "s"),
+            completed_at: completed,
+            duration_ms: 2_500,
+            content_tokens: 105,
+            model: "test".into(),
+            mode: crate::model::UsageMode::Regular,
+            project: Some("/projects/demo".into()),
+            source: "local".into(),
+        };
+        let later = crate::model::MessageTiming {
+            completed_at: completed + chrono::Duration::seconds(1),
+            ..matching.clone()
+        };
+        scan.message_timings = vec![
+            crate::model::MessageTiming {
+                completed_at: report.generated_at + chrono::Duration::seconds(1),
+                ..matching.clone()
+            },
+            crate::model::MessageTiming {
+                source: "unavailable".into(),
+                ..later.clone()
+            },
+            crate::model::MessageTiming {
+                session: SessionKey::main(AgentKind::Codex, "other"),
+                ..later.clone()
+            },
+            crate::model::MessageTiming {
+                model: "other".into(),
+                ..later.clone()
+            },
+            crate::model::MessageTiming {
+                mode: crate::model::UsageMode::Fast,
+                ..later.clone()
+            },
+            crate::model::MessageTiming {
+                project: Some("/other".into()),
+                ..later
+            },
+            matching.clone(),
+            crate::model::MessageTiming {
+                completed_at: completed - chrono::Duration::seconds(1),
+                content_tokens: 25,
+                ..matching
+            },
+        ];
+        let mut tracker = Tracker::new(&scan, &report, false);
+        tracker.seed_chart(&cli, &scan, &report);
+        let startup = tracker.info(0);
+        let speed = startup.agent_activity[0]
+            .last_message_speed
+            .as_ref()
+            .unwrap();
+        assert_eq!(speed.completed_at, completed);
+        assert_eq!(speed.tokens_per_second, 42.0);
+        assert_eq!(startup.output_tokens_per_second, 0.0);
+
+        // The previously future-dated record is still in the future at this refresh.
+        report.generated_at += chrono::Duration::milliseconds(500);
+        tracker.observe_at(&cli, &scan, &mut report, 0, Duration::from_secs(1));
+        let idle = report.monitor.as_ref().unwrap();
+        let speed = idle.agent_activity[0].last_message_speed.as_ref().unwrap();
+        assert_eq!(speed.completed_at, completed);
+        assert_eq!(speed.tokens_per_second, 42.0);
+
+        report.period.start = Some(day_start + chrono::Duration::days(1));
+        report.period.label = "day2".into();
+        report.generated_at += chrono::Duration::days(1);
+        tracker.observe_at(&cli, &scan, &mut report, 0, Duration::from_secs(2));
+        assert!(report.monitor.unwrap().agent_activity[0]
+            .last_message_speed
+            .is_none());
     }
 
     #[test]
@@ -1186,15 +1751,26 @@ mod interval_tests {
             .unwrap();
         assert_eq!(codex.window_tokens, 15);
         assert_eq!(claude.window_tokens, 17);
+        assert_eq!(codex.window_output_tokens, 5);
+        assert_eq!(claude.window_output_tokens, 7);
+        assert_eq!(codex.logged_output_tokens_history.last(), Some(&5));
+        assert_eq!(claude.logged_output_tokens_history.last(), Some(&7));
+        assert_eq!(codex.estimated_output_speed_history.last(), Some(&None));
+        assert_eq!(claude.estimated_output_speed_history.last(), Some(&None));
         assert_eq!(codex.output_tokens_per_second, 2.5);
         assert_eq!(claude.output_tokens_per_second, 3.5);
         assert_eq!(codex.output_speed_history.last(), Some(&Some(2.5)));
         assert_eq!(claude.output_speed_history.last(), Some(&Some(3.5)));
-        // A later Codex-only burst leaves Claude's chart at zero, not Codex's rate.
+        // An input-only Claude record raises the total without logging output.
         r.generated_at = now + chrono::Duration::seconds(2);
         let mut more = event("e", 10, r.generated_at);
         more.source = "codex-root".into();
         scan.events.push(more);
+        let mut input_only = scan.events[1].clone();
+        input_only.id = EventKey::new(AgentKind::ClaudeCode, "input-only");
+        input_only.timestamp = r.generated_at;
+        input_only.usage.output = 0;
+        scan.events.push(input_only);
         tracker.observe_at(&cli, &scan, &mut r, 0, Duration::from_secs(4));
         let info = r.monitor.as_ref().unwrap();
         let claude = info
@@ -1202,7 +1778,9 @@ mod interval_tests {
             .iter()
             .find(|agent| agent.agent == AgentKind::ClaudeCode)
             .unwrap();
-        assert_eq!(claude.window_tokens, 0);
+        assert_eq!(claude.window_tokens, 10);
+        assert_eq!(claude.window_output_tokens, 0);
+        assert_eq!(claude.logged_output_tokens_history.last(), Some(&0));
         assert_eq!(claude.output_tokens_per_second, 0.0);
     }
 

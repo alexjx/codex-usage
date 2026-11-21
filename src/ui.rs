@@ -237,7 +237,13 @@ where
                 .max()
                 .unwrap_or(0);
             let room = height.saturating_sub(v.header.len() + footer_size + date_rows);
-            let chart_available = cli.monitor() && !help && width >= 32 && room >= 9;
+            let chart_count = report
+                .monitor
+                .as_ref()
+                .map_or(1, |info| info.agent_activity.len().max(1));
+            // Each chart may need a spacer, heading, two plot rows, and axis labels.
+            let chart_available =
+                cli.monitor() && !help && width >= 32 && room >= (chart_count * 5 + 1).max(9);
             if !chart_available && cli.monitor() {
                 reserve_nav = nav(
                     &style,
@@ -252,8 +258,7 @@ where
             }
             if show_chart && chart_available {
                 if let Some(info) = &report.monitor {
-                    let count = info.agent_activity.len().max(1);
-                    let rows = ((room.saturating_sub(count * 2)) / (3 * count))
+                    let rows = ((room.saturating_sub(chart_count * 2)) / (3 * chart_count))
                         .clamp(2, 18)
                         .min(room.saturating_sub(7));
                     let mut chart = Vec::new();
@@ -265,7 +270,12 @@ where
                                 chart.push(String::new());
                             }
                             chart.extend(crate::chart::agent_history(
-                                agent, &style, width, rows, cli.ascii,
+                                agent,
+                                cli.interval(),
+                                &style,
+                                width,
+                                rows,
+                                cli.ascii,
                             ));
                         }
                     }
