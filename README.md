@@ -4,6 +4,10 @@ A Rust CLI for reporting local Codex CLI and Claude Code usage across Linux, WSL
 
 Reads local session logs. No API key, login, or network request is required.
 
+![Agent Usage live terminal monitor with separate Codex and Claude Code activity charts, token counts, and estimated costs](docs/monitor.png)
+
+The live monitor (`agent-usage monitor`) shown with synthetic session data.
+
 ## Install
 
 With Rust and native C/C++ build tools installed:
